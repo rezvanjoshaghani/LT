@@ -1,0 +1,8 @@
+# Scripts and configs run on the Linux cluster. Keep LF everywhere so a
+# working copy synced from Windows still executes.
+*.sbatch text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.toml text eol=lf

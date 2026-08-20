@@ -759,7 +759,11 @@ def make_sim(cfg: RenderConfig, scene: str):
     """Create a Habitat simulator for one Replica scene with color and depth sensors.
 
     Both sensors are mounted at the agent origin with zero rotation, so the
-    sensor pose equals the agent pose.
+    sensor pose equals the agent pose. Returns (sim, navmesh_source) where
+    navmesh_source records how the navmesh was obtained: 'simulator' when
+    Habitat loaded one on its own, 'dataset' when loaded from
+    cfg.navmesh_relpath, 'recomputed' when computed from the scene mesh
+    because the dataset ships none.
     """
     habitat_sim = _import_habitat()
     scene_path = cfg.replica_root / scene / cfg.scene_relpath
@@ -789,16 +793,24 @@ def make_sim(cfg: RenderConfig, scene: str):
     sim = habitat_sim.Simulator(habitat_sim.Configuration(backend, [agent_cfg]))
     seed = scene_seed(cfg.seed, scene)
     sim.seed(seed)
+    navmesh_source = "simulator"
     navmesh_path = cfg.replica_root / scene / cfg.navmesh_relpath
-    if navmesh_path.is_file() and not sim.pathfinder.is_loaded:
+    if not sim.pathfinder.is_loaded and navmesh_path.is_file():
         sim.pathfinder.load_nav_mesh(str(navmesh_path))
+        navmesh_source = "dataset"
     if not sim.pathfinder.is_loaded:
-        raise RuntimeError(
-            f"no navmesh for {scene}; expected {navmesh_path}. Viewpoint "
-            "sampling needs a navmesh."
-        )
+        settings = habitat_sim.NavMeshSettings()
+        settings.set_defaults()
+        settings.agent_height = cfg.eye_height_m
+        settings.agent_radius = 0.2
+        if not sim.recompute_navmesh(sim.pathfinder, settings):
+            raise RuntimeError(
+                f"no navmesh for {scene} at {navmesh_path} and recompute "
+                "failed. Viewpoint sampling needs a navmesh."
+            )
+        navmesh_source = "recomputed"
     sim.pathfinder.seed(seed)
-    return sim
+    return sim, navmesh_source
 
 
 def render_at_pose(
@@ -993,7 +1005,7 @@ def render_scene(cfg: RenderConfig, scene: str) -> Path:
     (out_dir / "rgb").mkdir(parents=True, exist_ok=True)
     (out_dir / "depth").mkdir(parents=True, exist_ok=True)
     K = intrinsics_from_hfov(cfg.image_height, cfg.image_width, cfg.hfov_deg)
-    sim = make_sim(cfg, scene)
+    sim, navmesh_source = make_sim(cfg, scene)
     try:
         depth_meta, convert = probe_depth_convention(
             sim, K, cfg.eye_height_m, out_dir / "probes"
@@ -1057,6 +1069,7 @@ def render_scene(cfg: RenderConfig, scene: str) -> Path:
         "seed": cfg.seed,
         "scene_seed": scene_seed(cfg.seed, scene),
         "habitat_sim_version": getattr(habitat_sim, "__version__", "unknown"),
+        "navmesh": navmesh_source,
         "depth_convention": depth_meta,
         "viewpoints": [
             {key: v for key, v in vp.items() if key != "T_base"} for vp in viewpoints

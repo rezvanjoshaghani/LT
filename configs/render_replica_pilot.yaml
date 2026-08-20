@@ -1,7 +1,10 @@
 # Phase 1 pilot: render one scene end to end and inspect the QC sheets.
 # Entrypoint: python -m lot.render_replica --config configs/render_replica_pilot.yaml
+# The pilot writes to its own output root. The 18-scene batch renders room_0
+# again under data/replica_renders; outputs are never overwritten, so the
+# pilot must not occupy the batch's directory.
 replica_root: data/replica
-output_root: data/replica_renders
+output_root: data/replica_renders_pilot
 scenes: [room_0]
 seed: 0
 image_height: 518

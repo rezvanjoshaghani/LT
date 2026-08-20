@@ -1,15 +1,18 @@
 #!/bin/bash
 # SLURM template for Replica rendering (PLAN Phase 1).
-# Account and partition are never hard-coded; pass them from the environment
-# at submit time:
+# Normally submitted by scripts/run_phase1_render.sh. Account and partition
+# are never hard-coded; pass them at submit time:
 #
-#   export SLURM_ACCOUNT=...   SLURM_PARTITION=...   LOT_CONDA_ENV=lot
-#   # pilot, one scene:
 #   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
 #          scripts/render_replica.sbatch configs/render_replica_pilot.yaml
-#   # full batch, 18 scenes:
 #   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
 #          --array 0-17 scripts/render_replica.sbatch configs/render_replica_all.yaml
+#
+# Environment (defaults match scripts/setup_borah.sh):
+#   LOT_ENV            micromamba env with habitat-sim (default lot-render)
+#   MAMBA_ROOT_PREFIX  micromamba root (default $HOME/micromamba)
+#   MAMBA_EXE          micromamba binary (default: found on PATH or ~/.local/bin)
+#   LOT_MODULES        optional space-separated modules to load
 #
 #SBATCH --job-name=lot-render
 #SBATCH --time=04:00:00
@@ -23,12 +26,24 @@
 set -euo pipefail
 
 CONFIG="${1:?usage: sbatch ... scripts/render_replica.sbatch <config.yaml>}"
-: "${LOT_CONDA_ENV:?set LOT_CONDA_ENV to the conda env that has habitat-sim}"
+LOT_ENV="${LOT_ENV:-lot-render}"
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$LOT_CONDA_ENV"
+if [ -n "${LOT_MODULES:-}" ] && command -v module >/dev/null 2>&1; then
+    module load $LOT_MODULES
+fi
+
+MM="${MAMBA_EXE:-}"
+if [ -z "$MM" ]; then
+    if command -v micromamba >/dev/null 2>&1; then
+        MM="$(command -v micromamba)"
+    else
+        MM="$HOME/.local/bin/micromamba"
+    fi
+fi
 
 cd "$SLURM_SUBMIT_DIR"
-python -m lot.render_replica \
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+"$MM" run -n "$LOT_ENV" python -m lot.render_replica \
     --config "$CONFIG" \
     --scene-index "${SLURM_ARRAY_TASK_ID:-0}"

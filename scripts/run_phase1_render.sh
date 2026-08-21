@@ -44,8 +44,17 @@ ALL_CONFIG=configs/render_replica_all.yaml
 PILOT_MANIFEST="$REPO_ROOT/data/replica_renders_pilot/room_0/manifest.json"
 
 require_slurm_env() {
-    : "${SLURM_ACCOUNT:?export SLURM_ACCOUNT=<account>}"
-    : "${SLURM_PARTITION:?export SLURM_PARTITION=<gpu partition>}"
+    if [ -z "${SLURM_ACCOUNT:-}" ] || [ -z "${SLURM_PARTITION:-}" ]; then
+        cat >&2 <<'EOF'
+Set the SLURM account and GPU partition first, with the real names:
+  export SLURM_ACCOUNT=myaccount SLURM_PARTITION=gpu
+To find them:
+  inside a running job:  echo "$SLURM_JOB_ACCOUNT $SLURM_JOB_PARTITION"
+  your accounts:         sacctmgr -nP show assoc user=$USER format=account
+  gpu partitions:        sinfo -o "%P %G" | grep -i gpu
+EOF
+        exit 1
+    fi
 }
 
 submit() {

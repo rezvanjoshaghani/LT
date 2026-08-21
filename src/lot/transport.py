@@ -18,6 +18,15 @@ Steps:
 
 Coverage is the fraction of a target patch's pixels that received support.
 Disoccluded regions stay empty. The z-buffer is +inf where no splat landed.
+
+Steps 2 and 4 describe the semantics, not the arithmetic. Every pixel of a
+source patch carries that patch's one feature vector, so the splat never has to
+move a vector at all. It accumulates scalar weights from source patch to target
+patch and mixes the features once at the end with a small matmul. Carrying
+vectors per pixel would allocate a [C, H_out * W_out] buffer, which is 824 MB at
+518 px with 768 channels and 2.2 GB with VGGT's 2048, several times over per
+call. The weight matrix is [Hp_out * Wp_out, Hp * Wp], which is 7.5 MB at the
+37 by 37 grids this study uses.
 """
 
 from __future__ import annotations
@@ -122,26 +131,37 @@ def transport(
     winners = z_keep <= zbuffer[lin] * (1 + TIE_RELATIVE_EPS)
     lin_w = lin[winners]
 
-    patch_row = (torch.arange(height, device=device) // patch_size)[:, None].expand(height, width)
-    patch_col = (torch.arange(width, device=device) // patch_size)[None, :].expand(height, width)
-    row_w = patch_row.reshape(-1)[keep_flat][winners]
-    col_w = patch_col.reshape(-1)[keep_flat][winners]
-    feats_w = features_ctx.to(torch.float32)[:, row_w, col_w]
+    source_patch = (
+        (torch.arange(height, device=device) // patch_size)[:, None] * patches_w
+        + (torch.arange(width, device=device) // patch_size)[None, :]
+    )
+    source_of_winner = source_patch.reshape(-1)[keep_flat][winners]
 
-    accum = torch.zeros((channels, out_height * out_width), dtype=torch.float32, device=device)
-    accum.index_add_(1, lin_w, feats_w)
     count = torch.zeros((out_height * out_width,), dtype=torch.float32, device=device)
     count.index_add_(0, lin_w, torch.ones_like(lin_w, dtype=torch.float32))
     hit = count > 0
-    features_px = accum / count.clamp(min=1)
-
-    feature_sums = features_px.reshape(
-        channels, out_patches_h, patch_size, out_patches_w, patch_size
-    ).sum(dim=(2, 4))
     hits_per_patch = hit.to(torch.float32).reshape(
         out_patches_h, patch_size, out_patches_w, patch_size
     ).sum(dim=(1, 3))
-    features_out = feature_sums / hits_per_patch.clamp(min=1)
+
+    # A target pixel splits its weight evenly between the splats that tie on it,
+    # and a target patch averages over the pixels that received support. Both
+    # divisions fold into the weight, so the matmul below reproduces the
+    # pixel-level average exactly while never materializing it.
+    target_patch = (lin_w // out_width // patch_size) * out_patches_w + (
+        lin_w % out_width
+    ) // patch_size
+    num_source = patches_h * patches_w
+    num_target = out_patches_h * out_patches_w
+    weights = torch.zeros((num_target * num_source,), dtype=torch.float32, device=device)
+    weights.index_add_(0, target_patch * num_source + source_of_winner, 1.0 / count[lin_w])
+    weights = weights.reshape(num_target, num_source)
+    weights = weights / hits_per_patch.reshape(num_target, 1).clamp(min=1)
+
+    features_flat = features_ctx.to(torch.float32).reshape(channels, num_source)
+    features_out = (features_flat @ weights.mT).reshape(
+        channels, out_patches_h, out_patches_w
+    )
     coverage = hits_per_patch / float(patch_size * patch_size)
 
     return TransportResult(features_out, coverage, zbuffer.reshape(out_height, out_width))

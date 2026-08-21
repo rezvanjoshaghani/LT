@@ -85,6 +85,84 @@ def test_coverage_values():
     )
 
 
+def _reference_pixel_splat(features, depth, K, T_tgt_from_ctx, out_hw, patch):
+    """The pixel-level form of the same contract, carrying feature vectors.
+
+    transport accumulates scalar weights from source patch to target patch and
+    mixes the features once at the end, because moving a vector per pixel costs
+    hundreds of megabytes per call. This does it the direct way instead: average
+    the winning splats on each target pixel, then average the pixels that got
+    support within each patch. The two must agree.
+    """
+    from lot.geometry import pixel_grid, project, transform_points, unproject
+
+    height, width = depth.shape
+    out_height, out_width = out_hw
+    channels = features.shape[0]
+    uv = pixel_grid(height, width, dtype=depth.dtype)
+    points = transform_points(T_tgt_from_ctx, unproject(uv, depth, K))
+    uv_tgt, z_tgt = project(points, K)
+
+    feat_px = torch.zeros((channels, out_height, out_width), dtype=torch.float32)
+    hit_px = torch.zeros((out_height, out_width), dtype=torch.bool)
+    hits: dict[tuple[int, int], list[tuple[float, int, int]]] = {}
+    for v in range(height):
+        for u in range(width):
+            z = float(z_tgt[v, u])
+            if not (z > 0 and float(depth[v, u]) > 0):
+                continue
+            iu = int(torch.floor(uv_tgt[v, u, 0] + 0.5))
+            iv = int(torch.floor(uv_tgt[v, u, 1] + 0.5))
+            if not (0 <= iu < out_width and 0 <= iv < out_height):
+                continue
+            hits.setdefault((iv, iu), []).append((z, v // patch, u // patch))
+    for (iv, iu), entries in hits.items():
+        zmin = min(e[0] for e in entries)
+        winners = [e for e in entries if e[0] <= zmin * (1 + 1e-6)]
+        stacked = torch.stack([features[:, r, q].to(torch.float32) for _, r, q in winners])
+        feat_px[:, iv, iu] = stacked.mean(dim=0)
+        hit_px[iv, iu] = True
+
+    grid_h, grid_w = out_height // patch, out_width // patch
+    feat_out = torch.zeros((channels, grid_h, grid_w), dtype=torch.float32)
+    coverage = torch.zeros((grid_h, grid_w), dtype=torch.float32)
+    for pr in range(grid_h):
+        for pc in range(grid_w):
+            block_hit = hit_px[pr * patch:(pr + 1) * patch, pc * patch:(pc + 1) * patch]
+            n = int(block_hit.sum())
+            coverage[pr, pc] = n / (patch * patch)
+            if n:
+                block = feat_px[:, pr * patch:(pr + 1) * patch, pc * patch:(pc + 1) * patch]
+                feat_out[:, pr, pc] = block.sum(dim=(1, 2)) / n
+    return feat_out, coverage
+
+
+def test_weighted_form_matches_the_pixel_level_splat():
+    """Guards the weight-matrix accumulation against the direct per-pixel form.
+
+    A random depth map makes splats collide and tie in ways the analytic scenes
+    never do, which is exactly where an accumulation refactor could drift.
+    """
+    generator = torch.Generator().manual_seed(3)
+    scene = build_two_plane_scene()
+    depth = 2.0 + 2.0 * torch.rand(
+        (IMAGE_SIZE, IMAGE_SIZE), generator=generator, dtype=torch.float64
+    )
+    features = patch_codes()
+    result = transport(
+        features, depth, scene.K, scene.K, scene.T_target_from_context, OUT_HW
+    )
+    ref_features, ref_coverage = _reference_pixel_splat(
+        features, depth, scene.K, scene.T_target_from_context, OUT_HW, PATCH
+    )
+    assert torch.equal(result.coverage, ref_coverage)
+    assert torch.allclose(result.features, ref_features, atol=1e-4)
+    # The scene has to exercise the hard cases or the agreement proves nothing:
+    # partly supported patches, and patches nothing reached at all.
+    assert ((result.coverage > 0) & (result.coverage < 1)).any()
+    assert (result.coverage == 0).any()
+
+
 def _reference_homography_splat(features, depth, K, R_tgt_from_ctx, patch):
     """Independent forward splat that uses the homography instead of 3D geometry.
 

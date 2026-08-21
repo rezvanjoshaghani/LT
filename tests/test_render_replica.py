@@ -21,6 +21,7 @@ from lot.geometry import (
     invert_se3,
 )
 from lot.render_replica import (
+    FRAME_STATS_NAME,
     REGIMES,
     REPLICA_SCENES,
     REPLICA_SCENES_TEST,
@@ -30,6 +31,11 @@ from lot.render_replica import (
     RenderConfig,
     classify_depth_convention,
     euclidean_to_planar_depth,
+    frame_depth_stats,
+    frame_passes_quality,
+    load_frame_stats,
+    passing_frame_ids,
+    write_frame_stats,
     intrinsics_from_hfov,
     load_config,
     load_manifest,
@@ -590,3 +596,81 @@ def test_habitat_render_smoke(tmp_path):
         assert (manifest_path.parent / "qc" / f"qc_{regime}.png").is_file()
     with pytest.raises(FileExistsError):
         render_scene(cfg, "room_0")
+
+
+# ---------------------------------------------------------------------------
+# Per-frame depth quality
+# ---------------------------------------------------------------------------
+
+def _reject_constant(name):
+    raise AssertionError(f"non-standard JSON token {name}")
+
+def test_frame_depth_stats_on_a_clean_frame():
+    depth = np.full((28, 28), 3.0, dtype=np.float32)
+    stats = frame_depth_stats(depth)
+    assert stats["valid_fraction"] == 1.0
+    assert stats["median_m"] == 3.0
+    assert stats["center_p01_m"] == 3.0
+    assert frame_passes_quality(stats)
+
+
+def test_frame_depth_stats_ignores_holes_and_reports_them():
+    depth = np.full((28, 28), 3.0, dtype=np.float32)
+    depth[:14] = 0.0
+    stats = frame_depth_stats(depth)
+    assert stats["valid_fraction"] == 0.5
+    assert stats["median_m"] == 3.0
+    # Half the frame is a hole, so the frame fails on valid fraction alone.
+    assert not frame_passes_quality(stats)
+
+
+def test_clearance_uses_a_percentile_not_the_minimum():
+    """One stray near pixel must not veto a frame, a real near surface must."""
+    depth = np.full((28, 28), 3.0, dtype=np.float32)
+    depth[14, 14] = 0.1
+    assert frame_passes_quality(frame_depth_stats(depth))
+    depth[7:21, 7:21] = 0.1
+    assert not frame_passes_quality(frame_depth_stats(depth))
+
+
+def test_wall_stare_and_far_frames_fail_the_median_band():
+    near = frame_depth_stats(np.full((28, 28), 0.9, dtype=np.float32))
+    far = frame_depth_stats(np.full((28, 28), 12.0, dtype=np.float32))
+    assert not frame_passes_quality(near)
+    assert not frame_passes_quality(far)
+    assert frame_passes_quality(frame_depth_stats(np.full((28, 28), 4.0, dtype=np.float32)))
+
+
+def test_all_invalid_depth_fails_rather_than_raising():
+    stats = frame_depth_stats(np.zeros((28, 28), dtype=np.float32))
+    assert stats["valid_fraction"] == 0.0
+    assert math.isnan(stats["median_m"])
+    assert not frame_passes_quality(stats)
+
+
+def test_frame_stats_sidecar_round_trip(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    cfg = RenderConfig(
+        replica_root=tmp_path, output_root=tmp_path, scenes=["room_0"], image_height=28, image_width=28
+    )
+    payload = write_frame_stats(root, manifest, cfg)
+    assert payload["total"] == len(manifest.frames)
+    # fake_scene_dir writes a constant 2.0 m depth, inside the accepted band.
+    assert payload["passing"] == len(manifest.frames)
+    assert passing_frame_ids(payload) == {f.frame_id for f in manifest.frames}
+    assert load_frame_stats(root / FRAME_STATS_NAME)["scene"] == manifest.scene
+    with pytest.raises(FileExistsError):
+        write_frame_stats(root, manifest, cfg)
+
+
+def test_frame_stats_sidecar_is_standard_json(tmp_path):
+    """A frame with no valid depth writes null, not a bare NaN token."""
+    root, manifest = fake_scene_dir(tmp_path)
+    np.save(root / manifest.frames[0].depth_path, np.zeros((28, 28), dtype=np.float32))
+    cfg = RenderConfig(
+        replica_root=tmp_path, output_root=tmp_path, scenes=["room_0"], image_height=28, image_width=28
+    )
+    payload = write_frame_stats(root, manifest, cfg)
+    assert payload["passing"] == len(manifest.frames) - 1
+    text = (root / FRAME_STATS_NAME).read_text(encoding="utf-8")
+    json.loads(text, parse_constant=_reject_constant)

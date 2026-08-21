@@ -68,6 +68,12 @@ Open, recorded rather than fixed:
   the effect: room_0 vp02 orbit_000 spans 0.04 to 6.46 m, and every room_0
   vp05 frame sits under 1.7 m. Phase 3 pair selection should filter on
   per-frame depth statistics rather than trust every rendered frame.
+  Closed before Phase 3. `--frame-stats` applies the base view's own standard
+  to every rendered frame after the fact and writes frame_stats.json beside
+  each manifest. Clearance is the first percentile of the central crop, not its
+  minimum, so a single stray near pixel cannot veto a frame while a real near
+  surface does. Every raw statistic is stored beside the verdict, so a later
+  phase can change thresholds without reading the depth files again.
 - Manifests written before this review can contain bare Infinity and NaN
   tokens, from probe views that came out ambiguous. Python reads them, strict
   JSON readers do not. New manifests write null instead. Check the batch with
@@ -75,6 +81,14 @@ Open, recorded rather than fixed:
 - transport allocates a full feature vector per splatted pixel, which is
   824 MB per buffer at 518 px with 768 channels. Phase 3 needs the
   weight-matrix form before it runs over tens of thousands of pairs.
+  Closed before Phase 3. Every pixel of a source patch carries that patch's one
+  feature vector, so the splat accumulates scalar weights from source patch to
+  target patch and mixes the features once with a small matmul. The weight
+  matrix is 7.5 MB at the 37 by 37 grids in use. Runtime is now nearly
+  independent of feature width: 68 ms at 768 channels and 78 ms at 2048, where
+  the old form would have needed about 6.6 GB per call at VGGT's width. A test
+  compares the result against the direct per-pixel splat on a random depth map,
+  where splats collide and tie in ways the analytic scenes never produce.
 - The per-pair pixel pipeline runs in float64 because manifest intrinsics and
   poses load as float64. Measured cost is 40 percent on CPU and far more on a
   consumer GPU.

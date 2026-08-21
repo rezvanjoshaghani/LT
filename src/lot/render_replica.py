@@ -649,6 +649,147 @@ def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) 
 
 
 # ---------------------------------------------------------------------------
+# Per-frame depth quality
+# ---------------------------------------------------------------------------
+
+FRAME_STATS_VERSION = 1
+FRAME_STATS_NAME = "frame_stats.json"
+
+# A depth below this is a rendering artifact, not a surface. Used wherever a
+# depth map is asked whether a pixel saw anything.
+NEAR_DEPTH_FLOOR_M = 0.05
+
+
+def frame_depth_stats(
+    depth: np.ndarray, center_crop: float = 0.5, near_m: float = NEAR_DEPTH_FLOOR_M
+) -> dict[str, float]:
+    """Depth quality statistics for one rendered frame, in meters.
+
+    depth: [H, W] planar z-depth as stored by the renderer.
+    center_crop: side fraction of the central crop used for the clearance
+        measure, so a wall at the edge of a wide view does not veto a frame.
+    Returns valid_fraction, median_m, center_p01_m, min_m, and max_m. A depth
+    counts as valid when it is finite and above near_m. center_p01_m is the
+    first percentile of the central crop rather than its minimum, so one stray
+    pixel cannot decide whether a frame is usable. Statistics that no valid
+    pixel supports come back as nan.
+    """
+    d = np.asarray(depth, dtype=np.float64)
+    if d.ndim != 2:
+        raise ValueError(f"depth must be [H, W], got {d.shape}")
+    if not 0 < center_crop <= 1:
+        raise ValueError("center_crop must be in (0, 1]")
+    valid = np.isfinite(d) & (d > near_m)
+    stats = {
+        "valid_fraction": float(valid.mean()),
+        "median_m": float("nan"),
+        "center_p01_m": float("nan"),
+        "min_m": float("nan"),
+        "max_m": float("nan"),
+    }
+    if valid.any():
+        good = d[valid]
+        stats["median_m"] = float(np.median(good))
+        stats["min_m"] = float(good.min())
+        stats["max_m"] = float(good.max())
+    height, width = d.shape
+    dh = int(round(height * (1 - center_crop) / 2))
+    dw = int(round(width * (1 - center_crop) / 2))
+    center = d[dh : height - dh, dw : width - dw]
+    center_valid = center[np.isfinite(center) & (center > near_m)]
+    if center_valid.size:
+        stats["center_p01_m"] = float(np.percentile(center_valid, 1.0))
+    return stats
+
+
+def frame_passes_quality(
+    stats: dict[str, float],
+    min_valid_fraction: float = 0.7,
+    min_median_m: float = 1.5,
+    max_median_m: float = 8.0,
+    min_clearance_m: float = 0.5,
+) -> bool:
+    """Whether one frame is usable, by the same rules the viewpoint filter applies.
+
+    Rendering only filtered the base view of each viewpoint. The translation and
+    orbit programs then move the camera up to 0.4 times the median scene depth
+    with physics disabled, so a derived frame can end up inside furniture or
+    pressed against a wall. This applies the base view's standard to every frame
+    after the fact, which is far cheaper than re-rendering.
+    """
+    median = stats.get("median_m", float("nan"))
+    clearance = stats.get("center_p01_m", float("nan"))
+    if not math.isfinite(median) or not math.isfinite(clearance):
+        return False
+    return (
+        stats.get("valid_fraction", 0.0) >= min_valid_fraction
+        and min_median_m <= median <= max_median_m
+        and clearance >= min_clearance_m
+    )
+
+
+def write_frame_stats(out_dir: Path, manifest: Manifest, cfg: RenderConfig) -> dict[str, Any]:
+    """Compute per-frame depth statistics for one scene and write the sidecar.
+
+    Reads the depth files the manifest references. Refuses to overwrite an
+    existing sidecar. Records every raw statistic beside the verdict, so a later
+    phase can apply different thresholds without reading the depth files again.
+    """
+    out_dir = Path(out_dir)
+    path = out_dir / FRAME_STATS_NAME
+    if path.exists():
+        raise FileExistsError(
+            f"{path} exists; outputs are never overwritten. Delete it to recompute."
+        )
+    thresholds = {
+        "min_valid_fraction": cfg.min_valid_fraction,
+        "min_median_m": cfg.min_median_depth_m,
+        "max_median_m": cfg.max_median_depth_m,
+        "min_clearance_m": cfg.min_clearance_m,
+    }
+    frames: dict[str, Any] = {}
+    for frame in manifest.frames:
+        stats = frame_depth_stats(np.load(out_dir / frame.depth_path))
+        stats["passes"] = frame_passes_quality(stats, **thresholds)
+        frames[frame.frame_id] = stats
+    passing = sum(1 for s in frames.values() if s["passes"])
+    payload = {
+        "frame_stats_version": FRAME_STATS_VERSION,
+        "scene": manifest.scene,
+        "thresholds": thresholds,
+        "total": len(frames),
+        "passing": passing,
+        "by_regime": {
+            regime: sum(
+                1
+                for f in manifest.frames
+                if f.regime == regime and frames[f.frame_id]["passes"]
+            )
+            for regime in REGIMES
+        },
+        "frames": frames,
+    }
+    path.write_text(
+        json.dumps(json_safe(payload), indent=1, allow_nan=False), encoding="utf-8"
+    )
+    return payload
+
+
+def load_frame_stats(path: Path) -> dict[str, Any]:
+    """Load a frame-stats sidecar. Raises ValueError on a version mismatch."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    version = payload.get("frame_stats_version")
+    if version != FRAME_STATS_VERSION:
+        raise ValueError(f"frame stats version {version}, expected {FRAME_STATS_VERSION}")
+    return payload
+
+
+def passing_frame_ids(payload: dict[str, Any]) -> set[str]:
+    """Frame ids a scene's sidecar marks usable. The entry point for pair selection."""
+    return {fid for fid, stats in payload["frames"].items() if stats["passes"]}
+
+
+# ---------------------------------------------------------------------------
 # QC contact sheets
 # ---------------------------------------------------------------------------
 
@@ -1269,6 +1410,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="regenerate QC contact sheets from existing manifests",
     )
+    action_group.add_argument(
+        "--frame-stats",
+        action="store_true",
+        help="compute per-frame depth statistics into frame_stats.json",
+    )
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     if args.list_scenes:
@@ -1305,6 +1451,29 @@ def main(argv: list[str] | None = None) -> None:
                 + ", ".join(failures)
             )
         print(f"all {len(scenes)} scenes valid")
+        return
+    if args.frame_stats:
+        total = passing = 0
+        for scene in scenes:
+            out_dir = cfg.output_root / scene
+            stats_path = out_dir / FRAME_STATS_NAME
+            if stats_path.exists():
+                payload = load_frame_stats(stats_path)
+                print(f"[{scene}] stats exist, skipping")
+            else:
+                manifest = load_manifest(out_dir / MANIFEST_NAME)
+                payload = write_frame_stats(out_dir, manifest, cfg)
+                print(
+                    f"[{scene}] {payload['passing']} of {payload['total']} frames pass "
+                    f"{payload['by_regime']}"
+                )
+            total += payload["total"]
+            passing += payload["passing"]
+        if total:
+            print(
+                f"{passing} of {total} frames pass the per-frame depth filter "
+                f"({100 * passing / total:.1f} percent)"
+            )
         return
     for scene in scenes:
         if args.qc_only:

@@ -652,8 +652,13 @@ def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) 
 # Per-frame depth quality
 # ---------------------------------------------------------------------------
 
-FRAME_STATS_VERSION = 1
+FRAME_STATS_VERSION = 2
 FRAME_STATS_NAME = "frame_stats.json"
+
+# Defaults for the usability test below. They are deliberately permissive: the
+# job is to drop frames that are not views of the scene, not to judge views.
+MIN_USABLE_VALID_FRACTION = 0.5
+MIN_USABLE_CLEARANCE_M = 0.15
 
 # A depth below this is a rendering artifact, not a surface. Used wherever a
 # depth map is asked whether a pixel saw anything.
@@ -702,38 +707,56 @@ def frame_depth_stats(
     return stats
 
 
-def frame_passes_quality(
-    stats: dict[str, float],
-    min_valid_fraction: float = 0.7,
-    min_median_m: float = 1.5,
-    max_median_m: float = 8.0,
-    min_clearance_m: float = 0.5,
-) -> bool:
-    """Whether one frame is usable, by the same rules the viewpoint filter applies.
+def _stat(stats: dict[str, Any], key: str) -> float:
+    """Read one statistic as a float, with missing and null reading as nan.
 
-    Rendering only filtered the base view of each viewpoint. The translation and
-    orbit programs then move the camera up to 0.4 times the median scene depth
-    with physics disabled, so a derived frame can end up inside furniture or
-    pressed against a wall. This applies the base view's standard to every frame
-    after the fact, which is far cheaper than re-rendering.
+    A statistic no valid pixel supports is nan in memory and null on disk, since
+    a bare NaN token is not standard JSON. Both must read back the same way, or
+    a predicate that works on fresh measurements fails on reloaded ones.
     """
-    median = stats.get("median_m", float("nan"))
-    clearance = stats.get("center_p01_m", float("nan"))
-    if not math.isfinite(median) or not math.isfinite(clearance):
+    value = stats.get(key)
+    return float("nan") if value is None else float(value)
+
+
+def frame_is_usable(
+    stats: dict[str, float],
+    min_valid_fraction: float = MIN_USABLE_VALID_FRACTION,
+    min_clearance_m: float = MIN_USABLE_CLEARANCE_M,
+) -> bool:
+    """Whether one frame is a view of the scene at all.
+
+    Two things make a rendered frame unusable. The camera can sit inside or hard
+    against geometry, which shows up as almost no clearance in the middle of the
+    frame. Or it can point into unscanned space, which shows up as most of the
+    depth map being invalid. Both are tested here.
+
+    Median depth is deliberately not tested. The viewpoint filter used a median
+    depth band to choose where the camera should stand, and applying that band
+    per frame turned out to measure something else entirely: in-place rotation
+    frames share their camera position with a base view that already passed, so
+    they cannot be inside geometry, yet the band rejected 19.2 percent of them,
+    against 18.7 percent of translation frames. What it was really rejecting was
+    pitch sweeps looking at a floor or ceiling a metre away. Those are ordinary
+    views. Worse, median depth sets the parallax of every pair built from a
+    frame, so gating on it would thin the very ends of the study's main axis:
+    close views carry the large disparities where depth-dependent re-mapping
+    matters most, and distant views carry the near-homography regime. Median
+    depth belongs in the stratification, not in the gate.
+    """
+    clearance = _stat(stats, "center_p01_m")
+    if not math.isfinite(clearance):
         return False
-    return (
-        stats.get("valid_fraction", 0.0) >= min_valid_fraction
-        and min_median_m <= median <= max_median_m
-        and clearance >= min_clearance_m
-    )
+    return _stat(stats, "valid_fraction") >= min_valid_fraction and clearance >= min_clearance_m
 
 
-def write_frame_stats(out_dir: Path, manifest: Manifest, cfg: RenderConfig) -> dict[str, Any]:
-    """Compute per-frame depth statistics for one scene and write the sidecar.
+def write_frame_stats(out_dir: Path, manifest: Manifest) -> dict[str, Any]:
+    """Measure every frame's depth and write the sidecar. Refuses to overwrite.
 
-    Reads the depth files the manifest references. Refuses to overwrite an
-    existing sidecar. Records every raw statistic beside the verdict, so a later
-    phase can apply different thresholds without reading the depth files again.
+    The sidecar stores measurements only, never a stored verdict. Usability is a
+    policy, and a policy that has been written into a file cannot be revised
+    without recomputing the file, which is how a stale judgement outlives the
+    reasoning behind it. Callers get verdicts from usable_frame_ids, which
+    applies the current policy to these measurements.
     """
     out_dir = Path(out_dir)
     path = out_dir / FRAME_STATS_NAME
@@ -741,31 +764,23 @@ def write_frame_stats(out_dir: Path, manifest: Manifest, cfg: RenderConfig) -> d
         raise FileExistsError(
             f"{path} exists; outputs are never overwritten. Delete it to recompute."
         )
-    thresholds = {
-        "min_valid_fraction": cfg.min_valid_fraction,
-        "min_median_m": cfg.min_median_depth_m,
-        "max_median_m": cfg.max_median_depth_m,
-        "min_clearance_m": cfg.min_clearance_m,
+    frames = {
+        frame.frame_id: frame_depth_stats(np.load(out_dir / frame.depth_path))
+        for frame in manifest.frames
     }
-    frames: dict[str, Any] = {}
-    for frame in manifest.frames:
-        stats = frame_depth_stats(np.load(out_dir / frame.depth_path))
-        stats["passes"] = frame_passes_quality(stats, **thresholds)
-        frames[frame.frame_id] = stats
-    passing = sum(1 for s in frames.values() if s["passes"])
+    medians = sorted(
+        s["median_m"] for s in frames.values() if math.isfinite(s["median_m"])
+    )
     payload = {
         "frame_stats_version": FRAME_STATS_VERSION,
         "scene": manifest.scene,
-        "thresholds": thresholds,
         "total": len(frames),
-        "passing": passing,
-        "by_regime": {
-            regime: sum(
-                1
-                for f in manifest.frames
-                if f.regime == regime and frames[f.frame_id]["passes"]
-            )
-            for regime in REGIMES
+        "regimes": {f.frame_id: f.regime for f in manifest.frames},
+        # Recorded for Phase 3's parallax stratification, not used to gate.
+        "median_depth_quantiles_m": {
+            "p05": medians[len(medians) * 5 // 100] if medians else None,
+            "p50": medians[len(medians) // 2] if medians else None,
+            "p95": medians[len(medians) * 95 // 100] if medians else None,
         },
         "frames": frames,
     }
@@ -784,9 +799,29 @@ def load_frame_stats(path: Path) -> dict[str, Any]:
     return payload
 
 
-def passing_frame_ids(payload: dict[str, Any]) -> set[str]:
-    """Frame ids a scene's sidecar marks usable. The entry point for pair selection."""
-    return {fid for fid, stats in payload["frames"].items() if stats["passes"]}
+def usable_frame_ids(payload: dict[str, Any], **policy: float) -> set[str]:
+    """Frame ids that are views of the scene. The entry point for pair selection.
+
+    Applies frame_is_usable to the stored measurements, so the policy can change
+    without re-reading a single depth file.
+    """
+    return {
+        fid for fid, stats in payload["frames"].items() if frame_is_usable(stats, **policy)
+    }
+
+
+def frame_stats_summary(payload: dict[str, Any], **policy: float) -> dict[str, Any]:
+    """Usable counts overall and per regime, under the current policy."""
+    usable = usable_frame_ids(payload, **policy)
+    regimes = payload.get("regimes", {})
+    return {
+        "total": payload["total"],
+        "usable": len(usable),
+        "by_regime": {
+            regime: sum(1 for fid in usable if regimes.get(fid) == regime)
+            for regime in REGIMES
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1453,26 +1488,32 @@ def main(argv: list[str] | None = None) -> None:
         print(f"all {len(scenes)} scenes valid")
         return
     if args.frame_stats:
-        total = passing = 0
+        total = usable = 0
         for scene in scenes:
             out_dir = cfg.output_root / scene
             stats_path = out_dir / FRAME_STATS_NAME
             if stats_path.exists():
                 payload = load_frame_stats(stats_path)
-                print(f"[{scene}] stats exist, skipping")
+                note = "measured earlier"
             else:
-                manifest = load_manifest(out_dir / MANIFEST_NAME)
-                payload = write_frame_stats(out_dir, manifest, cfg)
-                print(
-                    f"[{scene}] {payload['passing']} of {payload['total']} frames pass "
-                    f"{payload['by_regime']}"
-                )
-            total += payload["total"]
-            passing += payload["passing"]
+                payload = write_frame_stats(out_dir, load_manifest(out_dir / MANIFEST_NAME))
+                note = "measured"
+            summary = frame_stats_summary(payload)
+            quantiles = payload["median_depth_quantiles_m"]
+            spread = "/".join(
+                "none" if quantiles[k] is None else f"{quantiles[k]:.1f}"
+                for k in ("p05", "p50", "p95")
+            )
+            print(
+                f"[{scene}] {note}: {summary['usable']} of {summary['total']} usable "
+                f"{summary['by_regime']}, scene depth p05/p50/p95 {spread} m"
+            )
+            total += summary["total"]
+            usable += summary["usable"]
         if total:
             print(
-                f"{passing} of {total} frames pass the per-frame depth filter "
-                f"({100 * passing / total:.1f} percent)"
+                f"{usable} of {total} frames are usable "
+                f"({100 * usable / total:.1f} percent)"
             )
         return
     for scene in scenes:

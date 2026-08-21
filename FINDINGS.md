@@ -68,12 +68,47 @@ Open, recorded rather than fixed:
   the effect: room_0 vp02 orbit_000 spans 0.04 to 6.46 m, and every room_0
   vp05 frame sits under 1.7 m. Phase 3 pair selection should filter on
   per-frame depth statistics rather than trust every rendered frame.
-  Closed before Phase 3. `--frame-stats` applies the base view's own standard
-  to every rendered frame after the fact and writes frame_stats.json beside
-  each manifest. Clearance is the first percentile of the central crop, not its
-  minimum, so a single stray near pixel cannot veto a frame while a real near
-  surface does. Every raw statistic is stored beside the verdict, so a later
-  phase can change thresholds without reading the depth files again.
+  Closed before Phase 3, but not the way it was framed. See the next entry.
+
+## Phase 3 preparation: the frame filter was measuring the wrong thing
+
+Applying the base view's own standard to every frame rejected 1208 of 5136
+frames, 23.5 percent. The per-regime rates are the finding:
+
+    rotation     1124/1391 pass, 19.2 percent rejected
+    translation  1479/1819 pass, 18.7 percent rejected
+    orbit        1325/1926 pass, 31.2 percent rejected
+
+Rotation frames cannot exhibit the hazard the filter was built for. An
+in-place rotation keeps the camera at the base viewpoint's position, and that
+position already passed the viewpoint filter, so the camera is not inside
+geometry. Yet rotation was rejected at 19.2 percent, indistinguishable from
+translation's 18.7. A filter that rejects a fifth of the frames it cannot
+possibly be right about is not measuring what it claims to.
+
+What it was actually rejecting is pitch sweeps. A pitch of plus or minus 15
+degrees at 1.5 m eye height looks at floor or ceiling about a metre away, and
+the median depth band of 1.5 to 8 m throws those out. They are ordinary views
+of real geometry.
+
+Gating on median depth would also have damaged the study. Parallax is baseline
+over median scene depth, so median depth is the study's main independent
+variable. Rejecting close views removes the large disparities where
+depth-dependent re-mapping matters most, and rejecting distant views removes
+the near-homography regime. The filter would have thinned both ends of the
+error ladder and left the middle, which is exactly where Transport-Only and a
+learned predictor are least distinguishable.
+
+The gate now tests only whether a frame is a view of the scene at all: enough
+valid depth that the camera is not pointed into unscanned space, and enough
+clearance in the central crop that the lens is not buried in a surface. Median
+depth is measured and recorded for stratification, never used to reject.
+
+The sidecar stores measurements only, with no verdict written into it. A
+stored verdict outlives the reasoning behind it, which is how this mistake
+would have propagated silently into every later phase. usable_frame_ids
+applies the current policy to the stored measurements, so a policy change
+costs nothing and re-reads no depth files.
 - Manifests written before this review can contain bare Infinity and NaN
   tokens, from probe views that came out ambiguous. Python reads them, strict
   JSON readers do not. New manifests write null instead. Check the batch with

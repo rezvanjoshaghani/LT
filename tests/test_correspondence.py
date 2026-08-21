@@ -102,6 +102,57 @@ def test_patch_center_mode_covers_exactly_the_covisible_patches():
     assert set(patch_cols.tolist()) == {0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13}
 
 
+def test_patch_center_rejects_centers_that_straddle_a_depth_edge():
+    """Interpolating across a depth edge lifts the center to a point in mid air.
+
+    Patch column 3 has its center at pixel 48.5, so it reads pixels 48 and 49.
+    With a surface step between them the interpolated depth is on neither
+    surface, and the warp it produces would be reported as ground truth while
+    matching nothing. The sampler must drop that patch and keep its neighbors.
+    """
+    scene = build_two_plane_scene()
+    depth = torch.full((IMAGE_SIZE, IMAGE_SIZE), 4.0, dtype=torch.float64)
+    depth[:, 49:] = 2.0
+    samples = sample_correspondences(
+        depth,
+        scene.K,
+        scene.K,
+        scene.T_target_from_context,
+        torch.ones((IMAGE_SIZE, IMAGE_SIZE), dtype=torch.bool),
+        10_000,
+        CTX_HW,
+        patch_size=PATCH,
+        mode="patch_center",
+        generator=torch.Generator().manual_seed(0),
+    )
+    cols = set(pixel_to_patch_coords(samples.uv_target[:, 0], PATCH).round().long().tolist())
+    assert 3 not in cols
+    assert {2, 4}.issubset(cols)
+
+
+def test_candidates_without_an_in_box_neighbor_are_dropped():
+    """Images under three patches wide can leave a warp with no in-box neighbor.
+
+    The neighbor null offsets by one patch along one axis. On a two-patch image
+    every in-box location has all four offsets out of the box, so there is no
+    neighbor to choose and the candidate cannot yield a complete sample.
+    """
+    side = 2 * PATCH
+    scene = build_two_plane_scene()
+    samples = sample_correspondences(
+        torch.full((side, side), 3.0, dtype=torch.float64),
+        scene.K,
+        scene.K,
+        torch.eye(4, dtype=torch.float64),
+        torch.ones((side, side), dtype=torch.bool),
+        16,
+        (side, side),
+        patch_size=PATCH,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert all(field.shape[0] == 0 for field in samples)
+
+
 def test_value_pairs_on_the_analytic_scene():
     scene, vm = _scene_and_masks()
     samples = _sample(scene, vm, 10_000, "patch_center")

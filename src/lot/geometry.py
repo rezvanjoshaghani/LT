@@ -28,12 +28,25 @@ def common_dtype(*tensors: Tensor) -> torch.dtype:
 
 
 def check_intrinsics(K: Tensor) -> None:
-    """Validate a 3x3 zero-skew OpenCV intrinsics matrix. Raises ValueError on mismatch."""
+    """Validate a 3x3 zero-skew OpenCV intrinsics matrix. Raises ValueError on mismatch.
+
+    Focal lengths must be positive. A negative focal length mirrors an image axis,
+    which every downstream function would carry out silently. The zero entries are
+    checked with a tolerance, matching check_se3, so a matrix that picked up float
+    noise in a constrained entry is not rejected for it.
+    """
     if K.shape != (3, 3):
         raise ValueError(f"K must be 3x3, got {tuple(K.shape)}")
     last_row = torch.tensor([0.0, 0.0, 1.0], dtype=K.dtype, device=K.device)
-    if K[0, 1] != 0 or K[1, 0] != 0 or not torch.equal(K[2], last_row):
-        raise ValueError("K must have zero skew and last row [0, 0, 1]")
+    zero = torch.zeros((), dtype=K.dtype, device=K.device)
+    if not torch.allclose(K[0, 1], zero) or not torch.allclose(K[1, 0], zero):
+        raise ValueError("K must have zero skew")
+    if not torch.allclose(K[2], last_row):
+        raise ValueError("K must have last row [0, 0, 1]")
+    if float(K[0, 0]) <= 0 or float(K[1, 1]) <= 0:
+        raise ValueError(
+            f"K must have positive focal lengths, got {float(K[0, 0])}, {float(K[1, 1])}"
+        )
 
 
 def check_se3(T: Tensor) -> None:

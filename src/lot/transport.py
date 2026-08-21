@@ -27,6 +27,7 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
+from .encoders import PATCH_SIZE
 from .geometry import (
     check_intrinsics,
     common_dtype,
@@ -54,7 +55,7 @@ def transport(
     K_tgt: Tensor,
     T_tgt_from_ctx: Tensor,
     out_hw_px: tuple[int, int],
-    patch_size: int = 14,
+    patch_size: int = PATCH_SIZE,
 ) -> TransportResult:
     """Reproject context patch features into the target camera.
 
@@ -65,6 +66,8 @@ def transport(
     K_ctx, K_tgt: 3x3 intrinsics of the context and target cameras.
     T_tgt_from_ctx: the canonical relative transform from geometry.relative_pose.
     out_hw_px: (H_out, W_out) target size in pixels, both divisible by patch_size.
+    Every input is moved to the device of features_ctx, which is the device the
+    result is returned on.
     Returns float32 features and coverage. The z-buffer keeps the geometry dtype.
     """
     check_intrinsics(K_ctx)
@@ -88,9 +91,12 @@ def transport(
 
     dtype = common_dtype(depth_ctx_px, K_ctx, K_tgt, T_tgt_from_ctx)
     device = features_ctx.device
+    K_ctx = K_ctx.to(device)
+    K_tgt = K_tgt.to(device)
+    T_tgt_from_ctx = T_tgt_from_ctx.to(device)
 
     uv = pixel_grid(height, width, dtype=dtype, device=device)
-    z = depth_ctx_px.to(dtype)
+    z = depth_ctx_px.to(device=device, dtype=dtype)
     points_ctx = unproject(uv, z, K_ctx)
     points_tgt = transform_points(T_tgt_from_ctx, points_ctx)
     uv_tgt, z_tgt = project(points_tgt, K_tgt)

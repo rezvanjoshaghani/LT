@@ -10,6 +10,7 @@ from scenes import (
     OUT_OF_VIEW_TGT_COLS,
     PATCH,
     Z_BACK,
+    build_subpixel_two_plane_scene,
     build_two_plane_scene,
 )
 
@@ -104,6 +105,26 @@ def test_invalid_context_depth_is_conservative():
     assert flipped[hole_row, hole_col - 28]
     # Nothing becomes co-visible that was not before.
     assert not (vm.covisible & ~baseline.covisible).any()
+
+
+def test_subpixel_disparities_match_continuous_geometry():
+    """The referee must not invent depths between two surfaces.
+
+    Every reprojected location here falls between pixel centers. Reading the
+    context depth map by interpolation returns blended depths along both
+    occlusion edges, which rejects background points the context camera really
+    sees. The masks must instead agree with the continuous geometry everywhere.
+    """
+    scene = build_subpixel_two_plane_scene()
+    vm = visibility_masks(
+        scene.depth_target,
+        scene.depth_context,
+        scene.K,
+        scene.K,
+        scene.T_target_from_context,
+    )
+    assert torch.equal(vm.covisible, scene.covisible_target)
+    assert torch.equal(vm.disoccluded, ~scene.covisible_target)
 
 
 def test_fraction_per_patch_small_example():

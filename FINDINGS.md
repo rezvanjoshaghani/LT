@@ -26,3 +26,55 @@ in this project. Each entry names the evidence trail.
 - Batch totals: 18 of 18 manifests validate; 5136 frames = 107 viewpoints
   x 48 frames. One scene accepted 5 of 6 viewpoints under the depth
   quality filter, which the design permits.
+
+## Phase 1 review, before starting Phase 2 (2026-08-21)
+
+A review of the Phase 0 core found defects that the analytic scenes could not
+reach. All disparities in the two-plane scene are whole pixels, so every
+reprojected location lands on a pixel center. That is exactly where an
+interpolated read and a nearest read agree, so no test could see the
+difference. tests/scenes.py now also carries a sub-pixel two-plane scene whose
+edges and disparities both fall between pixels.
+
+Fixed, each with a regression test:
+
+- The co-visibility referee read the context depth map by bilinear
+  interpolation. A depth map is a z-buffer. Interpolating across an occlusion
+  edge returns a depth that lies on no surface. Background points the context
+  camera really sees were therefore labelled disoccluded in a band about one
+  pixel wide along every occlusion edge, and points in the depth gap could be
+  labelled co-visible. At the smallest parallax bin the true disocclusion
+  strip is only about ten pixels wide, so this bucket was contaminated most
+  where the study cares most. The referee now reads the z-buffer with nearest
+  sampling.
+- The frustum test used pixel-center bounds while transport splats over the
+  full pixel extent, so the two disagreed on a half-pixel border band. Both
+  now use the physical extent.
+- Correspondence sampling in patch_center mode interpolated the target depth
+  across the four pixels around a patch center without checking they share a
+  surface. A center on a depth edge was lifted to a point in mid air, and its
+  warp missed both surfaces by about half a patch at the rendered resolution.
+  Those centers are now dropped.
+- The neighbour null could hand torch.multinomial an all-zero row on images
+  under three patches wide. Such candidates are now dropped before sampling.
+- check_intrinsics accepted zero and negative focal lengths, which mirror or
+  collapse an image axis silently. It now requires positive focal lengths.
+
+Open, recorded rather than fixed:
+
+- Translation and orbit frames carry no per-frame quality check. Only the base
+  view of each viewpoint passes the depth filter, and the derived frames move
+  up to 0.4 times the median depth away with physics disabled. Pilot QC shows
+  the effect: room_0 vp02 orbit_000 spans 0.04 to 6.46 m, and every room_0
+  vp05 frame sits under 1.7 m. Phase 3 pair selection should filter on
+  per-frame depth statistics rather than trust every rendered frame.
+- Manifests written before this review can contain bare Infinity and NaN
+  tokens, from probe views that came out ambiguous. Python reads them, strict
+  JSON readers do not. New manifests write null instead. Check the batch with
+  `python -c "import json,sys;[json.loads(open(p).read(),parse_constant=lambda c:sys.exit(p)) for p in sys.argv[1:]]" data/replica_renders/*/manifest.json`.
+- transport allocates a full feature vector per splatted pixel, which is
+  824 MB per buffer at 518 px with 768 channels. Phase 3 needs the
+  weight-matrix form before it runs over tens of thousands of pairs.
+- The per-pair pixel pipeline runs in float64 because manifest intrinsics and
+  poses load as float64. Measured cost is 40 percent on CPU and far more on a
+  consumer GPU.

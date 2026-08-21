@@ -1,9 +1,37 @@
 """PLAN Phase 0, test 1: projection round trips and transform composition."""
 
+import pytest
 import torch
 
 from lot import geometry
 from scenes import build_rotation_scene, intrinsics, random_se3
+
+
+def test_check_intrinsics_rejects_degenerate_focal_lengths():
+    """A mirrored or zero focal length is carried out silently by every consumer."""
+    K = intrinsics()
+    geometry.check_intrinsics(K)
+    flipped = K.clone()
+    flipped[1, 1] = -flipped[1, 1]
+    with pytest.raises(ValueError, match="positive focal"):
+        geometry.check_intrinsics(flipped)
+    zero = K.clone()
+    zero[0, 0] = 0.0
+    with pytest.raises(ValueError, match="positive focal"):
+        geometry.check_intrinsics(zero)
+
+
+def test_check_intrinsics_tolerates_float_noise_in_the_zero_entries():
+    """The constrained entries are checked with a tolerance, like check_se3."""
+    K = intrinsics()
+    noisy = K.clone()
+    noisy[0, 1] = 1e-18
+    noisy[2, 0] = 1e-18
+    geometry.check_intrinsics(noisy)
+    skewed = K.clone()
+    skewed[0, 1] = 0.5
+    with pytest.raises(ValueError, match="zero skew"):
+        geometry.check_intrinsics(skewed)
 
 
 def _random_points(n: int, generator: torch.Generator) -> torch.Tensor:

@@ -237,6 +237,78 @@ def build_single_plane_scene(disparity_px: int = 7) -> SinglePlaneScene:
 
 
 @dataclasses.dataclass(frozen=True)
+class SubPixelTwoPlaneScene:
+    """Two planes whose disparities are not whole pixels.
+
+    The two-plane scene above is built so every disparity is an exact integer.
+    That makes its analytic answers exact, but it also means every reprojected
+    location lands on a pixel center, where interpolation and nearest sampling
+    agree. This scene breaks that: the occlusion edges and the disparities both
+    fall between pixels, so the visibility referee is tested where a depth map
+    read has to choose what a z-buffer entry means.
+
+    Layout, all in the world frame of the context camera:
+    - Context camera at the origin, target camera at (BASELINE_SUB, 0, 0), both
+      with identity rotation and the shared intrinsics.
+    - Back plane at z = Z_BACK filling the view. Front slab at z = Z_FRONT
+      spanning world x in [SLAB_X0, SLAB_X1], which is not patch aligned.
+    """
+
+    K: Tensor
+    T_target_from_context: Tensor
+    depth_context: Tensor    # [H, W] float64
+    depth_target: Tensor     # [H, W] float64
+    covisible_target: Tensor  # [H, W] bool, from continuous geometry
+
+
+BASELINE_SUB = 0.1
+SLAB_X0 = -0.1
+SLAB_X1 = 0.4
+
+
+def _two_plane_depth(camera_x: float) -> Tensor:
+    """Depth seen by a camera at world (camera_x, 0, 0) with identity rotation.
+
+    A pixel sees the front slab when its ray crosses z = Z_FRONT inside the slab,
+    and the back plane otherwise.
+    """
+    u = torch.arange(IMAGE_SIZE, dtype=torch.float64)
+    x_at_front = camera_x + Z_FRONT * (u - CX) / FX
+    on_slab = (x_at_front >= SLAB_X0) & (x_at_front <= SLAB_X1)
+    d = torch.where(on_slab, torch.full_like(u, Z_FRONT), torch.full_like(u, Z_BACK))
+    return d[None, :].expand(IMAGE_SIZE, IMAGE_SIZE).clone()
+
+
+def build_subpixel_two_plane_scene() -> SubPixelTwoPlaneScene:
+    K = intrinsics()
+    T_world_from_context = make_pose()
+    T_world_from_target = make_pose(t=torch.tensor([BASELINE_SUB, 0.0, 0.0]))
+    T_target_from_context = relative_pose(T_world_from_target, T_world_from_context)
+    depth_context = _two_plane_depth(0.0)
+    depth_target = _two_plane_depth(BASELINE_SUB)
+
+    # Continuous ground truth, per target pixel column. Lift the target pixel to
+    # its surface point, ask where that point lands in the context image, and ask
+    # whether the context ray to it crosses the slab first.
+    u = torch.arange(IMAGE_SIZE, dtype=torch.float64)
+    depth = depth_target[0]
+    x_world = BASELINE_SUB + depth * (u - CX) / FX
+    u_in_context = CX + FX * x_world / depth
+    inside_context = (u_in_context >= -0.5) & (u_in_context < IMAGE_SIZE - 0.5)
+    x_at_front = x_world * Z_FRONT / depth
+    behind_slab = (depth > Z_FRONT) & (x_at_front >= SLAB_X0) & (x_at_front <= SLAB_X1)
+    covisible = (inside_context & ~behind_slab)[None, :].expand(IMAGE_SIZE, IMAGE_SIZE)
+
+    return SubPixelTwoPlaneScene(
+        K=K,
+        T_target_from_context=T_target_from_context,
+        depth_context=depth_context,
+        depth_target=depth_target,
+        covisible_target=covisible.clone(),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class RotationScene:
     K: Tensor
     T_target_from_context: Tensor

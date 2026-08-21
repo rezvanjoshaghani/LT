@@ -43,6 +43,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from lot.encoders import PATCH_SIZE
 from lot.geometry import check_intrinsics, check_se3, pixel_grid
 
 REGIMES = ("rotation", "translation", "orbit")
@@ -523,6 +524,22 @@ class Manifest:
     frames: list[FrameRecord]
 
 
+def json_safe(value: Any) -> Any:
+    """Replace non-finite floats with null so a payload stays standard JSON.
+
+    Probe statistics carry inf and nan when a probe view is unusable. Python's
+    json writes those as bare Infinity and NaN tokens and reads them back, but no
+    strict reader accepts them, and the manifest is the cross-phase interface.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value
+
+
 def write_manifest(path: Path, manifest: Manifest) -> None:
     """Serialize a manifest to JSON. Poses and intrinsics as nested lists."""
     payload = {
@@ -547,7 +564,9 @@ def write_manifest(path: Path, manifest: Manifest) -> None:
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    path.write_text(
+        json.dumps(json_safe(payload), indent=1, allow_nan=False), encoding="utf-8"
+    )
 
 
 def load_manifest(path: Path) -> Manifest:
@@ -618,11 +637,15 @@ def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) 
                 raise ValueError(f"{f.frame_id}: missing rgb file {rgb}")
             if not depth.is_file():
                 raise ValueError(f"{f.frame_id}: missing depth file {depth}")
-            arr = np.load(depth)
-            if arr.shape != (f.height, f.width):
-                raise ValueError(f"{f.frame_id}: depth shape {arr.shape}")
-            if arr.dtype != np.float32:
-                raise ValueError(f"{f.frame_id}: depth dtype {arr.dtype}")
+            # Header only. Shape and dtype are all this checks, and a batch is
+            # thousands of megabyte arrays on a network filesystem.
+            arr = np.load(depth, mmap_mode="r")
+            shape, dtype = arr.shape, arr.dtype
+            del arr
+            if shape != (f.height, f.width):
+                raise ValueError(f"{f.frame_id}: depth shape {shape}")
+            if dtype != np.float32:
+                raise ValueError(f"{f.frame_id}: depth dtype {dtype}")
 
 
 # ---------------------------------------------------------------------------
@@ -742,8 +765,10 @@ class RenderConfig:
         unknown = [s for s in self.scenes if s not in REPLICA_SCENES]
         if unknown:
             raise ValueError(f"unknown Replica scenes: {unknown}")
-        if self.image_height % 14 or self.image_width % 14:
-            raise ValueError("image size must be a multiple of the patch size 14")
+        if self.image_height % PATCH_SIZE or self.image_width % PATCH_SIZE:
+            raise ValueError(
+                f"image size must be a multiple of the patch size {PATCH_SIZE}"
+            )
 
 
 def load_config(path: Path) -> RenderConfig:
@@ -874,20 +899,24 @@ def make_sim(cfg: RenderConfig, scene: str):
     if not sim.pathfinder.is_loaded and navmesh_path.is_file():
         sim.pathfinder.load_nav_mesh(str(navmesh_path))
         navmesh_source = "dataset"
-    if sim.pathfinder.is_loaded and not _navmesh_matches_geometry(
-        sim, cfg.eye_height_m
-    ):
-        # Seen in Replica: some scenes ship a navmesh in a different frame
-        # than mesh.ply, so its points stand outside the rendered shell.
-        print(
-            f"[{scene}] {navmesh_source} navmesh points miss the rendered "
-            "geometry; recomputing from the scene mesh"
-        )
-        _recompute_navmesh(sim, habitat_sim, cfg.eye_height_m, scene)
-        navmesh_source = "recomputed"
+    # The floor-visibility check draws random navigable points, so the pathfinder
+    # is seeded before every block of draws. An unseeded draw here would make the
+    # keep or recompute decision, and therefore the whole scene, irreproducible.
+    if sim.pathfinder.is_loaded:
+        sim.pathfinder.seed(seed)
+        if not _navmesh_matches_geometry(sim, cfg.eye_height_m):
+            # Seen in Replica: some scenes ship a navmesh in a different frame
+            # than mesh.ply, so its points stand outside the rendered shell.
+            print(
+                f"[{scene}] {navmesh_source} navmesh points miss the rendered "
+                "geometry; recomputing from the scene mesh"
+            )
+            _recompute_navmesh(sim, habitat_sim, cfg.eye_height_m, scene)
+            navmesh_source = "recomputed"
     if not sim.pathfinder.is_loaded:
         _recompute_navmesh(sim, habitat_sim, cfg.eye_height_m, scene)
         navmesh_source = "recomputed"
+    sim.pathfinder.seed(seed)
     if not _navmesh_matches_geometry(sim, cfg.eye_height_m):
         raise RuntimeError(
             f"navmesh for {scene} still misses the rendered geometry after "
@@ -988,7 +1017,7 @@ def probe_depth_convention(
                 break
     finally:
         (probe_dir / "classification.json").write_text(
-            json.dumps(probes, indent=1), encoding="utf-8"
+            json.dumps(json_safe(probes), indent=1, allow_nan=False), encoding="utf-8"
         )
     if not verdicts:
         raise RuntimeError(
@@ -1013,7 +1042,6 @@ def probe_depth_convention(
 def sample_viewpoints(
     sim,
     cfg: RenderConfig,
-    K: Tensor,
     rng: np.random.Generator,
     to_planar: Callable[[np.ndarray], np.ndarray],
 ) -> list[dict[str, Any]]:
@@ -1128,7 +1156,7 @@ def render_scene(cfg: RenderConfig, scene: str) -> Path:
             return d.to(torch.float32).numpy()
 
         rng = np.random.default_rng(scene_seed(cfg.seed, scene))
-        viewpoints = sample_viewpoints(sim, cfg, K, rng, to_planar)
+        viewpoints = sample_viewpoints(sim, cfg, rng, to_planar)
         print(f"[{scene}] {len(viewpoints)} viewpoints accepted")
 
         records: list[FrameRecord] = []

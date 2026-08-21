@@ -13,6 +13,19 @@ Definitions, fixed by CLAUDE.md:
 
 Visibility buckets always come from ground-truth geometry of both views.
 Estimated depth is never the referee.
+
+The context depth map is read with nearest-cell sampling, not bilinear. A depth
+map is a z-buffer: cell (v, u) holds the depth of the surface along the ray
+through that pixel center. Interpolating between two cells across a depth edge
+invents a depth that lies on no surface, and the invented value both rejects
+background points the context camera really sees and accepts points it never
+saw. The band this corrupts is about one pixel wide along every occlusion edge,
+which is a large fraction of the disocclusion strip at small parallax. Nearest
+sampling answers the question the definition actually asks: did the context
+pixel that images this point record this depth. The cost is that on a strongly
+slanted surface the half-pixel quantization shifts the compared depth by half a
+local gradient step, which stays well inside the tolerance for the depth ranges
+in this study.
 """
 
 from __future__ import annotations
@@ -22,7 +35,7 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from .encoders import sample_map_bilinear
+from .encoders import sample_map_nearest
 from .geometry import (
     common_dtype,
     invert_se3,
@@ -34,9 +47,9 @@ from .geometry import (
 
 DEFAULT_RELATIVE_DEPTH_TOL = 0.015
 
-# Invalid context depths are replaced by this large finite value before bilinear
-# sampling. Any sample that draws weight from an invalid entry fails the depth
-# tolerance test, so pixels near depth holes are conservatively not co-visible.
+# Invalid context depths are replaced by this large finite value before sampling.
+# A sample that reads an invalid entry fails the depth tolerance test, so pixels
+# landing on depth holes are conservatively not co-visible.
 _INVALID_DEPTH_SENTINEL = 1e30
 
 
@@ -80,15 +93,19 @@ def visibility_masks(
 
     u = uv_context[..., 0]
     v = uv_context[..., 1]
+    # Bounds are the physical image extent, not the pixel-center box: pixel W - 1
+    # spans up to W - 0.5, and the context camera images everything inside that.
+    # This is the same rule transport.py applies when it decides which target
+    # pixel a splat lands on, so the two modules agree on the border.
     in_frustum = (
         valid
         & (z_context > 0)
         & torch.isfinite(u)
         & torch.isfinite(v)
-        & (u >= 0)
-        & (u <= ctx_width - 1)
-        & (v >= 0)
-        & (v <= ctx_height - 1)
+        & (u >= -0.5)
+        & (u < ctx_width - 0.5)
+        & (v >= -0.5)
+        & (v < ctx_height - 0.5)
     )
 
     d = depth_context.to(dtype)
@@ -98,7 +115,7 @@ def visibility_masks(
         torch.full_like(d, _INVALID_DEPTH_SENTINEL),
     )
     safe_uv = torch.where(in_frustum[..., None], uv_context, torch.zeros_like(uv_context))
-    depth_seen = sample_map_bilinear(d, safe_uv)
+    depth_seen = sample_map_nearest(d, safe_uv)
     depth_agrees = (z_context - depth_seen).abs() <= rel_tol * z_context
 
     covisible = in_frustum & depth_agrees

@@ -14,6 +14,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from .geometry import common_dtype
+
 PATCH_SIZE = 14
 
 
@@ -43,9 +45,7 @@ def sample_map_bilinear(grid: Tensor, xy: Tensor) -> Tensor:
     if g.dim() != 3:
         raise ValueError(f"grid must be [H, W] or [C, H, W], got {tuple(grid.shape)}")
     channels, height, width = g.shape
-    dtype = torch.promote_types(g.dtype, xy.dtype)
-    if not dtype.is_floating_point:
-        dtype = torch.get_default_dtype()
+    dtype = common_dtype(g, xy)
     g = g.to(dtype)
     x = xy[..., 0].to(dtype).clamp(0, width - 1)
     y = xy[..., 1].to(dtype).clamp(0, height - 1)
@@ -66,6 +66,32 @@ def sample_map_bilinear(grid: Tensor, xy: Tensor) -> Tensor:
         + v11 * wx * wy
     )
     out = torch.movedim(out, 0, -1)
+    return out[..., 0] if squeeze else out
+
+
+def sample_map_nearest(grid: Tensor, xy: Tensor) -> Tensor:
+    """Nearest-cell sampling on a regular grid whose cell centers sit at integer coordinates.
+
+    grid: [H, W] or [C, H, W].
+    xy: [..., 2] continuous coordinates (x along width, y along height), in grid units.
+    Must be finite. A coordinate is assigned to the cell whose extent contains it,
+    by the same floor(x + 0.5) rule the transport splat uses, so the two agree on
+    which cell a continuous location belongs to. Coordinates outside the grid are
+    clamped to the border.
+    Returns [...] for a 2D grid and [..., C] for a 3D grid.
+
+    Nearest sampling reads a value the grid actually holds. Bilinear sampling of a
+    depth map does not: across a depth edge it returns a depth that lies on neither
+    surface. See visibility.py for why that distinction is load bearing there.
+    """
+    squeeze = grid.dim() == 2
+    g = grid[None] if squeeze else grid
+    if g.dim() != 3:
+        raise ValueError(f"grid must be [H, W] or [C, H, W], got {tuple(grid.shape)}")
+    _, height, width = g.shape
+    x = torch.floor(xy[..., 0] + 0.5).long().clamp(0, width - 1)
+    y = torch.floor(xy[..., 1] + 0.5).long().clamp(0, height - 1)
+    out = torch.movedim(g[:, y, x], 0, -1)
     return out[..., 0] if squeeze else out
 
 

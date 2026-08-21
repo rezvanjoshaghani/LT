@@ -148,6 +148,57 @@ at the top of the parallax range will be genuinely hard.
   poses load as float64. Measured cost is 40 percent on CPU and far more on a
   consumer GPU.
 
+## Phase 3: Experiment Zero, verdict (accepted 2026-08-21)
+
+DINOv2 ViT-B/14 is the encoder for all later phases. Its patch features behave
+like properties of the surface they sit on: transporting them with ground-truth
+geometry beats copying them unwarped by 0.140 cosine on centered features, the
+advantage grows with parallax from 0.075 to 0.147, and landing one patch off
+the correct location costs 0.088, so the agreement is sharply localized rather
+than a general similarity between any two features of the same room. VGGT's
+last-layer aggregator tokens do not behave that way: their margin is 0.013, a
+tenth of DINOv2's, and landing one patch off costs nothing measurable at
+-0.009, which says those tokens vary too slowly across the image to carry the
+surface identity transport exists to move.
+
+The full numbers, pooled over everything, centered, per-point path:
+
+    encoder        Random  Mean-Feature  No-Warp  Neighbor  Oracle  margin
+    dinov2_vitb14  0.0879        0.2465   0.5247    0.5765  0.6642  +0.1395
+    vggt_1b        0.1761        0.3433   0.7873    0.7783  0.8002  +0.0129
+
+Reading VGGT's row across is the whole story. Its floor sits at 0.787 while its
+correct answer sits at 0.800, and its one-patch-off null sits between them at
+0.778, below the floor. A feature whose value barely changes when you move a
+patch, and barely improves when you move it to the right place, is not encoding
+which surface is there. It behaves like slowly varying scene context indexed by
+image position, which is what the aggregator is for. Warping it actively hurts
+in the two regimes with the largest image displacement, pure rotation at -0.046
+and the largest parallax bin at -0.013, because moving a position-indexed
+quantity to a geometrically correct location destroys the positional agreement
+that made the unwarped copy match.
+
+This is a statement about the last aggregator layer, which PLAN's Phase 2 chose
+because it is what VGGT's own heads consume. Earlier layers and the depth head
+were not tested and could behave differently. That is a limitation of the
+verdict, not a hidden result.
+
+Centering did not change what DINOv2 says, which is the reason to trust it. The
+margin moves from 0.123 to 0.140, the growth with parallax from 0.065-to-0.134
+to 0.075-to-0.147, and the zero bin from 0.248 to 0.288. Every ordering and
+every trend survives. For VGGT centering quadrupled the margin, from 0.003 to
+0.013, and left it an order of magnitude short.
+
+The two paths agree to 0.001 in the centered reading as well, 0.6642 per-point
+against 0.6647 splat-and-pool. The splat, z-buffer, and pooling machinery costs
+nothing measurable, so the later phases measure representations rather than the
+implementation.
+
+Still open, recorded rather than fixed: rotation is one parallax stratum by
+construction, so the zero bin pools 7.5 to 60 degrees of yaw. Its margin of
+0.288 is an average across that whole range. The rotation regime should be
+stratified by angle before these numbers go in a paper.
+
 ## Phase 3: Experiment Zero, first run and what it exposed (2026-08-21)
 
 The first run scored 7300 pairs across 18 scenes. DINOv2 produced an ordered,

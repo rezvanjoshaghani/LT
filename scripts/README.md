@@ -1,4 +1,10 @@
-# Cluster runbook for Phase 1 rendering
+# Cluster runbook
+
+Phase 1 renders Replica. Phase 2 caches frozen features from those renders.
+The two phases use different environments, because habitat-sim pins an old
+Python and the encoders want a current torch.
+
+# Phase 1: rendering
 
 Habitat-Sim runs on Linux only. Rendering happens on the Borah cluster (or
 any Linux box with a GPU; sync the data afterwards, scenes are small). The
@@ -81,3 +87,64 @@ are never overwritten; delete a scene directory manually to re-render it.
 If headless EGL rendering fails on the cluster even with modules loaded,
 render on a Linux machine with a display driver and sync
 `data/replica_renders*/` back (the CLAUDE.md fallback).
+
+# Phase 2: feature caching
+
+Encoding needs a current torch and a GPU, but not habitat-sim, so it runs in
+its own environment. Everything except the two model wrappers is tested
+locally by `tests/test_encoder_cache.py` against a stub encoder.
+
+## 1. Environment (once)
+
+```bash
+micromamba create -y -n lot-encode -c conda-forge python=3.11 pyyaml pillow numpy
+micromamba run -n lot-encode pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+VGGT is a separate install and is only needed for the `vggt_1b` config:
+
+```bash
+micromamba run -n lot-encode pip install "vggt @ git+https://github.com/facebookresearch/vggt"
+```
+
+Weights download once. `cache_features.sbatch` points `TORCH_HOME` and
+`HF_HOME` at `cache/` in the repository, so compute nodes without internet
+still work after one login-node run has populated them:
+
+```bash
+TORCH_HOME=$PWD/cache/torch micromamba run -n lot-encode \
+    python -c "import torch; torch.hub.load('facebookresearch/dinov2','dinov2_vitb14',trust_repo=True)"
+```
+
+## 2. Pilot, then the batch
+
+```bash
+export SLURM_ACCOUNT=<account> SLURM_PARTITION=<gpu partition>
+sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+       scripts/cache_features.sbatch configs/cache_features_pilot.yaml
+sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+       --array 0-17 scripts/cache_features.sbatch configs/cache_features_all.yaml
+python -m lot.encoders --config configs/cache_features_all.yaml --validate-only
+```
+
+Then the same array against `configs/cache_features_vggt.yaml`, which also
+exports VGGT's estimated depth for Phase 4.
+
+Caches land in `cache/features/<encoder>/<scene>/`. A finished cache is never
+overwritten; the sbatch passes `--resume`, so re-running an array skips scenes
+that are already done and a failed task can simply be resubmitted.
+
+## What to check
+
+`meta.json` per scene records the channel count, the patch grid, the frame
+ids, and the measured rate. `--validate-only` re-checks every frame's shape
+and dtype against the manifest, so a truncated archive fails loudly rather
+than surfacing as missing features in Phase 3.
+
+Reference numbers from an RTX 2080 Super at 518 px, DINOv2 ViT-B/14 at batch
+8: about 9 frames per second end to end, which is roughly 10 minutes for all
+5136 frames, in 0.8 GB of GPU memory. The model alone runs at about 21 frames
+per second, so the rest is PNG decode and host transfer; a faster GPU moves
+the ceiling but not the floor. The cache is about 2.1 MB per frame, so the
+full set is roughly 11 GB per encoder. VGGT is a much larger model; start it
+at batch 2 and raise it if memory allows.

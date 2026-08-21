@@ -1,0 +1,311 @@
+"""PLAN Phase 2: encoder wrappers and the feature cache.
+
+The two model wrappers need weights, network, and a GPU, so they are exercised
+by a smoke test gated on LOT_ENCODER_SMOKE, the same way the Habitat render is
+gated. Everything else here runs anywhere against a stub encoder, so the cache
+format, the metadata, and the validation rules are pinned without downloads.
+"""
+
+import dataclasses
+import json
+import os
+
+import numpy as np
+import pytest
+import torch
+
+from lot.encoders import (
+    CACHE_META_NAME,
+    CACHE_VERSION,
+    ENCODERS,
+    FEATURES_NAME,
+    CacheConfig,
+    EncodedBatch,
+    EncoderSpec,
+    FrozenEncoder,
+    cache_dir,
+    cache_scene_features,
+    load_cache_config,
+    load_cached_depth,
+    load_cached_features,
+    load_encoder,
+    patch_grid_shape,
+    preprocess_images,
+    validate_feature_cache,
+)
+from test_render_replica import fake_scene_dir
+
+STUB_CHANNELS = 5
+
+
+def stub_spec(provides_depth: bool = False) -> EncoderSpec:
+    return EncoderSpec(
+        name="stub_depth" if provides_depth else "stub",
+        patch_size=14,
+        normalization="unit",
+        provides_depth=provides_depth,
+        source="stub",
+        channels=STUB_CHANNELS,
+    )
+
+
+class StubEncoder(FrozenEncoder):
+    """Deterministic stand-in for a frozen encoder. Never loads a model.
+
+    Each channel of a patch holds the mean brightness of that patch's pixels,
+    so a cached value can be checked against the source image by hand.
+    """
+
+    def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
+        count, height, width, _ = images_uint8.shape
+        patches_h, patches_w = patch_grid_shape((height, width), self.spec.patch_size)
+        gray = torch.from_numpy(images_uint8.astype(np.float32)).mean(dim=-1)
+        pooled = gray.reshape(
+            count, patches_h, self.spec.patch_size, patches_w, self.spec.patch_size
+        ).mean(dim=(2, 4))
+        features = pooled[:, None].expand(count, STUB_CHANNELS, patches_h, patches_w)
+        depth = None
+        if self.spec.provides_depth:
+            depth = gray / 100.0
+        return EncodedBatch(features=features.contiguous(), depth=depth, depth_conf=None)
+
+
+class BadShapeEncoder(FrozenEncoder):
+    """Returns a transposed patch grid, which the base class must reject."""
+
+    def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
+        count, height, width, _ = images_uint8.shape
+        patches_h, patches_w = patch_grid_shape((height, width), self.spec.patch_size)
+        features = torch.zeros((count, STUB_CHANNELS, patches_w + 1, patches_h))
+        return EncodedBatch(features=features, depth=None, depth_conf=None)
+
+
+# ---------------------------------------------------------------------------
+# Grid and preprocessing
+# ---------------------------------------------------------------------------
+
+def test_patch_grid_shape():
+    assert patch_grid_shape((518, 518)) == (37, 37)
+    assert patch_grid_shape((28, 42)) == (2, 3)
+    with pytest.raises(ValueError, match="whole number"):
+        patch_grid_shape((518, 500))
+
+
+def test_preprocess_normalizes_and_keeps_the_image_size():
+    spec = ENCODERS["dinov2_vitb14"]
+    images = np.zeros((2, 28, 28, 3), dtype=np.uint8)
+    images[1] = 255
+    x = preprocess_images(images, spec)
+    assert x.shape == (2, 3, 28, 28)
+    # Black and white map to the ImageNet-normalized extremes of each channel.
+    assert torch.allclose(x[0, 0, 0, 0], torch.tensor(-0.485 / 0.229), atol=1e-6)
+    assert torch.allclose(x[1, 0, 0, 0], torch.tensor((1 - 0.485) / 0.229), atol=1e-6)
+
+
+def test_preprocess_rejects_sizes_that_are_not_whole_patches():
+    """A resize would silently break the pixel-to-patch mapping this module owns."""
+    with pytest.raises(ValueError, match="whole number"):
+        preprocess_images(np.zeros((1, 30, 28, 3), dtype=np.uint8), ENCODERS["dinov2_vitb14"])
+    with pytest.raises(ValueError, match="uint8"):
+        preprocess_images(np.zeros((1, 28, 28, 3), dtype=np.float32), ENCODERS["dinov2_vitb14"])
+
+
+def test_unit_normalization_leaves_the_zero_to_one_range():
+    spec = ENCODERS["vggt_1b"]
+    images = np.full((1, 28, 28, 3), 255, dtype=np.uint8)
+    assert torch.allclose(preprocess_images(images, spec), torch.ones(1, 3, 28, 28))
+
+
+def test_encoder_checks_the_shape_it_was_given_back():
+    encoder = BadShapeEncoder(stub_spec(), "cpu")
+    with pytest.raises(RuntimeError, match="expected"):
+        encoder.encode(np.zeros((1, 28, 28, 3), dtype=np.uint8))
+
+
+def test_load_encoder_rejects_unknown_names():
+    with pytest.raises(ValueError, match="unknown encoder"):
+        load_encoder("resnet50")
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+def test_cache_round_trip(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    encoder = StubEncoder(stub_spec(), "cpu")
+    meta = cache_scene_features(manifest, root, encoder, cache_root, batch_size=2)
+
+    assert meta["cache_version"] == CACHE_VERSION
+    assert meta["channels"] == STUB_CHANNELS
+    assert meta["patch_grid"] == [2, 2]
+    assert meta["dtype"] == "float16"
+    assert meta["frame_count"] == len(manifest.frames)
+    assert meta["frames_per_second"] > 0
+    assert not meta["has_depth"]
+
+    validate_feature_cache(cache_root, "stub", manifest)
+    for frame in manifest.frames:
+        cached = load_cached_features(cache_root, "stub", manifest.scene, frame.frame_id)
+        assert cached.shape == (STUB_CHANNELS, 2, 2)
+        assert cached.dtype == torch.float16
+    # The cached value is the patch mean brightness of the stored image.
+    from PIL import Image
+
+    first = manifest.frames[0]
+    rgb = np.asarray(Image.open(root / first.rgb_path))[..., :3].astype(np.float32)
+    expected = rgb.mean(axis=-1)[:14, :14].mean()
+    cached = load_cached_features(cache_root, "stub", manifest.scene, first.frame_id)
+    assert abs(float(cached[0, 0, 0]) - expected) < 0.5
+
+
+def test_cache_refuses_to_overwrite(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    encoder = StubEncoder(stub_spec(), "cpu")
+    cache_scene_features(manifest, root, encoder, cache_root)
+    with pytest.raises(FileExistsError):
+        cache_scene_features(manifest, root, encoder, cache_root)
+
+
+def test_cache_leaves_no_partial_archive(tmp_path):
+    """The archive is renamed into place, so a half-written file never has the final name."""
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+    assert not list(directory.glob("*.partial"))
+
+
+def test_depth_export(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    encoder = StubEncoder(stub_spec(provides_depth=True), "cpu")
+    meta = cache_scene_features(manifest, root, encoder, cache_root, export_depth=True)
+    assert meta["has_depth"]
+    validate_feature_cache(cache_root, "stub_depth", manifest)
+    depth = load_cached_depth(cache_root, "stub_depth", manifest.scene, manifest.frames[0].frame_id)
+    assert depth.shape == (28, 28)
+    assert depth.dtype == torch.float16
+
+
+def test_depth_export_refused_for_encoders_without_depth(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    with pytest.raises(ValueError, match="does not produce depth"):
+        cache_scene_features(
+            manifest, root, StubEncoder(stub_spec(), "cpu"), tmp_path / "cache", export_depth=True
+        )
+
+
+def test_validation_catches_a_frame_missing_from_the_archive(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+    with np.load(directory / FEATURES_NAME) as archive:
+        arrays = {k: archive[k] for k in archive.files}
+    arrays.pop(manifest.frames[-1].frame_id)
+    np.savez(directory / FEATURES_NAME, **arrays)
+    with pytest.raises(ValueError, match="missing from"):
+        validate_feature_cache(cache_root, "stub", manifest)
+
+
+def test_validation_catches_a_manifest_that_grew(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    grown = dataclasses.replace(manifest, frames=manifest.frames + manifest.frames[:1])
+    with pytest.raises(ValueError, match="cache covers"):
+        validate_feature_cache(cache_root, "stub", grown)
+
+
+def test_validation_catches_a_version_bump(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    path = cache_dir(cache_root, "stub", manifest.scene) / CACHE_META_NAME
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["cache_version"] = CACHE_VERSION + 1
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="cache version"):
+        validate_feature_cache(cache_root, "stub", manifest)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def test_cache_config_rejects_unknown_keys(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        "renders_root: data/r\ncache_root: cache/f\nscenes: [room_0]\nbatch: 4\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown config keys"):
+        load_cache_config(path)
+
+
+def test_cache_config_requires_a_known_encoder():
+    with pytest.raises(ValueError, match="unknown encoder"):
+        CacheConfig(renders_root="a", cache_root="b", scenes=["room_0"], encoder="clip")
+
+
+def test_cache_config_refuses_depth_from_an_encoder_without_it():
+    with pytest.raises(ValueError, match="does not produce depth"):
+        CacheConfig(
+            renders_root="a",
+            cache_root="b",
+            scenes=["room_0"],
+            encoder="dinov2_vitb14",
+            export_depth=True,
+        )
+
+
+def test_shipped_configs_load():
+    from pathlib import Path
+
+    for name in ("cache_features_pilot.yaml", "cache_features_all.yaml"):
+        cfg = load_cache_config(Path(__file__).resolve().parents[1] / "configs" / name)
+        assert cfg.encoder in ENCODERS
+        assert cfg.scenes
+
+
+# ---------------------------------------------------------------------------
+# Real weights, gated
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not os.environ.get("LOT_ENCODER_SMOKE"),
+    reason="set LOT_ENCODER_SMOKE=1 to download weights and run the encoder",
+)
+def test_dinov2_grid_orientation_and_shape():
+    """The patch grid must carry image rows in dim 1 and image columns in dim 2.
+
+    A transposed reshape would keep the shape and the channel count and would
+    pass every other check in this file, while silently mirroring every warp.
+    A bright stripe must therefore show up on the axis it was drawn on.
+    """
+    size = 518
+    encoder = load_encoder("dinov2_vitb14", "cuda" if torch.cuda.is_available() else "cpu")
+    for axis in ("row", "col"):
+        image = np.zeros((1, size, size, 3), dtype=np.uint8)
+        if axis == "row":
+            image[0, 210:280] = 255
+        else:
+            image[0, :, 210:280] = 255
+        features = encoder.encode(image).features
+        assert features.shape == (1, 768, 37, 37)
+        unit = features[0].float()
+        unit = unit / unit.norm(dim=0, keepdim=True).clamp(min=1e-6)
+        background = unit.reshape(768, -1).median(dim=1).values
+        background = background / background.norm()
+        distinct = 1 - (unit * background[:, None, None]).sum(dim=0)
+        rows = distinct.mean(dim=1)
+        cols = distinct.mean(dim=0)
+        if axis == "row":
+            assert 14 <= int(rows.argmax()) <= 21
+            assert float(rows.max() - rows.min()) > float(cols.max() - cols.min())
+        else:
+            assert 14 <= int(cols.argmax()) <= 21
+            assert float(cols.max() - cols.min()) > float(rows.max() - rows.min())

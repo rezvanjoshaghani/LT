@@ -1,16 +1,38 @@
-"""Feature-grid coordinate mapping and sampling.
-
-Phase 0 ships only pure sampling utilities. The frozen encoder wrappers (DINOv2,
-VGGT) and the feature cache arrive in Phase 2 and must reuse these functions.
+"""Frozen encoders, the feature cache, and feature-grid sampling.
 
 The pixel-to-patch coordinate mapping is defined here once for the whole
 repository: pixel (u, v) maps to patch coordinates ((u + 0.5) / patch_size - 0.5,
 same for v). Integer patch coordinates are patch centers. The center of patch p
 sits at pixel coordinate patch_size * p + (patch_size - 1) / 2.
+
+Phase 2 adds the encoder wrappers and the cache. Both encoders are frozen and
+are only ever run under inference mode. Rendered frames are already a whole
+number of patches on each side, so nothing here resizes an image: a resize would
+change the pixel-to-patch mapping above and silently invalidate every warp
+computed against the manifest intrinsics.
+
+The heavy dependencies are imported lazily inside the loaders, so this module
+imports on any machine and everything except the two model wrappers is testable
+without weights, network, or GPU. That is the same split render_replica.py uses
+for Habitat.
+
+Cache layout, one directory per encoder and scene:
+    cache_root/{encoder}/{scene}/features.npz   one fp16 [C, Hp, Wp] per frame id
+    cache_root/{encoder}/{scene}/depth.npz      estimated depth, encoders that have it
+    cache_root/{encoder}/{scene}/meta.json      spec, grid, frame ids, throughput
 """
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Iterator, NamedTuple
+
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -105,3 +127,649 @@ def sample_features_bilinear(features: Tensor, uv_px: Tensor, patch_size: int = 
     Returns [..., C].
     """
     return sample_map_bilinear(features, pixel_to_patch_coords(uv_px, patch_size))
+
+
+def patch_grid_shape(hw_px: tuple[int, int], patch_size: int = PATCH_SIZE) -> tuple[int, int]:
+    """Patch-grid shape (Hp, Wp) for an image size (H, W) in pixels.
+
+    Both sides must be whole patches. Nothing in this project resizes or crops a
+    rendered frame, so a size that does not divide is a configuration error.
+    """
+    height, width = hw_px
+    if height <= 0 or width <= 0:
+        raise ValueError(f"image size must be positive, got {hw_px}")
+    if height % patch_size or width % patch_size:
+        raise ValueError(f"image size {hw_px} is not a whole number of {patch_size} px patches")
+    return height // patch_size, width // patch_size
+
+
+# ---------------------------------------------------------------------------
+# Frozen encoders
+# ---------------------------------------------------------------------------
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+@dataclasses.dataclass(frozen=True)
+class EncoderSpec:
+    """Static description of a frozen encoder.
+
+    channels is None when the width of the feature vector is only known once the
+    model is loaded. The cache records the value that was actually produced, so a
+    silent change of model version shows up as a cache validation failure rather
+    than as drifting numbers.
+    """
+
+    name: str
+    patch_size: int
+    normalization: str  # "imagenet" or "unit"
+    provides_depth: bool
+    source: str  # torch.hub entry point, or pretrained identifier
+    channels: int | None = None
+
+
+ENCODERS: dict[str, EncoderSpec] = {
+    "dinov2_vitb14": EncoderSpec(
+        name="dinov2_vitb14",
+        patch_size=14,
+        normalization="imagenet",
+        provides_depth=False,
+        source="dinov2_vitb14",
+        channels=768,
+    ),
+    # The same backbone trained with register tokens, which the DINOv2 authors
+    # added to absorb high-norm outlier tokens. Registered here so Phase 3 can
+    # compare it directly if outlier tokens turn out to matter for the value
+    # agreement metrics. Both variants cache identically.
+    "dinov2_vitb14_reg": EncoderSpec(
+        name="dinov2_vitb14_reg",
+        patch_size=14,
+        normalization="imagenet",
+        provides_depth=False,
+        source="dinov2_vitb14_reg",
+        channels=768,
+    ),
+    "vggt_1b": EncoderSpec(
+        name="vggt_1b",
+        patch_size=14,
+        normalization="unit",
+        provides_depth=True,
+        source="facebook/VGGT-1B",
+        channels=None,
+    ),
+}
+
+
+class EncodedBatch(NamedTuple):
+    features: Tensor        # [B, C, Hp, Wp] float32
+    depth: Tensor | None    # [B, H, W] float32 estimated planar z-depth, encoder units
+    depth_conf: Tensor | None  # [B, H, W] float32 confidence, or None
+
+
+def preprocess_images(
+    images_uint8: np.ndarray, spec: EncoderSpec, device: torch.device | str | None = None
+) -> Tensor:
+    """Turn rendered RGB frames into an encoder input tensor.
+
+    images_uint8: [B, H, W, 3] uint8 as written by the renderer.
+    device: where to build the result. The frames are moved while still uint8 and
+        converted there, which transfers a quarter of the bytes and keeps the
+        scaling off the CPU. That is the difference between being bound by the
+        host and being bound by the model.
+    Returns [B, 3, H, W] float32 normalized as the encoder expects. The image is
+    never resized or cropped, so the patch grid matches the manifest intrinsics.
+    """
+    arr = np.asarray(images_uint8)
+    if arr.ndim != 4 or arr.shape[-1] != 3:
+        raise ValueError(f"images must be [B, H, W, 3], got {arr.shape}")
+    if arr.dtype != np.uint8:
+        raise ValueError(f"images must be uint8, got {arr.dtype}")
+    patch_grid_shape(arr.shape[1:3], spec.patch_size)
+    if spec.normalization not in ("imagenet", "unit"):
+        raise ValueError(f"unknown normalization {spec.normalization!r}")
+    x = torch.from_numpy(np.ascontiguousarray(arr))
+    if device is not None:
+        x = x.to(device)
+    x = x.permute(0, 3, 1, 2).contiguous().to(torch.float32).div_(255.0)
+    if spec.normalization == "imagenet":
+        mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32, device=x.device).view(1, 3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, dtype=torch.float32, device=x.device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+    return x
+
+
+class FrozenEncoder:
+    """Common behaviour of the frozen encoder wrappers.
+
+    Subclasses load their model lazily in _load and implement _forward. The model
+    is put in eval mode with gradients disabled, and every call runs under
+    inference mode, so nothing here can train or be trained.
+    """
+
+    def __init__(self, spec: EncoderSpec, device: str = "cpu") -> None:
+        self.spec = spec
+        self.device = torch.device(device)
+        self._model: Any = None
+        self._channels: int | None = spec.channels
+
+    @property
+    def channels(self) -> int | None:
+        """Feature width. None until the first batch, for models that declare none."""
+        return self._channels
+
+    @property
+    def model(self) -> Any:
+        if self._model is None:
+            model = self._load()
+            model.eval()
+            for parameter in model.parameters():
+                parameter.requires_grad_(False)
+            self._model = model.to(self.device)
+        return self._model
+
+    def _load(self) -> Any:
+        raise NotImplementedError
+
+    def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
+        raise NotImplementedError
+
+    def encode(self, images_uint8: np.ndarray) -> EncodedBatch:
+        """Encode a batch of [B, H, W, 3] uint8 frames."""
+        with torch.inference_mode():
+            batch = self._forward(images_uint8)
+        self._check(batch, images_uint8.shape)
+        return batch
+
+    def _check(self, batch: EncodedBatch, images_shape: tuple[int, ...]) -> None:
+        count, height, width, _ = images_shape
+        patches_h, patches_w = patch_grid_shape((height, width), self.spec.patch_size)
+        expected = (count, patches_h, patches_w)
+        got = (batch.features.shape[0], batch.features.shape[2], batch.features.shape[3])
+        if batch.features.dim() != 4 or got != expected:
+            raise RuntimeError(
+                f"{self.spec.name} returned features of shape "
+                f"{tuple(batch.features.shape)}, expected [B, C, Hp, Wp] with "
+                f"B, Hp, Wp = {expected}"
+            )
+        channels = int(batch.features.shape[1])
+        if self._channels is None:
+            self._channels = channels
+        elif channels != self._channels:
+            raise RuntimeError(
+                f"{self.spec.name} returned {channels} channels, expected "
+                f"{self._channels}. The model version changed under the cache."
+            )
+
+
+class DinoV2Encoder(FrozenEncoder):
+    """DINOv2 ViT-B/14 from torch.hub, patch tokens only.
+
+    forward_features returns the final normalized patch tokens as
+    x_norm_patchtokens, shaped [B, Hp * Wp, C] in row-major patch order. That is
+    the only output this project uses; the class token is not a scene property.
+    """
+
+    HUB_REPO = "facebookresearch/dinov2"
+
+    def _load(self) -> Any:
+        return torch.hub.load(self.HUB_REPO, self.spec.source, trust_repo=True)
+
+    def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
+        x = preprocess_images(images_uint8, self.spec, self.device)
+        out = self.model.forward_features(x)
+        if "x_norm_patchtokens" not in out:
+            raise RuntimeError(
+                "DINOv2 forward_features did not return x_norm_patchtokens; got "
+                f"{sorted(out)}"
+            )
+        tokens = out["x_norm_patchtokens"]
+        count, num_tokens, channels = tokens.shape
+        patches_h, patches_w = patch_grid_shape(images_uint8.shape[1:3], self.spec.patch_size)
+        if num_tokens != patches_h * patches_w:
+            raise RuntimeError(
+                f"DINOv2 returned {num_tokens} patch tokens for a "
+                f"{patches_h} by {patches_w} grid"
+            )
+        features = tokens.reshape(count, patches_h, patches_w, channels)
+        features = features.permute(0, 3, 1, 2).to(torch.float32).contiguous()
+        return EncodedBatch(features=features, depth=None, depth_conf=None)
+
+
+class VggtEncoder(FrozenEncoder):
+    """VGGT, patch tokens from the aggregator and its estimated depth.
+
+    VGGT is a multi-view model. This project feeds it one view at a time, which
+    is what Phase 4 needs: depth estimated from the context view alone, with no
+    look at the target. The aggregator is called with a sequence of length one.
+
+    The estimated depth is in VGGT's own scale, not meters. Phase 4 is
+    responsible for aligning it to the ground-truth scale before it is used as a
+    transport input, and for reporting how that alignment was done.
+    """
+
+    def _load(self) -> Any:
+        try:
+            from vggt.models.vggt import VGGT
+        except ImportError as e:
+            raise RuntimeError(
+                "vggt is not installed. Install it per scripts/README.md and run "
+                "on a machine with the weights cached. Every other part of this "
+                "module works without it."
+            ) from e
+        return VGGT.from_pretrained(self.spec.source)
+
+    def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
+        x = preprocess_images(images_uint8, self.spec, self.device)
+        patches_h, patches_w = patch_grid_shape(images_uint8.shape[1:3], self.spec.patch_size)
+        # VGGT takes [B, S, 3, H, W] with S the number of views. One view each.
+        views = x[:, None]
+        tokens_per_layer, patch_start = self.model.aggregator(views)
+        tokens = tokens_per_layer[-1][:, 0, patch_start:, :]
+        count, num_tokens, channels = tokens.shape
+        if num_tokens != patches_h * patches_w:
+            raise RuntimeError(
+                f"VGGT aggregator returned {num_tokens} patch tokens for a "
+                f"{patches_h} by {patches_w} grid. Check the version and the "
+                "patch start index."
+            )
+        features = tokens.reshape(count, patches_h, patches_w, channels)
+        features = features.permute(0, 3, 1, 2).to(torch.float32).contiguous()
+
+        predictions = self.model(views)
+        depth = _squeeze_view_and_channel(predictions["depth"], "depth")
+        conf = (
+            _squeeze_view_and_channel(predictions["depth_conf"], "depth_conf")
+            if "depth_conf" in predictions
+            else None
+        )
+        return EncodedBatch(
+            features=features,
+            depth=depth.to(torch.float32),
+            depth_conf=None if conf is None else conf.to(torch.float32),
+        )
+
+
+def _squeeze_view_and_channel(tensor: Tensor, name: str) -> Tensor:
+    """Reduce a VGGT prediction to [B, H, W].
+
+    VGGT returns [B, S, H, W] or [B, S, H, W, 1] depending on the head. The view
+    axis is length one here because this project encodes one view at a time.
+    """
+    out = tensor
+    if out.dim() == 5 and out.shape[-1] == 1:
+        out = out[..., 0]
+    if out.dim() != 4 or out.shape[1] != 1:
+        raise RuntimeError(f"VGGT {name} had shape {tuple(tensor.shape)}, expected [B, 1, H, W]")
+    return out[:, 0]
+
+
+def load_encoder(name: str, device: str = "cpu") -> FrozenEncoder:
+    """Build a frozen encoder wrapper by name. Weights load on first use."""
+    if name not in ENCODERS:
+        raise ValueError(f"unknown encoder {name!r}; known: {sorted(ENCODERS)}")
+    spec = ENCODERS[name]
+    if name.startswith("dinov2_"):
+        return DinoV2Encoder(spec, device)
+    if name.startswith("vggt_"):
+        return VggtEncoder(spec, device)
+    raise ValueError(f"no wrapper registered for {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Feature cache
+# ---------------------------------------------------------------------------
+
+CACHE_VERSION = 1
+FEATURES_NAME = "features.npz"
+DEPTH_NAME = "depth.npz"
+CACHE_META_NAME = "meta.json"
+
+
+def cache_dir(cache_root: Path, encoder_name: str, scene: str) -> Path:
+    """Directory holding one scene's cache for one encoder."""
+    return Path(cache_root) / encoder_name / scene
+
+
+def _write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Write an npz through a temporary file, then rename it into place.
+
+    A half-written cache that still carries the final name would pass a later
+    existence check and be read as complete.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".partial")
+    with open(tmp, "wb") as handle:
+        np.savez(handle, **arrays)
+    os.replace(tmp, path)
+
+
+def cache_scene_features(
+    manifest: Any,
+    scene_root: Path,
+    encoder: FrozenEncoder,
+    cache_root: Path,
+    batch_size: int = 8,
+    export_depth: bool = False,
+) -> dict[str, Any]:
+    """Encode every frame of one scene and write the cache. Returns the metadata.
+
+    manifest: a render_replica.Manifest. Frames are encoded in manifest order.
+    scene_root: the directory the manifest's relative rgb paths resolve against.
+    Refuses to run when the cache metadata already exists, so a rerun never
+    overwrites a finished cache.
+    """
+    from PIL import Image
+
+    if not manifest.frames:
+        raise ValueError(f"manifest for {manifest.scene} has no frames")
+    out_dir = cache_dir(cache_root, encoder.spec.name, manifest.scene)
+    meta_path = out_dir / CACHE_META_NAME
+    if meta_path.exists():
+        raise FileExistsError(
+            f"{meta_path} exists; caches are never overwritten. Delete the "
+            "directory to re-encode."
+        )
+    if export_depth and not encoder.spec.provides_depth:
+        raise ValueError(f"{encoder.spec.name} does not produce depth")
+    scene_root = Path(scene_root)
+
+    features: dict[str, np.ndarray] = {}
+    depths: dict[str, np.ndarray] = {}
+    encode_seconds = 0.0
+    started = time.perf_counter()
+    for batch in _batched(manifest.frames, batch_size):
+        images = np.stack(
+            [np.asarray(Image.open(scene_root / f.rgb_path))[..., :3] for f in batch]
+        )
+        mark = time.perf_counter()
+        out = encoder.encode(images)
+        if encoder.device.type == "cuda":
+            torch.cuda.synchronize()
+        encode_seconds += time.perf_counter() - mark
+        arrays = out.features.to(torch.float16).cpu().numpy()
+        for frame, array in zip(batch, arrays):
+            features[frame.frame_id] = array
+        if export_depth:
+            if out.depth is None:
+                raise RuntimeError(f"{encoder.spec.name} returned no depth")
+            depth_arrays = out.depth.to(torch.float16).cpu().numpy()
+            conf_arrays = (
+                out.depth_conf.to(torch.float16).cpu().numpy()
+                if out.depth_conf is not None
+                else None
+            )
+            for i, frame in enumerate(batch):
+                depths[frame.frame_id] = depth_arrays[i]
+                if conf_arrays is not None:
+                    depths[f"{frame.frame_id}__conf"] = conf_arrays[i]
+    total_seconds = time.perf_counter() - started
+
+    first = manifest.frames[0]
+    patches_h, patches_w = patch_grid_shape(
+        (first.height, first.width), encoder.spec.patch_size
+    )
+    meta = {
+        "cache_version": CACHE_VERSION,
+        "encoder": encoder.spec.name,
+        "scene": manifest.scene,
+        "channels": int(encoder.channels),
+        "patch_size": encoder.spec.patch_size,
+        "patch_grid": [patches_h, patches_w],
+        "image_hw": [first.height, first.width],
+        "dtype": "float16",
+        "frame_count": len(manifest.frames),
+        "frame_ids": [f.frame_id for f in manifest.frames],
+        "has_depth": bool(export_depth),
+        "batch_size": batch_size,
+        "device": str(encoder.device),
+        "encode_seconds": round(encode_seconds, 3),
+        "total_seconds": round(total_seconds, 3),
+        "frames_per_second": round(len(manifest.frames) / max(total_seconds, 1e-9), 3),
+        "torch_version": torch.__version__,
+    }
+    _write_npz(out_dir / FEATURES_NAME, features)
+    if export_depth:
+        _write_npz(out_dir / DEPTH_NAME, depths)
+    meta_path.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    return meta
+
+
+def _batched(items: list, size: int) -> Iterator[list]:
+    if size <= 0:
+        raise ValueError("batch size must be positive")
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def load_cache_meta(cache_root: Path, encoder_name: str, scene: str) -> dict[str, Any]:
+    """Read one scene's cache metadata. Raises ValueError on a version mismatch."""
+    path = cache_dir(cache_root, encoder_name, scene) / CACHE_META_NAME
+    meta = json.loads(Path(path).read_text(encoding="utf-8"))
+    if meta.get("cache_version") != CACHE_VERSION:
+        raise ValueError(f"cache version {meta.get('cache_version')}, expected {CACHE_VERSION}")
+    return meta
+
+
+def load_cached_features(cache_root: Path, encoder_name: str, scene: str, frame_id: str) -> Tensor:
+    """Read one frame's cached features as a [C, Hp, Wp] float16 tensor.
+
+    Opens the scene archive per call. Callers that read many frames of one scene
+    should hold the archive open with numpy directly instead.
+    """
+    path = cache_dir(cache_root, encoder_name, scene) / FEATURES_NAME
+    with np.load(path) as archive:
+        if frame_id not in archive:
+            raise KeyError(f"{frame_id} not in {path}")
+        return torch.from_numpy(archive[frame_id])
+
+
+def load_cached_depth(cache_root: Path, encoder_name: str, scene: str, frame_id: str) -> Tensor:
+    """Read one frame's estimated depth as an [H, W] float16 tensor, encoder units."""
+    path = cache_dir(cache_root, encoder_name, scene) / DEPTH_NAME
+    with np.load(path) as archive:
+        if frame_id not in archive:
+            raise KeyError(f"{frame_id} not in {path}")
+        return torch.from_numpy(archive[frame_id])
+
+
+def validate_feature_cache(cache_root: Path, encoder_name: str, manifest: Any) -> dict[str, Any]:
+    """Check a scene cache against the manifest it was built from.
+
+    Raises ValueError with the first problem found. Returns the metadata.
+    """
+    meta = load_cache_meta(cache_root, encoder_name, manifest.scene)
+    if meta["encoder"] != encoder_name or meta["scene"] != manifest.scene:
+        raise ValueError(f"cache is for {meta['encoder']} / {meta['scene']}")
+    manifest_ids = [f.frame_id for f in manifest.frames]
+    if meta["frame_ids"] != manifest_ids:
+        missing = sorted(set(manifest_ids) - set(meta["frame_ids"]))
+        raise ValueError(
+            f"cache covers {len(meta['frame_ids'])} frames, manifest has "
+            f"{len(manifest_ids)}; first missing: {missing[:3]}"
+        )
+    expected = (int(meta["channels"]), *(int(v) for v in meta["patch_grid"]))
+    path = cache_dir(cache_root, encoder_name, manifest.scene) / FEATURES_NAME
+    with np.load(path) as archive:
+        stored = set(archive.files)
+        for frame_id in manifest_ids:
+            if frame_id not in stored:
+                raise ValueError(f"{frame_id}: missing from {path}")
+            array = archive[frame_id]
+            if array.shape != expected:
+                raise ValueError(f"{frame_id}: features {array.shape}, expected {expected}")
+            if array.dtype != np.float16:
+                raise ValueError(f"{frame_id}: features dtype {array.dtype}, expected float16")
+    if meta["has_depth"]:
+        depth_path = cache_dir(cache_root, encoder_name, manifest.scene) / DEPTH_NAME
+        image_hw = tuple(int(v) for v in meta["image_hw"])
+        with np.load(depth_path) as archive:
+            for frame_id in manifest_ids:
+                if frame_id not in archive:
+                    raise ValueError(f"{frame_id}: missing from {depth_path}")
+                if archive[frame_id].shape != image_hw:
+                    raise ValueError(
+                        f"{frame_id}: depth {archive[frame_id].shape}, expected {image_hw}"
+                    )
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Config and entrypoint
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class CacheConfig:
+    """One feature-caching experiment. Loaded from a yaml file, one file per run."""
+
+    renders_root: Path
+    cache_root: Path
+    scenes: list[str]
+    encoder: str = "dinov2_vitb14"
+    batch_size: int = 8
+    device: str = "cuda"
+    export_depth: bool = False
+
+    def __post_init__(self) -> None:
+        self.renders_root = Path(self.renders_root)
+        self.cache_root = Path(self.cache_root)
+        if not self.scenes:
+            raise ValueError("config lists no scenes")
+        if self.encoder not in ENCODERS:
+            raise ValueError(f"unknown encoder {self.encoder!r}; known: {sorted(ENCODERS)}")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if self.export_depth and not ENCODERS[self.encoder].provides_depth:
+            raise ValueError(f"{self.encoder} does not produce depth")
+
+
+def load_cache_config(path: Path) -> CacheConfig:
+    """Load a CacheConfig from yaml. Unknown keys are an error, not a warning."""
+    import yaml
+
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"config {path} did not parse to a mapping")
+    allowed = {f.name for f in dataclasses.fields(CacheConfig)}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(f"unknown config keys: {unknown}")
+    missing = [k for k in ("renders_root", "cache_root", "scenes") if k not in raw]
+    if missing:
+        raise ValueError(f"config missing required keys: {missing}")
+    return CacheConfig(**raw)
+
+
+def cache_scene(cfg: CacheConfig, scene: str, encoder: FrozenEncoder) -> dict[str, Any]:
+    """Cache one scene end to end and validate the result against its manifest."""
+    from .render_replica import MANIFEST_NAME, load_manifest
+
+    scene_root = cfg.renders_root / scene
+    manifest = load_manifest(scene_root / MANIFEST_NAME)
+    meta = cache_scene_features(
+        manifest,
+        scene_root,
+        encoder,
+        cfg.cache_root,
+        batch_size=cfg.batch_size,
+        export_depth=cfg.export_depth,
+    )
+    validate_feature_cache(cfg.cache_root, encoder.spec.name, manifest)
+    print(
+        f"[{scene}] {meta['frame_count']} frames, {meta['channels']} channels, "
+        f"{meta['patch_grid'][0]}x{meta['patch_grid'][1]} grid, "
+        f"{meta['frames_per_second']:.2f} frames/s"
+    )
+    return meta
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Cache frozen features for LT.")
+    parser.add_argument("--config", type=Path, required=True)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--scene", type=str, help="cache a single scene by name")
+    group.add_argument(
+        "--scene-index",
+        type=int,
+        help="cache a single scene by index into the config scene list "
+        "(for SLURM array jobs)",
+    )
+    parser.add_argument(
+        "--list-scenes", action="store_true", help="print the scene list and exit"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip scenes that already have a cache instead of failing",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate existing caches instead of encoding",
+    )
+    args = parser.parse_args(argv)
+    cfg = load_cache_config(args.config)
+    if args.list_scenes:
+        for i, scene in enumerate(cfg.scenes):
+            print(i, scene)
+        return
+    if args.scene is not None:
+        if args.scene not in cfg.scenes:
+            raise SystemExit(f"scene {args.scene!r} not in config scene list")
+        scenes = [args.scene]
+    elif args.scene_index is not None:
+        if not 0 <= args.scene_index < len(cfg.scenes):
+            raise SystemExit(
+                f"--scene-index {args.scene_index} outside 0..{len(cfg.scenes) - 1}"
+            )
+        scenes = [cfg.scenes[args.scene_index]]
+    else:
+        scenes = list(cfg.scenes)
+
+    from .render_replica import MANIFEST_NAME, load_manifest
+
+    if args.validate_only:
+        failures = []
+        for scene in scenes:
+            try:
+                manifest = load_manifest(cfg.renders_root / scene / MANIFEST_NAME)
+                meta = validate_feature_cache(cfg.cache_root, cfg.encoder, manifest)
+            except (FileNotFoundError, KeyError) as e:
+                print(f"[{scene}] MISSING: {e}")
+                failures.append(scene)
+            except ValueError as e:
+                print(f"[{scene}] INVALID: {e}")
+                failures.append(scene)
+            else:
+                print(f"[{scene}] cache valid, {meta['frame_count']} frames")
+        if failures:
+            raise SystemExit(
+                f"{len(failures)} of {len(scenes)} scenes failed validation: "
+                + ", ".join(failures)
+            )
+        print(f"all {len(scenes)} scenes valid")
+        return
+
+    encoder = load_encoder(cfg.encoder, cfg.device)
+    total_frames = 0
+    total_seconds = 0.0
+    for scene in scenes:
+        if args.resume and (
+            cache_dir(cfg.cache_root, cfg.encoder, scene) / CACHE_META_NAME
+        ).exists():
+            print(f"[{scene}] cache exists, skipping")
+            continue
+        meta = cache_scene(cfg, scene, encoder)
+        total_frames += meta["frame_count"]
+        total_seconds += meta["total_seconds"]
+    if total_frames:
+        rate = total_frames / total_seconds
+        print(
+            f"{total_frames} frames in {total_seconds:.1f} s, {rate:.2f} frames/s. "
+            f"At this rate the full 18-scene set is "
+            f"{5136 / rate / 60:.1f} min for 5136 frames."
+        )
+
+
+if __name__ == "__main__":
+    main()

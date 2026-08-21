@@ -78,3 +78,29 @@ Open, recorded rather than fixed:
 - The per-pair pixel pipeline runs in float64 because manifest intrinsics and
   poses load as float64. Measured cost is 40 percent on CPU and far more on a
   consumer GPU.
+
+## Phase 2: encoder caching (2026-08-21)
+
+- DINOv2 ViT-B/14 returns patch tokens in row-major order, so reshaping
+  [B, N, C] to [B, Hp, Wp, C] puts image rows on the first grid axis. This was
+  measured, not assumed. A bright stripe drawn across the image rows peaks at
+  patch row 17 of 37 with a flat column profile, and the same stripe drawn down
+  the columns peaks at patch column 17 with a flat row profile. A transposed
+  reshape would keep the shape and the channel count, pass every other check in
+  the suite, and mirror every warp in Phase 3. Evidence: the gated test
+  test_dinov2_grid_orientation_and_shape.
+- Throughput at 518 px, batch 8, on an RTX 2080 Super: the model alone runs at
+  21 frames per second, the whole cache path at 8.9. The difference is PNG
+  decode and host to device transfer, not the model. Moving the uint8 to float
+  conversion and the normalization onto the GPU took the end to end rate from
+  7.0 to 8.9. The full 5136 frame set is therefore about 10 minutes per
+  encoder, at 2.1 MB per frame, so roughly 11 GB per encoder.
+- No high-norm outlier tokens appeared on synthetic probes. The largest token
+  norm was within 1.1 times the median for both dinov2_vitb14 and
+  dinov2_vitb14_reg. That does not settle the question on real Replica frames,
+  where large flat surfaces are common, so the register variant is registered
+  as an encoder and Phase 3 can compare the two directly.
+- Acceptance is partly cluster bound. The rendered frames live on Borah, so the
+  pilot-scene cache runs there. The path is verified end to end locally on a
+  synthetic 518 px scene of 96 frames: fp16 [768, 37, 37] per frame, validated
+  against the manifest, reloaded bit for bit.

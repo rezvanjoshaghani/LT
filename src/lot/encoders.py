@@ -364,7 +364,28 @@ class VggtEncoder(FrozenEncoder):
         patches_h, patches_w = patch_grid_shape(images_uint8.shape[1:3], self.spec.patch_size)
         # VGGT takes [B, S, 3, H, W] with S the number of views. One view each.
         views = x[:, None]
-        tokens_per_layer, patch_start = self.model.aggregator(views)
+        # The model's own forward runs the aggregator and then the heads. Take
+        # the aggregator output as it passes rather than calling the aggregator
+        # separately, which would run the billion parameter trunk twice per
+        # batch. Capturing it in place also guarantees the tokens are exactly
+        # the ones the depth head consumed, whatever context the model wraps
+        # its trunk in.
+        captured: dict[str, Any] = {}
+
+        def capture(_module: Any, _inputs: Any, outputs: Any) -> None:
+            captured["outputs"] = outputs
+
+        handle = self.model.aggregator.register_forward_hook(capture)
+        try:
+            predictions = self.model(views)
+        finally:
+            handle.remove()
+        if "outputs" not in captured:
+            raise RuntimeError(
+                "VGGT forward did not call its aggregator, so the patch tokens "
+                "could not be captured. Check the installed version."
+            )
+        tokens_per_layer, patch_start = captured["outputs"]
         tokens = tokens_per_layer[-1][:, 0, patch_start:, :]
         count, num_tokens, channels = tokens.shape
         if num_tokens != patches_h * patches_w:
@@ -376,7 +397,6 @@ class VggtEncoder(FrozenEncoder):
         features = tokens.reshape(count, patches_h, patches_w, channels)
         features = features.permute(0, 3, 1, 2).to(torch.float32).contiguous()
 
-        predictions = self.model(views)
         depth = _squeeze_view_and_channel(predictions["depth"], "depth")
         conf = (
             _squeeze_view_and_channel(predictions["depth_conf"], "depth_conf")

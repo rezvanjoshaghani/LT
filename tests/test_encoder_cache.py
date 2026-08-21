@@ -272,6 +272,92 @@ def test_shipped_configs_load():
 
 
 # ---------------------------------------------------------------------------
+# VGGT wrapper, against a stand-in with the same interface
+# ---------------------------------------------------------------------------
+
+VGGT_CHANNELS = 16
+VGGT_PREFIX = 5  # register and camera tokens ahead of the patch tokens
+
+
+class FakeAggregator(torch.nn.Module):
+    """Returns per-layer tokens shaped the way VGGT's aggregator does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, views):
+        self.calls += 1
+        count, seq, _, height, width = views.shape
+        patches_h, patches_w = patch_grid_shape((height, width))
+        total = VGGT_PREFIX + patches_h * patches_w
+        tokens = torch.arange(
+            count * seq * total * VGGT_CHANNELS, dtype=torch.float32
+        ).reshape(count, seq, total, VGGT_CHANNELS)
+        return [tokens, tokens], VGGT_PREFIX
+
+
+class FakeVggtModel(torch.nn.Module):
+    """Stand-in with VGGT's call shape: aggregator inside forward, dict out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.aggregator = FakeAggregator()
+
+    def forward(self, views):
+        # VGGT runs its trunk inside forward and feeds the heads from it. The
+        # wrapper takes the tokens as they pass, so the fake must do the same.
+        self.aggregator(views)
+        count, seq, _, height, width = views.shape
+        return {
+            "depth": torch.full((count, seq, height, width, 1), 2.0),
+            "depth_conf": torch.full((count, seq, height, width), 0.5),
+        }
+
+
+def fake_vggt_encoder():
+    from lot.encoders import VggtEncoder
+
+    encoder = VggtEncoder(ENCODERS["vggt_1b"], "cpu")
+    encoder._model = FakeVggtModel().eval()
+    return encoder
+
+
+def test_vggt_wrapper_shapes_and_patch_token_offset():
+    """Pins the parts of the VGGT contract that no local weights can check.
+
+    The prefix tokens must be dropped, the single view axis squeezed, and the
+    remaining tokens laid out row-major on the patch grid.
+    """
+    encoder = fake_vggt_encoder()
+    out = encoder.encode(np.zeros((2, 28, 42, 3), dtype=np.uint8))
+    assert out.features.shape == (2, VGGT_CHANNELS, 2, 3)
+    assert out.depth.shape == (2, 28, 42)
+    assert out.depth_conf.shape == (2, 28, 42)
+    assert encoder.channels == VGGT_CHANNELS
+    # The first patch token is the one just past the prefix, not token zero.
+    expected_first = float(VGGT_PREFIX * VGGT_CHANNELS)
+    assert float(out.features[0, 0, 0, 0]) == expected_first
+
+
+def test_vggt_runs_its_trunk_once_per_batch():
+    """The aggregator is the billion parameter part; calling it twice doubles the job."""
+    encoder = fake_vggt_encoder()
+    encoder.encode(np.zeros((1, 28, 28, 3), dtype=np.uint8))
+    assert encoder.model.aggregator.calls == 1
+
+
+def test_vggt_wrapper_rejects_a_token_count_that_does_not_fit_the_grid():
+    encoder = fake_vggt_encoder()
+    encoder.model.aggregator.forward = lambda views: (
+        [torch.zeros((1, 1, 3, VGGT_CHANNELS))],
+        0,
+    )
+    with pytest.raises(RuntimeError, match="patch tokens"):
+        encoder.encode(np.zeros((1, 28, 28, 3), dtype=np.uint8))
+
+
+# ---------------------------------------------------------------------------
 # Real weights, gated
 # ---------------------------------------------------------------------------
 

@@ -144,6 +144,16 @@ ids, and the measured rate. `--validate-only` re-checks every frame's shape
 and dtype against the manifest, so a truncated archive fails loudly rather
 than surfacing as missing features in Phase 3.
 
+## 3. Per-frame depth statistics
+
+Rendering quality-filtered only the base view of each viewpoint. This measures
+every frame and writes frame_stats.json beside each manifest, which pair
+selection reads:
+
+```bash
+python -m lot.render_replica --config configs/render_replica_all.yaml --frame-stats
+```
+
 Reference numbers from an RTX 2080 Super at 518 px, DINOv2 ViT-B/14 at batch
 8: about 9 frames per second end to end, which is roughly 10 minutes for all
 5136 frames, in 0.8 GB of GPU memory. The model alone runs at about 21 frames
@@ -151,3 +161,32 @@ per second, so the rest is PNG decode and host transfer; a faster GPU moves
 the ceiling but not the floor. The cache is about 2.1 MB per frame, so the
 full set is roughly 11 GB per encoder. VGGT is a much larger model; start it
 at batch 2 and raise it if memory allows.
+
+# Phase 3: Experiment Zero
+
+The transportability test. No training, no new environment: it runs in
+`lot-encode` and needs only `pyarrow` on top of what Phase 2 installed.
+
+```bash
+micromamba run -n lot-encode pip install pyarrow
+```
+
+pandas is deliberately not required. Its wheels do not resolve on this
+cluster's toolchain, and pip falls back to building numpy from source against
+GCC 4.8.5, which fails. pyarrow writes the parquet directly.
+
+All 18 scenes run in one process, or as an array if you prefer:
+
+```bash
+python -m lot.evaluate --config configs/experiment_zero.yaml --resume
+sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+       --array 0-17 scripts/experiment_zero.sbatch configs/experiment_zero.yaml
+```
+
+Results land as one parquet per scene under
+`outputs/experiment_zero/eval/`, and the dataset mean feature map each encoder
+needs for its Mean-Feature floor is computed once into
+`outputs/experiment_zero/`. A finished scene is never overwritten; `--resume`
+skips it.
+
+The run is CPU bound on geometry, not on the GPU, so a GPU is not requested.

@@ -13,6 +13,7 @@ dependencies = [
     "pyyaml",
     "pillow",
     "matplotlib",
+    "pyarrow",
 ]
 
 [project.optional-dependencies]

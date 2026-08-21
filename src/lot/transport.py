@@ -57,41 +57,46 @@ class TransportResult(NamedTuple):
     zbuffer: Tensor   # [H_out, W_out], +inf where no splat landed
 
 
-def transport(
-    features_ctx: Tensor,
+class TransportPlan(NamedTuple):
+    """The part of a transport that depends only on geometry, not on features.
+
+    weights [Hp_out * Wp_out, Hp * Wp] carries, for each target patch, how much
+    of each source patch's feature it receives. Rows sum to one where anything
+    landed and to zero in a hole. The plan is what makes comparing encoders
+    cheap: two encoders over one pair share all of the geometry and differ only
+    by a matmul against the same matrix.
+    """
+
+    weights: Tensor
+    coverage: Tensor
+    zbuffer: Tensor
+    source_grid: tuple[int, int]
+    target_grid: tuple[int, int]
+
+
+def transport_plan(
     depth_ctx_px: Tensor,
     K_ctx: Tensor,
     K_tgt: Tensor,
     T_tgt_from_ctx: Tensor,
     out_hw_px: tuple[int, int],
     patch_size: int = PATCH_SIZE,
-) -> TransportResult:
-    """Reproject context patch features into the target camera.
+    device: torch.device | str | None = None,
+) -> TransportPlan:
+    """Work out where every context pixel lands and who wins each target pixel.
 
-    features_ctx: [C, Hp, Wp] patch-grid features of the context view.
-    depth_ctx_px: [H, W] planar z-depth of the context view in meters, at pixel
-        resolution, with H = Hp * patch_size and W = Wp * patch_size. Entries that
-        are not finite and positive are skipped.
-    K_ctx, K_tgt: 3x3 intrinsics of the context and target cameras.
-    T_tgt_from_ctx: the canonical relative transform from geometry.relative_pose.
-    out_hw_px: (H_out, W_out) target size in pixels, both divisible by patch_size.
-    Every input is moved to the device of features_ctx, which is the device the
-    result is returned on.
-    Returns float32 features and coverage. The z-buffer keeps the geometry dtype.
+    Takes the same geometry arguments as transport and returns the reusable
+    plan. The source patch grid is derived from the depth map, since a depth map
+    is always a whole number of patches in this project.
     """
     check_intrinsics(K_ctx)
     check_intrinsics(K_tgt)
-    if features_ctx.dim() != 3:
-        raise ValueError(f"features_ctx must be [C, Hp, Wp], got {tuple(features_ctx.shape)}")
     if depth_ctx_px.dim() != 2:
         raise ValueError(f"depth_ctx_px must be [H, W], got {tuple(depth_ctx_px.shape)}")
-    channels, patches_h, patches_w = features_ctx.shape
     height, width = depth_ctx_px.shape
-    if patches_h * patch_size != height or patches_w * patch_size != width:
-        raise ValueError(
-            f"depth {(height, width)} does not match features {(patches_h, patches_w)} "
-            f"at patch_size {patch_size}"
-        )
+    if height % patch_size or width % patch_size:
+        raise ValueError(f"depth {(height, width)} not divisible by patch_size {patch_size}")
+    patches_h, patches_w = height // patch_size, width // patch_size
     out_height, out_width = out_hw_px
     if out_height % patch_size or out_width % patch_size:
         raise ValueError(f"out_hw_px {out_hw_px} not divisible by patch_size {patch_size}")
@@ -99,7 +104,7 @@ def transport(
     out_patches_w = out_width // patch_size
 
     dtype = common_dtype(depth_ctx_px, K_ctx, K_tgt, T_tgt_from_ctx)
-    device = features_ctx.device
+    device = depth_ctx_px.device if device is None else torch.device(device)
     K_ctx = K_ctx.to(device)
     K_tgt = K_tgt.to(device)
     T_tgt_from_ctx = T_tgt_from_ctx.to(device)
@@ -158,10 +163,72 @@ def transport(
     weights = weights.reshape(num_target, num_source)
     weights = weights / hits_per_patch.reshape(num_target, 1).clamp(min=1)
 
-    features_flat = features_ctx.to(torch.float32).reshape(channels, num_source)
-    features_out = (features_flat @ weights.mT).reshape(
-        channels, out_patches_h, out_patches_w
+    return TransportPlan(
+        weights=weights,
+        coverage=hits_per_patch / float(patch_size * patch_size),
+        zbuffer=zbuffer.reshape(out_height, out_width),
+        source_grid=(patches_h, patches_w),
+        target_grid=(out_patches_h, out_patches_w),
     )
-    coverage = hits_per_patch / float(patch_size * patch_size)
 
-    return TransportResult(features_out, coverage, zbuffer.reshape(out_height, out_width))
+
+def apply_transport_plan(plan: TransportPlan, features_ctx: Tensor) -> Tensor:
+    """Mix one context feature map through a plan. Returns [C, Hp_out, Wp_out] float32."""
+    if features_ctx.dim() != 3:
+        raise ValueError(f"features_ctx must be [C, Hp, Wp], got {tuple(features_ctx.shape)}")
+    channels = features_ctx.shape[0]
+    if tuple(features_ctx.shape[1:]) != plan.source_grid:
+        raise ValueError(
+            f"features grid {tuple(features_ctx.shape[1:])} does not match the plan's "
+            f"source grid {plan.source_grid}"
+        )
+    flat = features_ctx.to(device=plan.weights.device, dtype=torch.float32).reshape(
+        channels, -1
+    )
+    return (flat @ plan.weights.mT).reshape(channels, *plan.target_grid)
+
+
+def transport(
+    features_ctx: Tensor,
+    depth_ctx_px: Tensor,
+    K_ctx: Tensor,
+    K_tgt: Tensor,
+    T_tgt_from_ctx: Tensor,
+    out_hw_px: tuple[int, int],
+    patch_size: int = PATCH_SIZE,
+) -> TransportResult:
+    """Reproject context patch features into the target camera.
+
+    features_ctx: [C, Hp, Wp] patch-grid features of the context view.
+    depth_ctx_px: [H, W] planar z-depth of the context view in meters, at pixel
+        resolution, with H = Hp * patch_size and W = Wp * patch_size. Entries that
+        are not finite and positive are skipped.
+    K_ctx, K_tgt: 3x3 intrinsics of the context and target cameras.
+    T_tgt_from_ctx: the canonical relative transform from geometry.relative_pose.
+    out_hw_px: (H_out, W_out) target size in pixels, both divisible by patch_size.
+    Every input is moved to the device of features_ctx, which is the device the
+    result is returned on.
+    Returns float32 features and coverage. The z-buffer keeps the geometry dtype.
+
+    This is the contract form. Callers transporting several feature maps through
+    the same geometry should build one transport_plan and apply it to each.
+    """
+    if features_ctx.dim() != 3:
+        raise ValueError(f"features_ctx must be [C, Hp, Wp], got {tuple(features_ctx.shape)}")
+    plan = transport_plan(
+        depth_ctx_px,
+        K_ctx,
+        K_tgt,
+        T_tgt_from_ctx,
+        out_hw_px,
+        patch_size,
+        device=features_ctx.device,
+    )
+    if tuple(features_ctx.shape[1:]) != plan.source_grid:
+        raise ValueError(
+            f"depth {tuple(depth_ctx_px.shape)} does not match features "
+            f"{tuple(features_ctx.shape[1:])} at patch_size {patch_size}"
+        )
+    return TransportResult(
+        apply_transport_plan(plan, features_ctx), plan.coverage, plan.zbuffer
+    )

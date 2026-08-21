@@ -14,6 +14,7 @@ from lot.evaluate import (
     PER_POINT,
     SPLAT_POOL,
     EvalConfig,
+    agreement_metrics,
     dataset_mean_feature_map,
     evaluate_pair_for_encoder,
     evaluate_scene,
@@ -401,3 +402,41 @@ def test_margins_are_a_subtraction_between_rows_of_one_pair(tmp_path):
     assert grouped
     for scores in grouped.values():
         assert ORACLE_TRANSPORT in scores and NO_WARP_COPY in scores
+
+
+def test_centering_restores_range_when_one_direction_dominates():
+    """The reason the results table carries both readings.
+
+    Measured on the caches, VGGT puts 0.91 of a feature's norm in a single
+    shared direction against DINOv2's 0.42. A shared direction that large
+    forces every cosine high regardless of content, so the raw metric stops
+    resolving anything. Subtracting the dataset mean removes a constant that
+    says nothing about which surface a patch sits on.
+    """
+    generator = torch.Generator().manual_seed(0)
+    content = torch.randn((256, 32), generator=generator)
+    other = torch.randn((256, 32), generator=generator)
+    offset = torch.zeros(32)
+    offset[0] = 30.0
+    center = ((content + offset).mean(dim=0) + (other + offset).mean(dim=0)) / 2
+
+    raw = agreement_metrics(content + offset, other + offset, center)
+    # The shared offset pins the raw cosine high between unrelated features.
+    assert raw["cosine_mean"] > 0.95
+    # Centering exposes that they are unrelated.
+    assert abs(raw["cosine_centered_mean"]) < 0.15
+    # Identical features stay perfect either way.
+    same = agreement_metrics(content + offset, content + offset, center)
+    assert same["cosine_mean"] == pytest.approx(1.0, abs=1e-5)
+    assert same["cosine_centered_mean"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_every_row_carries_both_readings(tmp_path):
+    build_eval_scene(tmp_path)
+    cfg = base_config(tmp_path, max_pairs_per_stratum=2, points_per_pair=32)
+    rows = evaluate_scene(
+        cfg, "room_0", {"dinov2_vitb14": torch.zeros((8, SIDE // 14, SIDE // 14))}
+    )
+    for row in rows:
+        assert "cosine_mean" in row and "cosine_centered_mean" in row
+        assert "l2_mean" in row and "l2_centered_mean" in row

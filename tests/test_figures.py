@@ -43,6 +43,8 @@ def make_row(**overrides):
         "n": 100,
         "cosine_mean": 0.9,
         "l2_mean": 0.4,
+        "cosine_centered_mean": 0.8,
+        "l2_centered_mean": 0.6,
         "coverage_mean": float("nan"),
     }
     row.update(overrides)
@@ -109,12 +111,13 @@ def test_summary_table_carries_every_variant_and_its_margin():
     assert len(table) == 1
     entry = table[0]
     assert entry["parallax_bin"] == "0.05-0.1"
-    assert entry[f"cosine[{ORACLE_TRANSPORT}]"] == pytest.approx(0.9)
-    assert entry[f"cosine[{NO_WARP_COPY}]"] == pytest.approx(0.5)
+    assert entry[f"value[{ORACLE_TRANSPORT}]"] == pytest.approx(0.9)
+    assert entry[f"value[{NO_WARP_COPY}]"] == pytest.approx(0.5)
     assert entry[f"margin[{ORACLE_TRANSPORT}]"] == pytest.approx(0.4)
     assert entry[f"margin[{MEAN_FEATURE}]"] == pytest.approx(-0.3)
     # The floor has no margin over itself.
     assert f"margin[{NO_WARP_COPY}]" not in entry
+    assert entry["metric"] == "cosine_mean"
 
 
 def test_console_summary_mentions_both_paths_and_the_floor():

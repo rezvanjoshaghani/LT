@@ -148,6 +148,53 @@ at the top of the parallax range will be genuinely hard.
   poses load as float64. Measured cost is 40 percent on CPU and far more on a
   consumer GPU.
 
+## Phase 3: Experiment Zero, first run and what it exposed (2026-08-21)
+
+The first run scored 7300 pairs across 18 scenes. DINOv2 produced an ordered,
+interpretable ladder. VGGT produced margins near zero. The second result was a
+fault in the metric, not in the encoder, and finding that is the main outcome
+of the run.
+
+Cosine on raw features cannot resolve VGGT. Measured on the caches, VGGT puts
+0.9095 of a feature's norm in a single direction shared by every patch, against
+DINOv2's 0.4226. Two vectors that each spend 91 percent of their length on one
+axis are forced above cosine 0.83 whatever the remaining 9 percent says, which
+is exactly the band every VGGT number fell in: Random-Patch 0.857,
+Mean-Feature 0.921, No-Warp-Copy 0.964, Oracle-Transport 0.967. The margin of
+0.003 measures the width of a saturated scale.
+
+The representation is not empty. After subtracting the dataset mean, two random
+patches of one VGGT frame agree at 0.226, against 0.088 for DINOv2 centered.
+There is more local structure under VGGT's offset than under DINOv2's. The
+constant was hiding it.
+
+The results table now carries both readings for every row, raw and centered,
+and the centering subtracts one global mean vector shared by every encoder,
+method, and pair. It is deliberately not the position-dependent mean map:
+positional structure is real information about how rooms are laid out, it is
+what the Mean-Feature floor exists to measure, and removing it would delete a
+floor rather than clean a metric.
+
+Two cross-checks that the pipeline itself is sound. Experiment Zero's
+Random-Patch null for DINOv2 scored 0.265 while the independent cache
+diagnostic put two random patches of a frame at 0.2518; two separate code paths
+agreeing to that tolerance is evidence the measurement is real. And the
+per-point and splat-and-pool paths agreed to within 0.001 in every cell, so the
+resampling, z-buffering, and pooling cost essentially nothing, and later phases
+will be measuring representations rather than the splat.
+
+Two expectations in PLAN did not survive, both worth reporting. PLAN expected
+transport's advantage to shrink as viewpoint change grows. For DINOv2 it grows:
+the margin runs from 0.065 at the smallest parallax to 0.134 at the largest,
+because the unwarped copy collapses faster than the warped one does. Geometry
+helps most exactly where it is needed. And the zero-parallax bin holds DINOv2's
+lowest absolute cosine, 0.699, with its largest margin, 0.248. Parallax is
+baseline over depth and is identically zero for every rotation pair, so that
+bin pools 7.5 to 60 degrees of yaw, which sweeps a surface point across
+two thirds of a 90 degree field of view. It is not a small viewpoint change; it
+is a large image displacement with no baseline. Rotation needs strata by angle,
+which the first run did not have.
+
 ## Phase 2: encoder caching (2026-08-21)
 
 - DINOv2 ViT-B/14 returns patch tokens in row-major order, so reshaping

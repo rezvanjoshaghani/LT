@@ -87,10 +87,13 @@ def unit_normalize(features: Tensor, eps: float = 1e-12) -> Tensor:
     return features / features.norm(dim=-1, keepdim=True).clamp(min=eps)
 
 
-def value_agreement(prediction: Tensor, target: Tensor) -> tuple[float, float]:
+def value_agreement(
+    prediction: Tensor, target: Tensor, center: Tensor | None = None
+) -> tuple[float, float]:
     """Mean cosine and mean L2 between predicted and true features.
 
-    prediction, target: [N, C]. Both are unit normalized first, as CLAUDE.md
+    prediction, target: [N, C]. center: an optional [C] vector subtracted from
+    both before normalizing. Both sides are unit normalized, as CLAUDE.md
     requires, so cosine and L2 measure direction only and are two readings of
     the same quantity. Both are reported because the ladder is read in both.
     Returns (nan, nan) for an empty selection rather than raising, since a pair
@@ -100,11 +103,49 @@ def value_agreement(prediction: Tensor, target: Tensor) -> tuple[float, float]:
         raise ValueError(f"shape mismatch {tuple(prediction.shape)} vs {tuple(target.shape)}")
     if prediction.numel() == 0:
         return float("nan"), float("nan")
-    a = unit_normalize(prediction.to(torch.float32))
-    b = unit_normalize(target.to(torch.float32))
+    a = prediction.to(torch.float32)
+    b = target.to(torch.float32)
+    if center is not None:
+        a = a - center.to(a.dtype)
+        b = b - center.to(b.dtype)
+    a = unit_normalize(a)
+    b = unit_normalize(b)
     cosine = (a * b).sum(dim=-1)
     l2 = (a - b).norm(dim=-1)
     return float(cosine.mean()), float(l2.mean())
+
+
+def agreement_metrics(
+    prediction: Tensor, target: Tensor, center: Tensor
+) -> dict[str, float]:
+    """Agreement measured both as the features stand and after centering them.
+
+    Both are reported because they answer different questions and neither alone
+    is honest here. The raw numbers are what CLAUDE.md asks for and what a
+    downstream predictor would have to reproduce. But an encoder can spend most
+    of a feature's length on one direction shared by every patch, and then every
+    cosine is high for a reason that has nothing to do with which surface a
+    patch sits on: measured on the cache, VGGT puts 0.91 of a feature's norm in
+    its shared direction against DINOv2's 0.42, which pins every VGGT cosine
+    above 0.85 and leaves the metric almost no range to report a result in.
+    Subtracting the dataset mean removes that constant, which carries no
+    information about surface identity and transports trivially because it does
+    not vary. The same single vector is subtracted for every encoder, method,
+    and pair, so it cannot favour anything.
+
+    The mean is a global vector, not the position-dependent mean map. The
+    positional structure is real information about how rooms are laid out, it is
+    what the Mean-Feature floor exists to measure, and erasing it would delete a
+    floor rather than clean a metric.
+    """
+    cosine, l2 = value_agreement(prediction, target)
+    cosine_centered, l2_centered = value_agreement(prediction, target, center=center)
+    return {
+        "cosine_mean": cosine,
+        "l2_mean": l2,
+        "cosine_centered_mean": cosine_centered,
+        "l2_centered_mean": l2_centered,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -250,18 +291,17 @@ def evaluate_pair_for_encoder(
     which the caller attaches.
     """
     rows: list[dict[str, Any]] = []
+    center = mean_feature_map.to(torch.float32).mean(dim=(1, 2))
 
     values = gather_value_pairs(features_context, features_target, geometry.samples, patch_size)
     target_values = values["target"]
     for key, name in _VARIANT_NAMES.items():
-        cosine, l2 = value_agreement(values[key], target_values)
         rows.append(
             {
                 "path": PER_POINT,
                 "variant": name,
                 "n": int(target_values.shape[0]),
-                "cosine_mean": cosine,
-                "l2_mean": l2,
+                **agreement_metrics(values[key], target_values, center),
                 "coverage_mean": float("nan"),
             }
         )
@@ -278,14 +318,12 @@ def evaluate_pair_for_encoder(
     target_patches = target_patches[:, selected].T
     for name, prediction in predictions.items():
         flat = prediction.to(torch.float32).reshape(prediction.shape[0], -1)[:, selected].T
-        cosine, l2 = value_agreement(flat, target_patches)
         rows.append(
             {
                 "path": SPLAT_POOL,
                 "variant": name,
                 "n": int(target_patches.shape[0]),
-                "cosine_mean": cosine,
-                "l2_mean": l2,
+                **agreement_metrics(flat, target_patches, center),
                 "coverage_mean": geometry.coverage_mean,
             }
         )

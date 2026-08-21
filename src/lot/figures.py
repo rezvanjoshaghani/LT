@@ -94,6 +94,7 @@ def paired_records(
                     "parallax": row["parallax"],
                     "encoder": row["encoder"],
                     "path": row["path"],
+                    "metric": metric,
                     "variant": variant,
                     "value": row[metric],
                     "margin": row[metric] - floor[metric],
@@ -124,30 +125,39 @@ def aggregate(
 def summary_table(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """The paper table: every variant's score and margin, by encoder, path, and bin."""
     stats = aggregate(
-        records, ("encoder", "path", "parallax_bin", "variant"), ("value", "margin")
+        records,
+        ("encoder", "metric", "path", "parallax_bin", "variant"),
+        ("value", "margin"),
     )
     encoders = sorted({r["encoder"] for r in records})
+    metrics = sorted({r["metric"] for r in records})
     table: list[dict[str, Any]] = []
     for encoder in encoders:
-        for path in PATH_ORDER:
-            for bin_label in parallax_bin_order():
-                present = [
-                    v for v in VARIANT_ORDER if (encoder, path, bin_label, v) in stats
-                ]
-                if not present:
-                    continue
-                row: dict[str, Any] = {
-                    "encoder": encoder,
-                    "path": path,
-                    "parallax_bin": bin_label,
-                    "n_pairs": stats[(encoder, path, bin_label, present[0])]["n_pairs"],
-                }
-                for variant in present:
-                    entry = stats[(encoder, path, bin_label, variant)]
-                    row[f"cosine[{variant}]"] = entry["value"]
-                    if variant != NO_WARP_COPY:
-                        row[f"margin[{variant}]"] = entry["margin"]
-                table.append(row)
+        for metric in metrics:
+            for path in PATH_ORDER:
+                for bin_label in parallax_bin_order():
+                    present = [
+                        v
+                        for v in VARIANT_ORDER
+                        if (encoder, metric, path, bin_label, v) in stats
+                    ]
+                    if not present:
+                        continue
+                    row: dict[str, Any] = {
+                        "encoder": encoder,
+                        "metric": metric,
+                        "path": path,
+                        "parallax_bin": bin_label,
+                        "n_pairs": stats[
+                            (encoder, metric, path, bin_label, present[0])
+                        ]["n_pairs"],
+                    }
+                    for variant in present:
+                        entry = stats[(encoder, metric, path, bin_label, variant)]
+                        row[f"value[{variant}]"] = entry["value"]
+                        if variant != NO_WARP_COPY:
+                            row[f"margin[{variant}]"] = entry["margin"]
+                    table.append(row)
     return table
 
 
@@ -233,35 +243,48 @@ def margin_versus_parallax_figure(records: Sequence[dict[str, Any]], path: Path)
     import matplotlib.pyplot as plt
 
     encoders = sorted({r["encoder"] for r in records})
+    metrics = sorted({r["metric"] for r in records})
     order = parallax_bin_order()
-    figure, axes = plt.subplots(1, len(PATH_ORDER), figsize=(5.2 * len(PATH_ORDER), 4.2), squeeze=False)
-    for column, evaluation_path in enumerate(PATH_ORDER):
-        axis = axes[0][column]
-        for variant, style in ((ORACLE_TRANSPORT, "-o"), (MEAN_FEATURE, "--s")):
-            stats = aggregate(
-                [r for r in records if r["variant"] == variant and r["path"] == evaluation_path],
-                ("encoder", "parallax_bin"),
-                ("margin",),
-            )
-            for encoder in encoders:
-                present = [b for b in order if (encoder, b) in stats]
-                if not present:
-                    continue
-                axis.plot(
-                    range(len(present)),
-                    [stats[(encoder, b)]["margin"] for b in present],
-                    style,
-                    label=f"{encoder} {variant}",
-                    markersize=4,
+    figure, axes = plt.subplots(
+        len(metrics),
+        len(PATH_ORDER),
+        figsize=(5.2 * len(PATH_ORDER), 4.2 * len(metrics)),
+        squeeze=False,
+    )
+    for row_index, metric in enumerate(metrics):
+        for column, evaluation_path in enumerate(PATH_ORDER):
+            axis = axes[row_index][column]
+            for variant, style in ((ORACLE_TRANSPORT, "-o"), (MEAN_FEATURE, "--s")):
+                stats = aggregate(
+                    [
+                        r
+                        for r in records
+                        if r["variant"] == variant
+                        and r["path"] == evaluation_path
+                        and r["metric"] == metric
+                    ],
+                    ("encoder", "parallax_bin"),
+                    ("margin",),
                 )
-                axis.set_xticks(range(len(present)))
-                axis.set_xticklabels(present, rotation=45, ha="right", fontsize=8)
-        axis.axhline(0.0, color="black", linewidth=1)
-        axis.set_title(f"{evaluation_path}", fontsize=10)
-        axis.set_xlabel("parallax bin (baseline / median depth)", fontsize=9)
-        if column == 0:
-            axis.set_ylabel("cosine margin over No-Warp-Copy", fontsize=9)
-        axis.grid(alpha=0.3)
+                for encoder in encoders:
+                    present = [b for b in order if (encoder, b) in stats]
+                    if not present:
+                        continue
+                    axis.plot(
+                        range(len(present)),
+                        [stats[(encoder, b)]["margin"] for b in present],
+                        style,
+                        label=f"{encoder} {variant}",
+                        markersize=4,
+                    )
+                    axis.set_xticks(range(len(present)))
+                    axis.set_xticklabels(present, rotation=45, ha="right", fontsize=8)
+            axis.axhline(0.0, color="black", linewidth=1)
+            axis.set_title(f"{evaluation_path}, {metric}", fontsize=10)
+            axis.set_xlabel("parallax bin (baseline / median depth)", fontsize=9)
+            if column == 0:
+                axis.set_ylabel("margin over No-Warp-Copy", fontsize=9)
+            axis.grid(alpha=0.3)
     axes[0][-1].legend(fontsize=7, loc="best")
     figure.suptitle("Experiment Zero: how far a frozen feature transports", fontsize=11)
     figure.tight_layout()
@@ -286,12 +309,21 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     out_dir = args.out_dir or Path(args.eval_dir).parent
     rows = read_eval_dir(args.eval_dir)
-    records = paired_records(rows, metric=args.metric)
+    metrics = [args.metric]
+    if args.metric == "cosine_mean" and "cosine_centered_mean" in rows[0]:
+        # Report both readings side by side. Neither alone is honest when an
+        # encoder spends most of a feature's length on one shared direction.
+        metrics.append("cosine_centered_mean")
+    records: list[dict[str, Any]] = []
+    for metric in metrics:
+        records.extend(paired_records(rows, metric=metric))
     scored = len({tuple(r[k] for k in PAIR_KEYS) for r in rows})
     usable = len({(r["scene"], r["encoder"], r["path"], r["variant"]) for r in records})
     print(f"read {len(rows)} rows, {scored} comparisons, {len(records)} scored records")
-    print()
-    print(format_console_summary(records))
+    for metric in metrics:
+        print()
+        print(f"===== {metric} =====")
+        print(format_console_summary([r for r in records if r["metric"] == metric]))
     figure_path = Path(out_dir) / "figures" / "margin_versus_parallax.png"
     table_path = Path(out_dir) / "tables" / "experiment_zero.parquet"
     print()

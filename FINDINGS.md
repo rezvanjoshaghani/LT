@@ -115,3 +115,26 @@ Open, recorded rather than fixed:
   Phase 3 planning: encoding is cheap and repeatable, and any pipeline that
   re-reads the rendered PNGs will see the same variance, whereas one that reads
   the cached features will not.
+- VGGT is accepted on the same 18 scenes. Its aggregator returns 2048 channels
+  on the same 37 by 37 grid, and the estimated depth exported for Phase 4 is
+  [518, 518] per frame with a confidence map beside it. All 5136 frames
+  validate. The run took 13.6 minutes at 6.30 frames per second.
+- The two encoders confirm the bottleneck reading. VGGT held 6.32 to 6.45
+  frames per second across every scene, a spread of two percent, where DINOv2
+  varied threefold over the same PNGs on the same filesystem. VGGT is heavy
+  enough to be compute bound, so filesystem variance hides behind the GPU;
+  DINOv2 is light enough that the filesystem is the whole story. Only
+  apartment_0 broke VGGT's uniformity, at 5.41, because it also paid for
+  loading the 5 GB of weights.
+- VGGT's wrapper originally ran the aggregator twice per batch, once for the
+  patch tokens and once inside the model's own forward for depth, and measured
+  2.02 frames per second. Taking the tokens with a forward hook instead
+  removed the duplicate trunk pass and reached 6.30, a factor of 3.1. The
+  aggregator therefore dominates the cost even more than the head; the fix is
+  in the wrapper, not in any setting.
+- Method choice worth naming in the writeup: the VGGT features are the last
+  aggregator layer, which is the representation VGGT's own heads consume.
+  Every layer is exposed, so this is a choice rather than a constraint, and
+  Phase 3's verdict on which encoder to carry forward rests partly on it. The
+  estimated depth is in VGGT's own scale, not meters, and Phase 4 must align
+  it and say how.

@@ -109,6 +109,26 @@ stored verdict outlives the reasoning behind it, which is how this mistake
 would have propagated silently into every later phase. usable_frame_ids
 applies the current policy to the stored measurements, so a policy change
 costs nothing and re-reads no depth files.
+
+Under the corrected gate 5078 of 5136 frames are usable, 98.9 percent:
+
+    rotation     1381/1391 usable,  10 rejected
+    translation  1790/1819 usable,  29 rejected
+    orbit        1907/1926 usable,  19 rejected
+
+The ordering is now the one the physics predicts, which is the check that the
+gate measures what it claims. Rotation never moves the camera and loses the
+fewest frames. Translation moves it furthest, up to 0.4 times the median
+depth, and loses the most. Orbit sits between. The ten rotation losses are
+views into unscanned space, where too little of the depth map is valid, not
+cameras inside geometry.
+
+Scene scale, for Phase 3 stratification. Per-frame median depth has a p50 of
+1.9 m across the 18 scenes, ranging from 1.5 to 3.0 m by scene, with per-scene
+p05 near 1.0 m and p95 between 1.9 and 5.6 m. These are close interiors. Since
+parallax is baseline over median depth, the translation program's 0.4 target
+means baselines of roughly 0.7 m, which is large relative to the rooms. Pairs
+at the top of the parallax range will be genuinely hard.
 - Manifests written before this review can contain bare Infinity and NaN
   tokens, from probe views that came out ambiguous. Python reads them, strict
   JSON readers do not. New manifests write null instead. Check the batch with

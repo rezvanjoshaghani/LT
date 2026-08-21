@@ -15,7 +15,7 @@ from lot.evaluate import (
 from lot.figures import (
     aggregate,
     format_console_summary,
-    margin_versus_parallax_figure,
+    margin_versus_axis_figure,
     paired_records,
     read_eval_dir,
     summary_table,
@@ -36,6 +36,7 @@ def make_row(**overrides):
         "parallax": 0.1,
         "parallax_bin": "0.05-0.1",
         "rotation_deg": 0.0,
+        "rotation_bin": "zero",
         "covisible_fraction": 0.8,
         "encoder": "dinov2_vitb14",
         "path": PER_POINT,
@@ -148,7 +149,7 @@ def test_figure_and_table_regenerate_from_parquet_alone(tmp_path):
 
     records = paired_records(read_eval_dir(eval_dir))
     figure = tmp_path / "figures" / "margin_versus_parallax.png"
-    margin_versus_parallax_figure(records, figure)
+    margin_versus_axis_figure(records, figure)
     assert figure.is_file() and figure.stat().st_size > 0
 
     table = tmp_path / "tables" / "experiment_zero.parquet"
@@ -161,3 +162,37 @@ def test_figure_and_table_regenerate_from_parquet_alone(tmp_path):
 def test_read_eval_dir_needs_something_to_read(tmp_path):
     with pytest.raises(FileNotFoundError):
         read_eval_dir(tmp_path)
+
+
+def test_rotation_figure_uses_the_angle_axis(tmp_path):
+    """In-place rotation has no baseline, so parallax collapses it to one point."""
+    from lot.datasets import rotation_bin_order
+
+    rows = []
+    for index, (angle_bin, cosine) in enumerate(
+        (("5-10", 0.9), ("10-20", 0.8), ("20-40", 0.6))
+    ):
+        rows += one_comparison(
+            {ORACLE_TRANSPORT: cosine, NO_WARP_COPY: 0.5, MEAN_FEATURE: 0.2},
+            regime="rotation",
+            parallax_bin="zero",
+            rotation_bin=angle_bin,
+            context_frame_id=f"c{index}",
+        )
+    records = paired_records(rows)
+    figure = tmp_path / "margin_versus_rotation.png"
+    margin_versus_axis_figure(
+        records,
+        figure,
+        axis="rotation_bin",
+        order=rotation_bin_order(),
+        axis_label="rotation bin",
+        regimes=("rotation",),
+    )
+    assert figure.is_file() and figure.stat().st_size > 0
+
+
+def test_a_figure_with_no_matching_regime_says_so(tmp_path):
+    records = paired_records(one_comparison({ORACLE_TRANSPORT: 0.9, NO_WARP_COPY: 0.5}))
+    with pytest.raises(ValueError, match="no records"):
+        margin_versus_axis_figure(records, tmp_path / "x.png", regimes=("rotation",))

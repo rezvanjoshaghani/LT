@@ -261,3 +261,62 @@ def test_summary_counts_add_up():
     assert sum(summary["by_regime"].values()) == len(pairs)
     assert sum(summary["by_parallax_bin"].values()) == len(pairs)
     assert summary["by_split"]["train"] == len(pairs)
+
+
+# ---------------------------------------------------------------------------
+# Both axes of viewpoint change
+# ---------------------------------------------------------------------------
+
+def test_rotation_bins_mirror_the_parallax_bins():
+    from lot.datasets import ROTATION_BIN_EDGES, rotation_bin, rotation_bin_order
+
+    order = rotation_bin_order()
+    assert order[0] == ZERO_PARALLAX_BIN
+    assert len(order) == len(ROTATION_BIN_EDGES) + 1
+    assert rotation_bin(0.0) == ZERO_PARALLAX_BIN
+    for position, edge in enumerate(ROTATION_BIN_EDGES[:-1], start=1):
+        assert rotation_bin(edge) == order[position]
+        assert rotation_bin(edge + 1e-3) == order[position + 1]
+    with pytest.raises(ValueError):
+        rotation_bin(-1.0)
+
+
+def test_each_regime_varies_on_the_axis_it_actually_moves():
+    """Neither axis alone can stratify: each collapses one regime to a single cell."""
+    manifest, stats = make_scene()
+    pairs = build_scene_pairs(manifest, stats)
+    rotation = [p for p in pairs if p.regime == "rotation"]
+    translation = [p for p in pairs if p.regime == "translation"]
+
+    # In-place rotation has no baseline, so parallax cannot separate its pairs.
+    assert {p.parallax_bin for p in rotation} == {ZERO_PARALLAX_BIN}
+    assert len({p.rotation_bin for p in rotation}) > 1
+    # Pure translation has no rotation, so the angle cannot separate its pairs.
+    assert {p.rotation_bin for p in translation} == {ZERO_PARALLAX_BIN}
+    assert len({p.parallax_bin for p in translation}) > 1
+
+
+def test_strata_split_rotation_by_angle():
+    """The first Experiment Zero run pooled 7.5 to 60 degrees into one cell."""
+    manifest, stats = make_scene()
+    rotation = [p for p in build_scene_pairs(manifest, stats) if p.regime == "rotation"]
+    strata = {stratum_of(p) for p in rotation}
+    assert len(strata) > 1
+    for stratum in strata:
+        assert len(stratum) == 4  # scene, regime, parallax bin, rotation bin
+
+
+def test_subsampling_now_keeps_every_rotation_angle():
+    """A cap per stratum only balances angles once the angles are separate strata."""
+    manifest, stats = make_scene()
+    rotation = [p for p in build_scene_pairs(manifest, stats) if p.regime == "rotation"]
+    taken = subsample_by_stratum(rotation, max_per_stratum=1, seed=0)
+    assert {p.rotation_bin for p in taken} == {p.rotation_bin for p in rotation}
+
+
+def test_summary_reports_both_axes():
+    manifest, stats = make_scene()
+    pairs = build_scene_pairs(manifest, stats)
+    summary = summarize_pairs(pairs)
+    assert sum(summary["by_parallax_bin"].values()) == len(pairs)
+    assert sum(summary["by_rotation_bin"].values()) == len(pairs)

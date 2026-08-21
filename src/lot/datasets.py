@@ -44,47 +44,83 @@ from .render_replica import (
     usable_frame_ids,
 )
 
+# A viewpoint change has two components and they are not interchangeable. The
+# baseline decides how much depth-dependent re-mapping is needed; the rotation
+# decides how far a surface point travels across the image. Stratifying by only
+# one of them pools situations that differ in the other, which is what happened
+# in the first Experiment Zero run: every in-place rotation pair has zero
+# baseline, so one parallax bin held 7.5 to 60 degrees of yaw, and 60 degrees of
+# a 90 degree field of view sweeps a point across two thirds of the frame.
+# Every pair is therefore binned on both axes.
+
 # Upper edges of the parallax bins. The open-ended last bin catches pairs that
 # combine two opposite translations, which reach twice the largest single
 # baseline the camera program targets.
 PARALLAX_BIN_EDGES: tuple[float, ...] = (0.025, 0.05, 0.1, 0.2, 0.4, float("inf"))
 
-# Below this a pair has no baseline at all. In-place rotation is exactly zero by
-# construction, so this only has to absorb floating point noise in the pose
-# arithmetic, not a judgement about what counts as small.
+# Upper edges of the rotation bins, in degrees. The camera programs produce
+# pairwise angles from 7.5 up to 60.
+ROTATION_BIN_EDGES: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, float("inf"))
+
+# Below these a pair has no baseline, or no rotation, at all. Both are exactly
+# zero by construction for the programs that hold one fixed, so these only have
+# to absorb floating point noise in the pose arithmetic, not make a judgement
+# about what counts as small.
 ZERO_PARALLAX_TOL = 1e-9
+ZERO_ROTATION_TOL_DEG = 1e-6
 
-ZERO_PARALLAX_BIN = "zero"
+ZERO_BIN = "zero"
+ZERO_PARALLAX_BIN = ZERO_BIN  # kept for readers of the earlier name
 
 
-def parallax_bin(value: float) -> str:
-    """Label the parallax bin a value falls in.
+def _bin_label(value: float, edges: Sequence[float], zero_tol: float, name: str) -> str:
+    """Label the bin a non-negative value falls in.
 
     Bins are half open on the left, so a value sits in the first bin whose upper
-    edge it does not exceed. Pure rotation gets its own label rather than being
-    folded into the smallest bin, because zero baseline is a different physical
-    situation from a small one: no depth-dependent re-mapping exists at all.
+    edge it does not exceed. Exact zero gets its own label rather than being
+    folded into the smallest bin, because no baseline at all, or no rotation at
+    all, is a different physical situation from a small one.
     """
     if not math.isfinite(value) or value < 0:
-        raise ValueError(f"parallax must be finite and non-negative, got {value}")
-    if value < ZERO_PARALLAX_TOL:
-        return ZERO_PARALLAX_BIN
+        raise ValueError(f"{name} must be finite and non-negative, got {value}")
+    if value < zero_tol:
+        return ZERO_BIN
     lower = 0.0
-    for edge in PARALLAX_BIN_EDGES:
+    for edge in edges:
         if value <= edge:
             return f"{lower:g}-{edge:g}" if math.isfinite(edge) else f"{lower:g}+"
         lower = edge
     raise AssertionError("the last bin edge must be infinite")
 
 
-def parallax_bin_order() -> list[str]:
-    """Bin labels in increasing parallax order, for stable figures and tables."""
-    labels = [ZERO_PARALLAX_BIN]
+def _bin_order(edges: Sequence[float]) -> list[str]:
+    """Bin labels in increasing order, for stable figures and tables."""
+    labels = [ZERO_BIN]
     lower = 0.0
-    for edge in PARALLAX_BIN_EDGES:
+    for edge in edges:
         labels.append(f"{lower:g}-{edge:g}" if math.isfinite(edge) else f"{lower:g}+")
         lower = edge
     return labels
+
+
+def parallax_bin(value: float) -> str:
+    """Label the parallax bin a value falls in. Pure rotation lands in "zero"."""
+    return _bin_label(value, PARALLAX_BIN_EDGES, ZERO_PARALLAX_TOL, "parallax")
+
+
+def parallax_bin_order() -> list[str]:
+    """Parallax bin labels in increasing order."""
+    return _bin_order(PARALLAX_BIN_EDGES)
+
+
+def rotation_bin(degrees: float) -> str:
+    """Label the rotation bin an angle falls in. Pure translation lands in "zero"."""
+    return _bin_label(degrees, ROTATION_BIN_EDGES, ZERO_ROTATION_TOL_DEG, "rotation")
+
+
+def rotation_bin_order() -> list[str]:
+    """Rotation bin labels in increasing order."""
+    return _bin_order(ROTATION_BIN_EDGES)
 
 
 def scene_split(scene: str) -> str:
@@ -111,6 +147,7 @@ class PairRecord:
     parallax: float
     parallax_bin: str
     rotation_deg: float
+    rotation_bin: str
 
     def as_row(self) -> dict[str, Any]:
         """Flat dict for a results table."""
@@ -191,6 +228,7 @@ def build_scene_pairs(
                         parallax=value,
                         parallax_bin=parallax_bin(value),
                         rotation_deg=rotation,
+                        rotation_bin=rotation_bin(rotation),
                     )
                 )
     return pairs
@@ -204,9 +242,15 @@ def load_scene_pairs(renders_root: Path, scene: str, **kwargs: Any) -> list[Pair
     return build_scene_pairs(manifest, stats, **kwargs)
 
 
-def stratum_of(pair: PairRecord) -> tuple[str, str, str]:
-    """The stratum a pair is sampled and reported within: scene, regime, parallax bin."""
-    return (pair.scene, pair.regime, pair.parallax_bin)
+def stratum_of(pair: PairRecord) -> tuple[str, str, str, str]:
+    """The stratum a pair is sampled and reported within.
+
+    Scene, regime, and both axes of viewpoint change. Binning on one axis alone
+    would pool pairs that differ on the other: rotation pairs all share a
+    parallax of zero, and translation pairs all share a rotation of zero, so
+    either axis by itself collapses one whole regime into a single cell.
+    """
+    return (pair.scene, pair.regime, pair.parallax_bin, pair.rotation_bin)
 
 
 def subsample_by_stratum(
@@ -227,7 +271,7 @@ def subsample_by_stratum(
     if max_per_stratum <= 0:
         raise ValueError("max_per_stratum must be positive")
     pairs = list(pairs)
-    buckets: dict[tuple[str, str, str], list[int]] = {}
+    buckets: dict[tuple[str, ...], list[int]] = {}
     for index, pair in enumerate(pairs):
         buckets.setdefault(stratum_of(pair), []).append(index)
     keep: set[int] = set()
@@ -246,7 +290,7 @@ def subsample_by_stratum(
     return [pair for index, pair in enumerate(pairs) if index in keep]
 
 
-def hash_stratum(stratum: tuple[str, str, str]) -> int:
+def hash_stratum(stratum: tuple[str, ...]) -> int:
     """Stable integer for a stratum. Python's hash is salted per process."""
     import zlib
 
@@ -256,15 +300,18 @@ def hash_stratum(stratum: tuple[str, str, str]) -> int:
 def summarize_pairs(pairs: Sequence[PairRecord]) -> dict[str, Any]:
     """Counts by split, regime, and parallax bin, for a run log."""
     by_regime: dict[str, int] = {regime: 0 for regime in REGIMES}
-    by_bin: dict[str, int] = {label: 0 for label in parallax_bin_order()}
+    by_parallax: dict[str, int] = {label: 0 for label in parallax_bin_order()}
+    by_rotation: dict[str, int] = {label: 0 for label in rotation_bin_order()}
     by_split: dict[str, int] = {"train": 0, "test": 0}
     for pair in pairs:
         by_regime[pair.regime] += 1
-        by_bin[pair.parallax_bin] += 1
+        by_parallax[pair.parallax_bin] += 1
+        by_rotation[pair.rotation_bin] += 1
         by_split[pair.split] += 1
     return {
         "total": len(pairs),
         "by_split": by_split,
         "by_regime": by_regime,
-        "by_parallax_bin": by_bin,
+        "by_parallax_bin": by_parallax,
+        "by_rotation_bin": by_rotation,
     }

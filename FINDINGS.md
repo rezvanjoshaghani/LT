@@ -250,10 +250,25 @@ against 0.6647 splat-and-pool. The splat, z-buffer, and pooling machinery costs
 nothing measurable, so the later phases measure representations rather than the
 implementation.
 
-Still open, recorded rather than fixed: rotation is one parallax stratum by
-construction, so the zero bin pools 7.5 to 60 degrees of yaw. Its margin of
-0.288 is an average across that whole range. The rotation regime should be
-stratified by angle before these numbers go in a paper.
+Closed before Phase 4. Rotation was one parallax stratum by construction, so
+the zero bin pooled 7.5 to 60 degrees of yaw and its margin of 0.288 was an
+average across that whole range. A viewpoint change has two components that are
+not interchangeable: the baseline decides how much depth-dependent re-mapping
+is needed, and the rotation decides how far a surface point travels across the
+image. Every pair is now binned on both, and the stratum is scene, regime,
+parallax bin, and rotation bin.
+
+Binning on one axis alone collapses one whole regime into a single cell,
+whichever axis is chosen: in-place rotation has no baseline, pure translation
+has no rotation. Orbit is the case that shows why both are needed, since it
+moves on both axes at once and the two are correlated through the orbit radius.
+
+The effect on sampling, per scene at a cap of 40 per stratum: rotation goes
+from 1 stratum and 40 pairs to 4 strata and 160, orbit from 4 strata and 160 to
+13 strata and 478, translation is unchanged at 5 strata and 200. The run grows
+from 7200 pairs to 15084 and from about 9 minutes to about 19. Phase 4 inherits
+this stratification, which is why it landed before Phase 4 rather than after:
+doing it later would have meant re-running both rungs.
 
 ## Phase 3: Experiment Zero, first run and what it exposed (2026-08-21)
 

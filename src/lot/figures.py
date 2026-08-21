@@ -18,7 +18,7 @@ import math
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .datasets import parallax_bin_order
+from .datasets import parallax_bin_order, rotation_bin_order
 from .evaluate import (
     MEAN_FEATURE,
     NEIGHBOR_PATCH,
@@ -92,6 +92,8 @@ def paired_records(
                     "regime": row["regime"],
                     "parallax_bin": row["parallax_bin"],
                     "parallax": row["parallax"],
+                    "rotation_bin": row["rotation_bin"],
+                    "rotation_deg": row["rotation_deg"],
                     "encoder": row["encoder"],
                     "path": row["path"],
                     "metric": metric,
@@ -230,21 +232,35 @@ def format_console_summary(records: Sequence[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def margin_versus_parallax_figure(records: Sequence[dict[str, Any]], path: Path) -> None:
-    """The acceptance figure: margin over No-Warp-Copy against parallax.
+def margin_versus_axis_figure(
+    records: Sequence[dict[str, Any]],
+    path: Path,
+    axis: str = "parallax_bin",
+    order: Sequence[str] | None = None,
+    axis_label: str = "parallax bin (baseline / median depth)",
+    regimes: Sequence[str] | None = None,
+) -> None:
+    """Margin over No-Warp-Copy against one axis of viewpoint change.
 
-    One panel per path, one line per encoder. The floor is the zero line by
-    construction, and Mean-Feature is drawn as a second reference so the
-    distance between a real result and a location-free guess stays visible.
+    One panel per evaluation path and metric, one line per encoder. The floor is
+    the zero line by construction, and Mean-Feature is drawn as a second
+    reference so the distance between a real result and a location-free guess
+    stays visible. A viewpoint change has two axes and neither alone describes
+    every regime, so this takes the axis as an argument: parallax separates the
+    translating regimes, rotation angle separates the in-place one.
     """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    if regimes is not None:
+        records = [r for r in records if r["regime"] in regimes]
+    if not records:
+        raise ValueError("no records to plot")
     encoders = sorted({r["encoder"] for r in records})
     metrics = sorted({r["metric"] for r in records})
-    order = parallax_bin_order()
+    order = list(order) if order is not None else parallax_bin_order()
     figure, axes = plt.subplots(
         len(metrics),
         len(PATH_ORDER),
@@ -253,7 +269,7 @@ def margin_versus_parallax_figure(records: Sequence[dict[str, Any]], path: Path)
     )
     for row_index, metric in enumerate(metrics):
         for column, evaluation_path in enumerate(PATH_ORDER):
-            axis = axes[row_index][column]
+            panel = axes[row_index][column]
             for variant, style in ((ORACLE_TRANSPORT, "-o"), (MEAN_FEATURE, "--s")):
                 stats = aggregate(
                     [
@@ -263,29 +279,36 @@ def margin_versus_parallax_figure(records: Sequence[dict[str, Any]], path: Path)
                         and r["path"] == evaluation_path
                         and r["metric"] == metric
                     ],
-                    ("encoder", "parallax_bin"),
+                    ("encoder", axis),
                     ("margin",),
                 )
                 for encoder in encoders:
                     present = [b for b in order if (encoder, b) in stats]
                     if not present:
                         continue
-                    axis.plot(
+                    panel.plot(
                         range(len(present)),
                         [stats[(encoder, b)]["margin"] for b in present],
                         style,
                         label=f"{encoder} {variant}",
                         markersize=4,
                     )
-                    axis.set_xticks(range(len(present)))
-                    axis.set_xticklabels(present, rotation=45, ha="right", fontsize=8)
-            axis.axhline(0.0, color="black", linewidth=1)
-            axis.set_title(f"{evaluation_path}, {metric}", fontsize=10)
-            axis.set_xlabel("parallax bin (baseline / median depth)", fontsize=9)
+                    panel.set_xticks(range(len(present)))
+                    panel.set_xticklabels(present, rotation=45, ha="right", fontsize=8)
+            panel.axhline(0.0, color="black", linewidth=1)
+            panel.set_title(f"{evaluation_path}, {metric}", fontsize=10)
+            panel.set_xlabel(axis_label, fontsize=9)
             if column == 0:
-                axis.set_ylabel("margin over No-Warp-Copy", fontsize=9)
-            axis.grid(alpha=0.3)
-    axes[0][-1].legend(fontsize=7, loc="best")
+                panel.set_ylabel("margin over No-Warp-Copy", fontsize=9)
+            panel.grid(alpha=0.3)
+    for row in axes:
+        for panel in row:
+            if panel.get_legend_handles_labels()[0]:
+                panel.legend(fontsize=7, loc="best")
+                break
+        else:
+            continue
+        break
     figure.suptitle("Experiment Zero: how far a frozen feature transports", fontsize=11)
     figure.tight_layout()
     path = Path(path)
@@ -324,19 +347,39 @@ def main(argv: list[str] | None = None) -> None:
         print()
         print(f"===== {metric} =====")
         print(format_console_summary([r for r in records if r["metric"] == metric]))
-    figure_path = Path(out_dir) / "figures" / "margin_versus_parallax.png"
+    figures = {
+        "margin_versus_parallax.png": dict(
+            axis="parallax_bin",
+            order=parallax_bin_order(),
+            axis_label="parallax bin (baseline / median depth)",
+            regimes=None,
+        ),
+        # In-place rotation has no baseline, so the parallax figure collapses it
+        # to one point. Its own axis is the angle.
+        "margin_versus_rotation.png": dict(
+            axis="rotation_bin",
+            order=rotation_bin_order(),
+            axis_label="rotation bin (degrees between the two views)",
+            regimes=("rotation",),
+        ),
+    }
     table_path = Path(out_dir) / "tables" / "experiment_zero.parquet"
     print()
     # The table is the artifact the numbers live in, so it is written before the
     # figure. A missing plotting library must not cost the run its results.
     write_table(table_path, summary_table(records))
     print(f"table  -> {table_path}")
-    try:
-        margin_versus_parallax_figure(records, figure_path)
-    except ImportError as error:
-        print(f"figure skipped: {error}. Install matplotlib and rerun; the table is written.")
-    else:
-        print(f"figure -> {figure_path}")
+    for name, options in figures.items():
+        figure_path = Path(out_dir) / "figures" / name
+        try:
+            margin_versus_axis_figure(records, figure_path, **options)
+        except ImportError as error:
+            print(f"figures skipped: {error}. Install matplotlib and rerun; the table is written.")
+            break
+        except ValueError as error:
+            print(f"{name} skipped: {error}")
+        else:
+            print(f"figure -> {figure_path}")
     assert usable  # every scene contributed something
 
 

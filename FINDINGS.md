@@ -104,8 +104,14 @@ Open, recorded rather than fixed:
   48, as fp16 [768, 37, 37], and validated against its manifest frame by frame.
   The 37 by 37 grid confirms the encoder saw the 518 px frames the manifest
   declares, which is the assumption every Phase 3 warp rests on.
-- The measured rate on an L40 is 19.69 frames per second, against 8.9 on the
-  local RTX 2080 Super, so the full 5136 frame set is about 4.3 minutes per
-  encoder rather than 10. The host side still sets the floor: the local model
-  alone ran at 21 frames per second, and the L40 end to end lands just under
-  that, so PNG decode and transfer, not the GPU, now bound the job.
+- The DINOv2 batch is complete and accepted. All 18 scenes cached and
+  validated: 5136 frames, every one fp16 [768, 37, 37], frame counts matching
+  the manifests, including frl_apartment_2 at 240 for the 5 viewpoints Phase 1
+  accepted there. Total wall time was about 3.5 minutes on one L40.
+- Per-scene rates ranged from 18.6 to 57.9 frames per second, a threefold
+  spread with no relation to scene content or frame count, while the aggregate
+  was 25.9. The job is bound by reading and decoding PNGs from shared scratch,
+  not by the GPU, so the spread tracks filesystem contention. This matters for
+  Phase 3 planning: encoding is cheap and repeatable, and any pipeline that
+  re-reads the rendered PNGs will see the same variance, whereas one that reads
+  the cached features will not.

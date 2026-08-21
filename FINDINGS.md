@@ -100,7 +100,12 @@ Open, recorded rather than fixed:
   dinov2_vitb14_reg. That does not settle the question on real Replica frames,
   where large flat surfaces are common, so the register variant is registered
   as an encoder and Phase 3 can compare the two directly.
-- Acceptance is partly cluster bound. The rendered frames live on Borah, so the
-  pilot-scene cache runs there. The path is verified end to end locally on a
-  synthetic 518 px scene of 96 frames: fp16 [768, 37, 37] per frame, validated
-  against the manifest, reloaded bit for bit.
+- Pilot acceptance passed on Borah. room_0 cached 288 frames, 6 viewpoints of
+  48, as fp16 [768, 37, 37], and validated against its manifest frame by frame.
+  The 37 by 37 grid confirms the encoder saw the 518 px frames the manifest
+  declares, which is the assumption every Phase 3 warp rests on.
+- The measured rate on an L40 is 19.69 frames per second, against 8.9 on the
+  local RTX 2080 Super, so the full 5136 frame set is about 4.3 minutes per
+  encoder rather than 10. The host side still sets the floor: the local model
+  alone ran at 21 frames per second, and the L40 end to end lands just under
+  that, so PNG decode and transfer, not the GPU, now bound the job.

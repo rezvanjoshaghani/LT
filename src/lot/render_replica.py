@@ -791,6 +791,45 @@ def scene_seed(seed: int, scene: str) -> int:
     return (seed * 100003 + zlib.crc32(scene.encode("utf-8"))) % (2**31)
 
 
+def _navmesh_matches_geometry(sim, eye_height_m: float, n_points: int = 3) -> bool:
+    """True when the floor is visible below navigable points.
+
+    A camera at eye height above a walkable point must see geometry when
+    looking straight down. A navmesh from a mismatched coordinate frame
+    (some Replica scenes ship one that does not match mesh.ply) puts its
+    points outside the scanned shell, where the floor view is empty. The
+    check is independent of the depth convention: any hit is a positive
+    depth either way.
+    """
+    up_ref = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    down = torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64)
+    fractions = []
+    for _ in range(n_points):
+        point = np.asarray(
+            sim.pathfinder.get_random_navigable_point(), dtype=np.float64
+        )
+        eye = torch.tensor(point) + torch.tensor(
+            [0.0, eye_height_m, 0.0], dtype=torch.float64
+        )
+        _, depth_raw, _ = render_at_pose(sim, look_at_cv(eye, eye + down, up_ref))
+        valid = np.isfinite(depth_raw) & (depth_raw > 0.05)
+        fractions.append(float(valid.mean()))
+    return float(np.median(np.asarray(fractions))) >= 0.5
+
+
+def _recompute_navmesh(sim, habitat_sim, eye_height_m: float, scene: str) -> None:
+    """Recompute the navmesh from the loaded scene geometry, in place."""
+    settings = habitat_sim.NavMeshSettings()
+    settings.set_defaults()
+    settings.agent_height = eye_height_m
+    settings.agent_radius = 0.2
+    if not sim.recompute_navmesh(sim.pathfinder, settings):
+        raise RuntimeError(
+            f"navmesh recompute failed for {scene}. Viewpoint sampling "
+            "needs a navmesh."
+        )
+
+
 def make_sim(cfg: RenderConfig, scene: str):
     """Create a Habitat simulator for one Replica scene with color and depth sensors.
 
@@ -799,7 +838,8 @@ def make_sim(cfg: RenderConfig, scene: str):
     navmesh_source records how the navmesh was obtained: 'simulator' when
     Habitat loaded one on its own, 'dataset' when loaded from
     cfg.navmesh_relpath, 'recomputed' when computed from the scene mesh
-    because the dataset ships none.
+    because the dataset ships none or the loaded navmesh fails the
+    floor-visibility check (_navmesh_matches_geometry).
     """
     habitat_sim = _import_habitat()
     scene_path = cfg.replica_root / scene / cfg.scene_relpath
@@ -834,17 +874,25 @@ def make_sim(cfg: RenderConfig, scene: str):
     if not sim.pathfinder.is_loaded and navmesh_path.is_file():
         sim.pathfinder.load_nav_mesh(str(navmesh_path))
         navmesh_source = "dataset"
-    if not sim.pathfinder.is_loaded:
-        settings = habitat_sim.NavMeshSettings()
-        settings.set_defaults()
-        settings.agent_height = cfg.eye_height_m
-        settings.agent_radius = 0.2
-        if not sim.recompute_navmesh(sim.pathfinder, settings):
-            raise RuntimeError(
-                f"no navmesh for {scene} at {navmesh_path} and recompute "
-                "failed. Viewpoint sampling needs a navmesh."
-            )
+    if sim.pathfinder.is_loaded and not _navmesh_matches_geometry(
+        sim, cfg.eye_height_m
+    ):
+        # Seen in Replica: some scenes ship a navmesh in a different frame
+        # than mesh.ply, so its points stand outside the rendered shell.
+        print(
+            f"[{scene}] {navmesh_source} navmesh points miss the rendered "
+            "geometry; recomputing from the scene mesh"
+        )
+        _recompute_navmesh(sim, habitat_sim, cfg.eye_height_m, scene)
         navmesh_source = "recomputed"
+    if not sim.pathfinder.is_loaded:
+        _recompute_navmesh(sim, habitat_sim, cfg.eye_height_m, scene)
+        navmesh_source = "recomputed"
+    if not _navmesh_matches_geometry(sim, cfg.eye_height_m):
+        raise RuntimeError(
+            f"navmesh for {scene} still misses the rendered geometry after "
+            "recompute; inspect the scene"
+        )
     sim.pathfinder.seed(seed)
     return sim, navmesh_source
 

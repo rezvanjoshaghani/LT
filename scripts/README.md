@@ -120,19 +120,22 @@ TORCH_HOME=$PWD/cache/torch micromamba run -n lot-encode \
 
 ```bash
 export SLURM_ACCOUNT=<account> SLURM_PARTITION=<gpu partition>
-sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
-       scripts/cache_features.sbatch configs/cache_features_pilot.yaml
-sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
-       --array 0-17 scripts/cache_features.sbatch configs/cache_features_all.yaml
-python -m lot.encoders --config configs/cache_features_all.yaml --validate-only
+./scripts/run_phase2_cache.sh pilot
+./scripts/run_phase2_cache.sh all       # refuses to run before the pilot
+./scripts/run_phase2_cache.sh vggt      # VGGT features and estimated depth
+./scripts/run_phase2_cache.sh validate  # no GPU
 ```
 
-Then the same array against `configs/cache_features_vggt.yaml`, which also
-exports VGGT's estimated depth for Phase 4.
+To find the account and partition: inside a running job,
+`echo "$SLURM_JOB_ACCOUNT $SLURM_JOB_PARTITION"`; otherwise
+`sacctmgr -nP show assoc user=$USER format=account` and
+`sinfo -o "%P %G" | grep -i gpu`. The wrapper says the same thing if either
+variable is unset, which raw `sbatch` does not.
 
 Caches land in `cache/features/<encoder>/<scene>/`. A finished cache is never
-overwritten; the sbatch passes `--resume`, so re-running an array skips scenes
-that are already done and a failed task can simply be resubmitted.
+overwritten. The wrapper submits array indices only for scenes that have no
+cache yet, so a partially finished batch resumes without queueing jobs that
+would no-op, and the sbatch also passes `--resume` as a second guard.
 
 ## What to check
 

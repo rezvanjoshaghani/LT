@@ -248,9 +248,9 @@ def test_depth_convention_classification_and_conversion():
     recovered = euclidean_to_planar_depth(euclid, K)
     assert torch.allclose(recovered, planar, atol=1e-12)
 
-    # Moderate clutter does not flip the verdict: a robust statistic ignores it.
+    # Moderate clutter inside the crop does not flip the verdict.
     cluttered = planar.clone()
-    cluttered[:60, :60] = 0.9
+    cluttered[90:130, 90:130] = 0.9
     assert classify_depth_convention(cluttered, K)["verdict"] == "planar_z"
 
     # A structureless map is ambiguous, not silently classified.
@@ -262,6 +262,34 @@ def test_depth_convention_classification_and_conversion():
     holes = planar.clone()
     holes[:, :] = 0.0
     assert classify_depth_convention(holes, K)["verdict"] == "ambiguous"
+
+
+def test_depth_convention_tolerates_tilted_planes():
+    """The cluster failure mode: scans a few degrees off gravity alignment.
+
+    A camera looking straight down at a floor tilted by angle t sees planar
+    z-depth h / (1 - tan(t) x'), an affine-up-to-negligible-curvature
+    function of the normalized image coordinate. The constant-depth test
+    rejected these; the plane-fit test must classify them.
+    """
+    K = intrinsics_from_hfov(224, 224, 90.0)
+    h = 1.5
+    uv = torch.stack(
+        torch.meshgrid(
+            torch.arange(224, dtype=torch.float64),
+            torch.arange(224, dtype=torch.float64),
+            indexing="ij",
+        ),
+        dim=-1,
+    )
+    xprime = (uv[..., 1] - K[0, 2]) / K[0, 0]
+    for tilt_deg in (2.0, 4.0, 6.0):
+        tilted = h / (1.0 - math.tan(math.radians(tilt_deg)) * xprime)
+        stats = classify_depth_convention(tilted, K)
+        assert stats["verdict"] == "planar_z", (tilt_deg, stats)
+        tilted_euclid = tilted * ray_norm_map(224, 224, K)
+        stats_e = classify_depth_convention(tilted_euclid, K)
+        assert stats_e["verdict"] == "euclidean_ray", (tilt_deg, stats_e)
 
 
 # ---------------------------------------------------------------------------

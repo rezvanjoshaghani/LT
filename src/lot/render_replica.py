@@ -252,12 +252,27 @@ def euclidean_to_planar_depth(depth: Tensor, K: Tensor) -> Tensor:
     return depth / n
 
 
-def _robust_spread(x: Tensor) -> float:
-    """Median absolute deviation over median. Zero for a constant map."""
-    med = x.median()
-    if float(med) <= 0:
+def _plane_residual_spread(z: Tensor, x: Tensor, y: Tensor) -> float:
+    """Robust spread of z around a fitted affine plane in (x, y), over median z.
+
+    Two-pass fit: least squares on all samples, then a refit on inliers
+    within three median absolute deviations of the first residuals, so
+    moderate clutter does not drag the plane. Zero for any plane.
+    """
+    med_z = z.median()
+    if float(med_z) <= 0:
         return float("inf")
-    return float((x - med).abs().median() / med)
+    A = torch.stack((x, y, torch.ones_like(x)), dim=-1)
+    coef = torch.linalg.lstsq(A, z.unsqueeze(-1)).solution
+    r = (z.unsqueeze(-1) - A @ coef).squeeze(-1)
+    med = r.median()
+    keep = (r - med).abs() <= 3 * (r - med).abs().median() + 1e-9
+    if int(keep.sum()) >= 16:
+        A, z = A[keep], z[keep]
+        coef = torch.linalg.lstsq(A, z.unsqueeze(-1)).solution
+        r = (z.unsqueeze(-1) - A @ coef).squeeze(-1)
+    r_med = r.median()
+    return float((r - r_med).abs().median() / med_z)
 
 
 def classify_depth_convention(
@@ -266,20 +281,26 @@ def classify_depth_convention(
     center_crop: float = 0.5,
     flat_tol: float = 0.01,
     margin: float = 3.0,
+    max_samples: int = 20000,
 ) -> dict[str, Any]:
-    """Decide whether a depth map of a fronto-parallel surface is planar or euclidean.
+    """Decide whether a depth map of a planar surface is planar z or euclidean.
 
-    Under planar z-depth a fronto-parallel wall is constant. Under euclidean
-    ray distance it grows toward the corners by the ray norm factor. The map
-    divided by ray_norm_map is constant exactly in the euclidean case. The
-    verdict picks the interpretation with the smaller robust spread, and it
-    must be flatter than flat_tol and at least margin times flatter than the
-    alternative; otherwise the verdict is ambiguous. Statistics use the
-    central crop only and the median absolute deviation, so moderate clutter
-    in the view does not flip the answer.
+    A planar surface is an affine function of the normalized image
+    coordinates under the correct planar z-depth interpretation, whatever
+    its tilt. Under the wrong interpretation the ray-norm factor leaves a
+    curved residual no plane can absorb. Each interpretation (the map
+    itself, and the map divided by ray_norm_map) is therefore scored by the
+    robust residual spread around a fitted plane; the verdict picks the
+    flatter one, which must be flatter than flat_tol and at least margin
+    times flatter than the alternative, else 'ambiguous'. The plane fit
+    means walls seen at an angle and floors of slightly tilted scans still
+    classify; the earlier constant-depth test required fronto-parallel
+    views and failed on scenes a few degrees off gravity alignment.
 
-    Returns a dict with keys verdict ('planar_z', 'euclidean_ray', or
-    'ambiguous'), spread_planar, spread_euclidean, median_m, valid_fraction.
+    Statistics use the central crop only, a robust two-pass fit, and at
+    most max_samples pixels. Returns a dict with keys verdict ('planar_z',
+    'euclidean_ray', or 'ambiguous'), spread_planar, spread_euclidean,
+    median_m, valid_fraction.
     """
     if depth.dim() != 2:
         raise ValueError(f"depth must be [H, W], got {tuple(depth.shape)}")
@@ -290,7 +311,11 @@ def classify_depth_convention(
     dh = int(round(h * (1 - center_crop) / 2))
     dw = int(round(w * (1 - center_crop) / 2))
     crop = d[dh : h - dh, dw : w - dw]
-    n = ray_norm_map(h, w, K)[dh : h - dh, dw : w - dw]
+    K64 = K.to(torch.float64)
+    uv = pixel_grid(h, w, dtype=torch.float64)[dh : h - dh, dw : w - dw]
+    x = (uv[..., 0] - K64[0, 2]) / K64[0, 0]
+    y = (uv[..., 1] - K64[1, 2]) / K64[1, 1]
+    n = torch.sqrt(x * x + y * y + 1.0)
     valid = torch.isfinite(crop) & (crop > 0)
     valid_fraction = float(valid.float().mean())
     result: dict[str, Any] = {
@@ -300,11 +325,13 @@ def classify_depth_convention(
         "median_m": float("nan"),
         "valid_fraction": valid_fraction,
     }
-    if valid.float().mean() < 0.5:
+    if valid_fraction < 0.5:
         return result
-    dv = crop[valid]
-    spread_planar = _robust_spread(dv)
-    spread_euclidean = _robust_spread(dv / n[valid])
+    dv, xv, yv, nv = crop[valid], x[valid], y[valid], n[valid]
+    step = max(1, dv.numel() // max_samples)
+    dv, xv, yv, nv = dv[::step], xv[::step], yv[::step], nv[::step]
+    spread_planar = _plane_residual_spread(dv, xv, yv)
+    spread_euclidean = _plane_residual_spread(dv / nv, xv, yv)
     result["spread_planar"] = spread_planar
     result["spread_euclidean"] = spread_euclidean
     result["median_m"] = float(dv.median())
@@ -856,56 +883,80 @@ _UP_WORLD = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64)
 
 
 def probe_depth_convention(
-    sim, K: Tensor, eye_height_m: float, probe_dir: Path
+    sim, K: Tensor, eye_height_m: float, probe_dir: Path, n_points: int = 3
 ) -> tuple[dict[str, Any], bool]:
-    """Resolve the depth convention empirically from wall and floor probe views.
+    """Resolve the depth convention empirically from probe views.
 
-    Renders one straight-down floor view and four horizontal views from a
-    navigable point, classifies each with classify_depth_convention, and
-    requires all confident verdicts to agree. Saves every probe render under
-    probe_dir for the QC record. Returns (metadata dict, convert_needed).
-    Raises RuntimeError when no probe is confident or the verdicts disagree;
-    per PLAN, that is an anomaly to report, not to tune away.
+    From up to n_points navigable points, renders a floor view, a ceiling
+    view, and four horizontal views, and classifies each with
+    classify_depth_convention. The classifier fits a plane, so obliquely
+    seen walls and floors of slightly tilted scans still vote. All
+    confident verdicts must agree, and probing stops early once three
+    agree. Every probe render, and the classification stats as
+    classification.json, are saved under probe_dir for the QC record.
+    Returns (metadata dict, convert_needed). Raises RuntimeError when no
+    probe is confident or the verdicts disagree; per PLAN, that is an
+    anomaly to report, not to tune away.
     """
-    point = np.asarray(sim.pathfinder.get_random_navigable_point(), dtype=np.float64)
-    eye = torch.tensor(point) + torch.tensor([0.0, eye_height_m, 0.0], dtype=torch.float64)
-    poses = {
-        "floor_down": look_at_cv(
-            eye, eye + torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64),
-            up_world=torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64),
-        )
-    }
-    for yaw in (0.0, 90.0, 180.0, 270.0):
-        a = math.radians(yaw)
-        direction = torch.tensor([math.sin(a), 0.0, math.cos(a)], dtype=torch.float64)
-        poses[f"wall_yaw{int(yaw):03d}"] = look_at_cv(eye, eye + direction, _UP_WORLD)
-    probe_dir.mkdir(parents=True, exist_ok=True)
     from PIL import Image
 
-    probes = []
-    verdicts = []
-    for name, pose in poses.items():
-        rgb, depth_raw, _ = render_at_pose(sim, pose)
-        Image.fromarray(rgb).save(probe_dir / f"{name}.png")
-        np.save(probe_dir / f"{name}_depth_raw.npy", depth_raw)
-        stats = classify_depth_convention(torch.from_numpy(depth_raw), K)
-        stats["name"] = name
-        probes.append(stats)
-        if stats["verdict"] != "ambiguous":
-            verdicts.append(stats["verdict"])
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    up_ref = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    down = torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64)
+    probes: list[dict[str, Any]] = []
+    verdicts: list[str] = []
+    points_used = 0
+    try:
+        for pi in range(n_points):
+            points_used = pi + 1
+            point = np.asarray(
+                sim.pathfinder.get_random_navigable_point(), dtype=np.float64
+            )
+            eye = torch.tensor(point) + torch.tensor(
+                [0.0, eye_height_m, 0.0], dtype=torch.float64
+            )
+            poses = {
+                f"p{pi}_floor_down": look_at_cv(eye, eye + down, up_ref),
+                f"p{pi}_ceiling_up": look_at_cv(eye, eye - down, up_ref),
+            }
+            for yaw in (0.0, 90.0, 180.0, 270.0):
+                a = math.radians(yaw)
+                direction = torch.tensor(
+                    [math.sin(a), 0.0, math.cos(a)], dtype=torch.float64
+                )
+                poses[f"p{pi}_wall_yaw{int(yaw):03d}"] = look_at_cv(
+                    eye, eye + direction, _UP_WORLD
+                )
+            for name, pose in poses.items():
+                rgb, depth_raw, _ = render_at_pose(sim, pose)
+                Image.fromarray(rgb).save(probe_dir / f"{name}.png")
+                np.save(probe_dir / f"{name}_depth_raw.npy", depth_raw)
+                stats = classify_depth_convention(torch.from_numpy(depth_raw), K)
+                stats["name"] = name
+                probes.append(stats)
+                if stats["verdict"] != "ambiguous":
+                    verdicts.append(stats["verdict"])
+            if len(verdicts) >= 3 and len(set(verdicts)) == 1:
+                break
+    finally:
+        (probe_dir / "classification.json").write_text(
+            json.dumps(probes, indent=1), encoding="utf-8"
+        )
     if not verdicts:
         raise RuntimeError(
             f"depth convention: every probe ambiguous; inspect {probe_dir}"
         )
     if len(set(verdicts)) != 1:
         raise RuntimeError(
-            f"depth convention: probes disagree {verdicts}; inspect {probe_dir}"
+            f"depth convention: probes disagree {sorted(set(verdicts))}; "
+            f"inspect {probe_dir}"
         )
     raw_verdict = verdicts[0]
     metadata = {
         "raw_verdict": raw_verdict,
         "converted_to_planar": raw_verdict == "euclidean_ray",
         "stored_depth": "planar_z",
+        "probe_points": points_used,
         "probes": probes,
     }
     return metadata, raw_verdict == "euclidean_ray"

@@ -634,6 +634,80 @@ def validate_feature_cache(cache_root: Path, encoder_name: str, manifest: Any) -
     return meta
 
 
+def feature_statistics(
+    cache_root: Path,
+    encoder_name: str,
+    scenes: Sequence[str],
+    max_frames: int = 64,
+    samples: int = 20000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """How much of a cached feature is shared by every patch.
+
+    Cosine similarity only tells things apart when the features are spread over
+    the sphere. If every patch points in nearly the same direction, every cosine
+    is near one, the floors rise to meet any method, and the metric stops
+    resolving anything, whatever the representation actually knows.
+
+    Returns, for the raw features and again after subtracting the mean feature:
+    shared_direction_fraction, the norm of the mean feature over the mean norm
+    of a feature, which is near one when a single direction dominates;
+    cosine_within_frame, between two random patches of one frame; and
+    cosine_across_frames, between patches of different frames. The centered
+    numbers say whether centering would restore the metric's range, which is a
+    decision to take deliberately rather than a knob to turn until a number
+    improves.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    maps: list[Tensor] = []
+    for scene in scenes:
+        path = cache_dir(cache_root, encoder_name, scene) / FEATURES_NAME
+        with np.load(path) as archive:
+            names = sorted(archive.files)[: max(1, max_frames // max(1, len(scenes)))]
+            for name in names:
+                maps.append(torch.from_numpy(archive[name]).to(torch.float32))
+        if len(maps) >= max_frames:
+            break
+    if not maps:
+        raise ValueError(f"no cached features for {encoder_name}")
+
+    channels = maps[0].shape[0]
+    per_frame = [m.reshape(channels, -1).T for m in maps]  # [P, C] each
+    flat = torch.cat(per_frame, dim=0)
+    mean = flat.mean(dim=0)
+
+    def report(vectors: Tensor, frames: list[Tensor]) -> dict[str, float]:
+        norms = vectors.norm(dim=1)
+        unit = vectors / norms.clamp(min=1e-12)[:, None]
+        within = []
+        for frame in frames:
+            count = frame.shape[0]
+            a = torch.randint(count, (samples // len(frames) + 1,), generator=generator)
+            b = torch.randint(count, (samples // len(frames) + 1,), generator=generator)
+            f = frame / frame.norm(dim=1).clamp(min=1e-12)[:, None]
+            within.append((f[a] * f[b]).sum(dim=1))
+        total = vectors.shape[0]
+        i = torch.randint(total, (samples,), generator=generator)
+        j = torch.randint(total, (samples,), generator=generator)
+        return {
+            "shared_direction_fraction": float(
+                vectors.mean(dim=0).norm() / norms.mean().clamp(min=1e-12)
+            ),
+            "cosine_within_frame": float(torch.cat(within).mean()),
+            "cosine_across_frames": float((unit[i] * unit[j]).sum(dim=1).mean()),
+        }
+
+    raw = report(flat, per_frame)
+    centered = report(flat - mean, [frame - mean for frame in per_frame])
+    return {
+        "encoder": encoder_name,
+        "frames": len(maps),
+        "channels": channels,
+        "raw": raw,
+        "centered": centered,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Config and entrypoint
 # ---------------------------------------------------------------------------
@@ -727,6 +801,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="validate existing caches instead of encoding",
     )
+    parser.add_argument(
+        "--feature-stats",
+        action="store_true",
+        help="report how far the cached features spread on the sphere",
+    )
     args = parser.parse_args(argv)
     cfg = load_cache_config(args.config)
     if args.list_scenes:
@@ -748,6 +827,17 @@ def main(argv: list[str] | None = None) -> None:
 
     from .render_replica import MANIFEST_NAME, load_manifest
 
+    if args.feature_stats:
+        stats = feature_statistics(cfg.cache_root, cfg.encoder, scenes)
+        print(f"{stats['encoder']}: {stats['frames']} frames, {stats['channels']} channels")
+        print(f"{'':22s} {'shared dir':>11s} {'within frame':>13s} {'across frames':>14s}")
+        for label in ("raw", "centered"):
+            entry = stats[label]
+            print(
+                f"  {label:20s} {entry['shared_direction_fraction']:11.4f} "
+                f"{entry['cosine_within_frame']:13.4f} {entry['cosine_across_frames']:14.4f}"
+            )
+        return
     if args.validate_only:
         failures = []
         for scene in scenes:

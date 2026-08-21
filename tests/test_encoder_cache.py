@@ -395,3 +395,41 @@ def test_dinov2_grid_orientation_and_shape():
         else:
             assert 14 <= int(cols.argmax()) <= 21
             assert float(cols.max() - cols.min()) > float(rows.max() - rows.min())
+
+
+# ---------------------------------------------------------------------------
+# Feature spread diagnostic
+# ---------------------------------------------------------------------------
+
+def write_fake_cache(root, encoder, scene, maps):
+    directory = cache_dir(root, encoder, scene)
+    directory.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        directory / "features.npz",
+        **{f"f{i:03d}": m.to(torch.float16).numpy() for i, m in enumerate(maps)},
+    )
+
+
+def test_feature_statistics_detects_a_dominant_shared_direction(tmp_path):
+    """The diagnostic that says whether cosine can resolve anything at all."""
+    from lot.encoders import feature_statistics
+
+    generator = torch.Generator().manual_seed(0)
+    spread = [torch.randn((6, 3, 3), generator=generator) for _ in range(4)]
+    offset = torch.zeros((6, 1, 1))
+    offset[0] = 20.0
+    write_fake_cache(tmp_path, "dinov2_vitb14", "room_0", spread)
+    write_fake_cache(tmp_path, "vggt_1b", "room_0", [m + offset for m in spread])
+
+    wide = feature_statistics(tmp_path, "dinov2_vitb14", ["room_0"], samples=2000)
+    narrow = feature_statistics(tmp_path, "vggt_1b", ["room_0"], samples=2000)
+
+    # A big common offset pushes every cosine towards one and hides the content.
+    assert narrow["raw"]["shared_direction_fraction"] > 0.9
+    assert wide["raw"]["shared_direction_fraction"] < 0.5
+    assert narrow["raw"]["cosine_across_frames"] > 0.9
+    assert narrow["raw"]["cosine_across_frames"] > wide["raw"]["cosine_across_frames"]
+    # Centering removes the offset, so the two agree again on the same content.
+    assert narrow["centered"]["cosine_across_frames"] == pytest.approx(
+        wide["centered"]["cosine_across_frames"], abs=0.05
+    )

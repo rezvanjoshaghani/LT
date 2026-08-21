@@ -294,11 +294,17 @@ def main(argv: list[str] | None = None) -> None:
     print(format_console_summary(records))
     figure_path = Path(out_dir) / "figures" / "margin_versus_parallax.png"
     table_path = Path(out_dir) / "tables" / "experiment_zero.parquet"
-    margin_versus_parallax_figure(records, figure_path)
-    write_table(table_path, summary_table(records))
     print()
-    print(f"figure -> {figure_path}")
+    # The table is the artifact the numbers live in, so it is written before the
+    # figure. A missing plotting library must not cost the run its results.
+    write_table(table_path, summary_table(records))
     print(f"table  -> {table_path}")
+    try:
+        margin_versus_parallax_figure(records, figure_path)
+    except ImportError as error:
+        print(f"figure skipped: {error}. Install matplotlib and rerun; the table is written.")
+    else:
+        print(f"figure -> {figure_path}")
     assert usable  # every scene contributed something
 
 

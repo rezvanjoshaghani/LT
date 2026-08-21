@@ -82,8 +82,8 @@ PY
 # --- 3. Replica dataset ----------------------------------------------------
 step "Replica dataset -> $REPLICA_ROOT"
 find_scene_root() {
-    # The official downloader may extract scenes at the root or one level
-    # down. Return the directory that contains apartment_0.
+    # The archive may place scenes at the root or one level down. Return
+    # the directory that contains apartment_0.
     if [ -f "$1/apartment_0/mesh.ply" ]; then
         echo "$1"
     else
@@ -92,20 +92,36 @@ find_scene_root() {
     fi
 }
 
+# Same release assets as the official Replica-Dataset download.sh: v1.0,
+# 17 split parts of one tar.gz, about 34 GB. Fetched here directly so
+# that wget -c can resume interrupted parts, the parts live next to the
+# target instead of /tmp, and extraction does not need pigz, which many
+# clusters lack. Parts are deleted only after the scene check passes.
+DOWNLOAD_BASE="https://github.com/facebookresearch/Replica-Dataset/releases/download/v1.0"
+PARTS_DIR="$REPLICA_ROOT/.download"
+
 mkdir -p "$REPLICA_ROOT"
 EFFECTIVE_ROOT="$(find_scene_root "$REPLICA_ROOT")"
 if [ -n "$EFFECTIVE_ROOT" ]; then
     echo "dataset already present at $EFFECTIVE_ROOT, skipping download"
 else
-    echo "downloading Replica via the official download.sh (tens of GB)"
-    TMP="$(mktemp -d)"
-    trap 'rm -rf "$TMP"' EXIT
-    git clone --depth 1 https://github.com/facebookresearch/Replica-Dataset.git \
-        "$TMP/Replica-Dataset"
-    ( cd "$TMP" && bash "$TMP/Replica-Dataset/download.sh" "$REPLICA_ROOT" )
+    echo "downloading Replica v1.0 (17 parts, ~34 GB, resumable)"
+    mkdir -p "$PARTS_DIR"
+    for sfx in a{a..q}; do
+        wget -c -nv -P "$PARTS_DIR" \
+            "$DOWNLOAD_BASE/replica_v1_0.tar.gz.part$sfx"
+    done
+    if command -v unpigz >/dev/null 2>&1; then
+        DECOMPRESS="unpigz"
+    else
+        DECOMPRESS="gzip -dc"
+    fi
+    echo "extracting with $DECOMPRESS"
+    cat "$PARTS_DIR"/replica_v1_0.tar.gz.part?? | $DECOMPRESS \
+        | tar -x -C "$REPLICA_ROOT"
     EFFECTIVE_ROOT="$(find_scene_root "$REPLICA_ROOT")"
     if [ -z "$EFFECTIVE_ROOT" ]; then
-        echo "ERROR: download finished but apartment_0/mesh.ply not found under $REPLICA_ROOT" >&2
+        echo "ERROR: extraction finished but apartment_0/mesh.ply not found under $REPLICA_ROOT" >&2
         exit 1
     fi
 fi
@@ -128,6 +144,10 @@ echo "all 18 scene meshes present; $navmesh/18 ship a navmesh"
 if [ "$navmesh" -lt 18 ]; then
     echo "(scenes without one get a navmesh recomputed at render time; the"
     echo " manifest metadata records which happened)"
+fi
+if [ -d "$PARTS_DIR" ]; then
+    rm -rf "$PARTS_DIR"
+    echo "removed download parts from $PARTS_DIR"
 fi
 
 # Configs address the dataset as data/replica inside the repo. Link it

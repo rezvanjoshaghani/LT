@@ -22,7 +22,9 @@ The dataset is tens of GB, so point `REPLICA_ROOT` at scratch; the script
 symlinks it to `data/replica` where the configs expect it. It installs
 micromamba to `~/.local/bin` if missing, creates the `lot-render` env
 (habitat-sim 0.3.1 headless + withbullet, CPU torch, numpy < 2), downloads
-Replica with the official `download.sh`, and verifies all 18 scene meshes.
+the official Replica v1.0 release parts with `wget -c` (resumable, kept
+next to the target until the scene check passes, no pigz needed), and
+verifies all 18 scene meshes.
 
 Python note: habitat-sim conda builds pin Python 3.9 while this package
 targets 3.10+, so the render env never pip-installs the package. The run

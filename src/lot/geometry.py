@@ -13,6 +13,8 @@ Conventions, used everywhere in this repository:
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -166,19 +168,49 @@ def apply_homography(H: Tensor, uv: Tensor) -> Tensor:
     return p[..., :2] / p[..., 2:3]
 
 
-def parallax(T_tgt_from_ctx: Tensor, depth: Tensor) -> Tensor:
-    """Parallax magnitude: camera baseline over median valid scene depth.
+def baseline_m(T_tgt_from_ctx: Tensor) -> Tensor:
+    """Distance between the two camera centers, in meters.
 
-    T_tgt_from_ctx: the relative transform from relative_pose. Its translation norm
-    equals the distance between the two camera centers.
+    T_tgt_from_ctx: the relative transform from relative_pose. Its translation
+    norm is the baseline.
+    """
+    check_se3(T_tgt_from_ctx)
+    return torch.linalg.vector_norm(T_tgt_from_ctx[:3, 3])
+
+
+def parallax_from_median_depth(T_tgt_from_ctx: Tensor, median_depth_m: float) -> Tensor:
+    """Parallax magnitude: camera baseline over median scene depth.
+
+    This is the definition the whole project uses. It is written once here, and
+    parallax below is the convenience form that takes a depth map instead of a
+    number already reduced.
+    """
+    if not (median_depth_m > 0):
+        raise ValueError(f"median depth must be positive, got {median_depth_m}")
+    return baseline_m(T_tgt_from_ctx) / median_depth_m
+
+
+def parallax(T_tgt_from_ctx: Tensor, depth: Tensor) -> Tensor:
+    """Parallax magnitude for a depth map: baseline over its median valid depth.
+
     depth: any tensor of planar z-depths from the scene, in meters. Entries that are
     not finite and positive are ignored.
     Returns a scalar tensor.
     """
-    check_se3(T_tgt_from_ctx)
-    t = T_tgt_from_ctx[:3, 3]
-    baseline = torch.linalg.vector_norm(t)
     valid = depth[(depth > 0) & torch.isfinite(depth)]
     if valid.numel() == 0:
         raise ValueError("no valid depths for parallax")
-    return baseline / valid.median()
+    return parallax_from_median_depth(T_tgt_from_ctx, float(valid.median()))
+
+
+def rotation_angle_deg(R: Tensor) -> float:
+    """Angle of a 3x3 rotation matrix in degrees, in [0, 180].
+
+    Convention free: this is the magnitude of the rotation, whatever axis it is
+    about. Used to stratify the in-place rotation regime, where every pair has
+    zero baseline and the viewpoint change is entirely angular.
+    """
+    if R.shape != (3, 3):
+        raise ValueError(f"R must be 3x3, got {tuple(R.shape)}")
+    cosine = (float(torch.diagonal(R.to(torch.float64)).sum()) - 1.0) / 2.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))

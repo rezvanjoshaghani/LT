@@ -285,9 +285,11 @@ class FakeAggregator(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
+        self.last_shape = None
 
     def forward(self, views):
         self.calls += 1
+        self.last_shape = tuple(views.shape)
         count, seq, _, height, width = views.shape
         patches_h, patches_w = patch_grid_shape((height, width))
         total = VGGT_PREFIX + patches_h * patches_w
@@ -433,3 +435,37 @@ def test_feature_statistics_detects_a_dominant_shared_direction(tmp_path):
     assert narrow["centered"]["cosine_across_frames"] == pytest.approx(
         wide["centered"]["cosine_across_frames"], abs=0.05
     )
+
+
+def test_vggt_sees_one_frame_at_a_time():
+    """Scopes the Phase 3 finding: no frame can leak into another's tokens.
+
+    VGGT's aggregator alternates attention within a frame and across the frames
+    of a sequence. If a context and its target were ever handed over as one
+    sequence, the global attention would mix them and the transportability
+    measurement would be reading a representation that had already seen the
+    answer. The wrapper passes a sequence of length one, always.
+    """
+    encoder = fake_vggt_encoder()
+    encoder.encode(np.zeros((3, 28, 28, 3), dtype=np.uint8))
+    count, sequence = encoder.model.aggregator.last_shape[:2]
+    assert count == 3 and sequence == 1
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LOT_ENCODER_SMOKE"),
+    reason="set LOT_ENCODER_SMOKE=1 to download weights and run the encoder",
+)
+def test_vggt_batching_does_not_mix_frames():
+    """The same claim against the real model: batching must not couple images.
+
+    A sequence of length one rules out the aggregator's cross-frame attention,
+    but only measurement rules out the batch axis coupling images some other
+    way. Encoding two frames together must equal encoding each alone.
+    """
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 255, (2, 518, 518, 3), dtype=np.uint8)
+    encoder = load_encoder("vggt_1b", "cuda" if torch.cuda.is_available() else "cpu")
+    together = encoder.encode(frames).features
+    apart = torch.cat([encoder.encode(frames[i : i + 1]).features for i in (0, 1)])
+    assert torch.allclose(together, apart, atol=1e-3)

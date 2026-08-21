@@ -178,10 +178,66 @@ and the largest parallax bin at -0.013, because moving a position-indexed
 quantity to a geometrically correct location destroys the positional agreement
 that made the unwarped copy match.
 
+Why the inversion happens, and why it is the useful result. The August 18
+hypothesis was that VGGT should transport best, having been trained to match
+content across views. The opposite followed from what its final tokens are for.
+They exist to predict pointmaps, which are 3D coordinates in a reference frame,
+and a coordinate is a function of the camera. Training pressure toward
+coordinates produces view-covariant values. Surface identity is precisely the
+view-invariant part. So the strongest correspondence machine available produces
+final-layer values that barely transport, which makes VGGT an existence proof
+that correspondence rank and transportable metric are different properties of a
+representation.
+
+The raw-versus-centered contrast is the vindication of the floors. Raw cosine
+reads VGGT's Oracle-Transport at 0.967. Reported without the No-Warp-Copy floor
+beside it, that is a number anyone would publish as excellent transportability.
+The floor is what turns it into a margin of 0.003, and the diagnostic is what
+turns that into a saturated scale. A metric without its floor would have
+inverted the paper's conclusion.
+
+Scope of the claim, both confirmed against the harness rather than assumed:
+
+- VGGT features come from single-frame forward passes. The wrapper builds a
+  sequence of length one, so the aggregator's cross-frame global attention has
+  nothing to mix. Had a context and its target ever been handed over as one
+  sequence, the context tokens would have already seen the target and the
+  measurement would be contaminated. Pinned by
+  test_vggt_sees_one_frame_at_a_time, with a cluster-gated companion that
+  checks the real model's batch axis does not couple images either.
+- Random-Patch is drawn inside the context image, not across the dataset, and
+  is read from the same context feature map as No-Warp-Copy and Neighbor-Patch.
+  All three predictions differ only in where they read: same image, same
+  encoder, same scene. That is what makes "a random place in the other view of
+  this room" at 0.176 the right comparison against "the same place" at 0.787
+  and "one patch off" at 0.778, and what supports reading VGGT's tokens as
+  slowly varying across the image and stable across views at fixed position.
+  Pinned by test_every_null_reads_the_context_map_and_differs_only_in_where.
+
 This is a statement about the last aggregator layer, which PLAN's Phase 2 chose
 because it is what VGGT's own heads consume. Earlier layers and the depth head
-were not tested and could behave differently. That is a limitation of the
-verdict, not a hidden result.
+were not tested and could behave differently. In particular VGGT contains a
+DINO encoder, which would presumably transport like DINO, so all paper text
+must keep the claim scoped to the last aggregator layer. The stronger version
+is available cheaply: cache a mid-aggregator layer for the same frames and add
+a row. If transportability decays monotonically with aggregator depth, the
+finding becomes that geometry supervision progressively converts
+surface-attached values into position-indexed ones. Optional, not blocking.
+
+Consequences for the rest of the ladder, recorded here so later phases are read
+correctly:
+
+- The Oracle-Transport numbers are the reference ceiling every later figure
+  plots against, and the ceiling itself decays with parallax, from 0.80 to 0.54
+  centered. Representation non-equivariance is real and grows with viewpoint
+  change. That is rung 0's own finding, and Phase 5's expectations must be read
+  against the decaying ceiling within each bin, never against 1.0.
+- VGGT stays in the pipeline untouched as the Phase 4 depth estimator. This
+  finding concerns its tokens and says nothing about its depth. Nothing here
+  should be read as a reason to remove VGGT.
+- The splat-and-pool path matches the per-point path to within 0.003
+  everywhere, so the operational ceiling equals the representational one and
+  the pipeline costs essentially nothing. One sentence in the paper, no more.
 
 Centering did not change what DINOv2 says, which is the reason to trust it. The
 margin moves from 0.123 to 0.140, the growth with parallax from 0.065-to-0.134

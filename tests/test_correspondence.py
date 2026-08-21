@@ -5,7 +5,7 @@ import torch
 from lot.correspondence import gather_value_pairs, sample_correspondences
 from lot.encoders import pixel_to_patch_coords
 from lot.visibility import visibility_masks
-from scenes import IMAGE_SIZE, PATCH, build_two_plane_scene
+from scenes import GRID, IMAGE_SIZE, PATCH, build_two_plane_scene
 
 CTX_HW = (IMAGE_SIZE, IMAGE_SIZE)
 BOX_LO = 0.5 * PATCH - 0.5
@@ -178,3 +178,28 @@ def test_value_pairs_on_the_analytic_scene():
 
     shapes = {v.shape for v in pairs.values()}
     assert shapes == {(192, 3)}
+
+
+def test_every_null_reads_the_context_map_and_differs_only_in_where():
+    """Scopes the Phase 3 reading of VGGT as position indexed.
+
+    no_warp, neighbor, and random are all reads of the same context feature
+    map, so the contrast between them isolates location and nothing else: not
+    the image, not the encoder, not the scene. random in particular is drawn
+    inside the context image rather than from elsewhere in the dataset, which
+    is what makes "a random place in the other view of this room" the right
+    comparison for "the same place" and "one patch off".
+    """
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 200, "pixel")
+    context = torch.full((4, GRID, GRID), 1.0)
+    target = torch.full((4, GRID, GRID), 2.0)
+    pairs = gather_value_pairs(context, target, samples)
+    # Bilinear weights do not sum to exactly one in floating point, and the
+    # point here is which map was read, not the last bit of the read.
+    assert torch.allclose(pairs["target"], torch.full_like(pairs["target"], 2.0))
+    for null in ("warp", "no_warp", "neighbor", "random"):
+        assert torch.allclose(pairs[null], torch.full_like(pairs[null], 1.0)), null
+    # And the random location really is inside the context image.
+    assert (samples.uv_context_random >= 0).all()
+    assert (samples.uv_context_random <= IMAGE_SIZE - 1).all()

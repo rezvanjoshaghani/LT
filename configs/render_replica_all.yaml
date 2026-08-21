@@ -34,6 +34,9 @@ image_width: 518
 hfov_deg: 90.0
 eye_height_m: 1.5
 viewpoints_per_scene: 6
+# Matches the pilot: reject base viewpoints with median depth under 1.5 m
+# (wall-stare views found in pilot QC).
+min_median_depth_m: 1.5
 yaw_offsets_deg: [-30.0, -22.5, -15.0, -7.5, 0.0, 7.5, 15.0, 22.5, 30.0]
 pitch_offsets_deg: [-15.0, -7.5, 7.5, 15.0]
 parallax_values: [0.05, 0.1, 0.2, 0.4]

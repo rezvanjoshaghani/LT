@@ -12,6 +12,10 @@ image_width: 518
 hfov_deg: 90.0
 eye_height_m: 1.5
 viewpoints_per_scene: 6
+# Pilot QC 2026-08-20: a viewpoint with median depth just above 1 m stared
+# at a wall from arm's length; raise the floor so base views keep real
+# scene structure. Small rooms still clear 1.5 m comfortably.
+min_median_depth_m: 1.5
 # In-place rotation: fixed position, fixed angular steps.
 yaw_offsets_deg: [-30.0, -22.5, -15.0, -7.5, 0.0, 7.5, 15.0, 22.5, 30.0]
 pitch_offsets_deg: [-15.0, -7.5, 7.5, 15.0]

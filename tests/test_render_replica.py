@@ -435,6 +435,29 @@ def test_write_scene_qc_from_manifest(tmp_path):
     assert out.is_file() and out.stat().st_size > 1000
 
 
+def test_validate_only_cli_reports_per_scene(tmp_path, capsys):
+    from lot.render_replica import main
+
+    root, manifest = fake_scene_dir(tmp_path)  # creates tmp_path/room_0
+    write_manifest(root / "manifest.json", manifest)
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "replica_root: /r\n"
+        f"output_root: {tmp_path.as_posix()}\n"
+        "scenes: [room_0, room_1]\n"
+    )
+    # One valid scene, one never rendered: every scene gets a status line
+    # and the exit names the failures instead of dying on the first one.
+    with pytest.raises(SystemExit, match="room_1"):
+        main(["--config", str(cfg), "--validate-only"])
+    out = capsys.readouterr().out
+    assert "[room_0] manifest valid" in out
+    assert "[room_1] MISSING" in out
+    # Restricted to the valid scene, validation passes cleanly.
+    main(["--config", str(cfg), "--scene", "room_0", "--validate-only"])
+    assert "all 1 scenes valid" in capsys.readouterr().out
+
+
 def test_scene_split_is_canonical():
     assert len(REPLICA_SCENES) == 18
     assert len(REPLICA_SCENES_TRAIN) == 13

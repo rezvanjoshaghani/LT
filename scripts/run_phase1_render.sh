@@ -102,9 +102,23 @@ all)
         echo "run './scripts/run_phase1_render.sh pilot' first." >&2
         exit 1
     fi
-    submit --array 0-17 scripts/render_replica.sbatch "$ALL_CONFIG"
+    # Submit only scenes without a manifest, so a partially finished batch
+    # resumes instead of tripping the never-overwrite rule.
+    missing=$(PYTHONPATH="$REPO_ROOT/src" "$MM" run -n "$LOT_ENV" \
+        python -m lot.render_replica --config "$ALL_CONFIG" --list-scenes \
+        | while read -r i s; do
+            [ -f "$REPO_ROOT/data/replica_renders/$s/manifest.json" ] || printf '%s,' "$i"
+        done)
+    missing="${missing%,}"
+    if [ -z "$missing" ]; then
+        echo "all scenes already have manifests; nothing to submit."
+        echo "run './scripts/run_phase1_render.sh validate' to check them."
+        exit 0
+    fi
+    submit --array "$missing" scripts/render_replica.sbatch "$ALL_CONFIG"
     cat <<EOF
-Batch submitted (18 array tasks, one scene each). Afterwards:
+Batch submitted for scene indices: $missing
+Afterwards:
   ./scripts/run_phase1_render.sh validate
 QC sheets land in data/replica_renders/<scene>/qc/.
 EOF

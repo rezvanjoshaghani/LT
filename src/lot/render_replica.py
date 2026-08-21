@@ -1156,14 +1156,31 @@ def main(argv: list[str] | None = None) -> None:
         scenes = [cfg.scenes[args.scene_index]]
     else:
         scenes = list(cfg.scenes)
-    for scene in scenes:
-        if args.validate_only:
+    if args.validate_only:
+        failures = []
+        for scene in scenes:
             out_dir = cfg.output_root / scene
-            validate_manifest(
-                load_manifest(out_dir / MANIFEST_NAME), out_dir, check_files=True
+            try:
+                validate_manifest(
+                    load_manifest(out_dir / MANIFEST_NAME), out_dir, check_files=True
+                )
+            except FileNotFoundError:
+                print(f"[{scene}] MISSING: no manifest at {out_dir / MANIFEST_NAME}")
+                failures.append(scene)
+            except ValueError as e:
+                print(f"[{scene}] INVALID: {e}")
+                failures.append(scene)
+            else:
+                print(f"[{scene}] manifest valid")
+        if failures:
+            raise SystemExit(
+                f"{len(failures)} of {len(scenes)} scenes failed validation: "
+                + ", ".join(failures)
             )
-            print(f"[{scene}] manifest valid")
-        elif args.qc_only:
+        print(f"all {len(scenes)} scenes valid")
+        return
+    for scene in scenes:
+        if args.qc_only:
             out_dir = cfg.output_root / scene
             manifest = load_manifest(out_dir / MANIFEST_NAME)
             validate_manifest(manifest, out_dir, check_files=True)

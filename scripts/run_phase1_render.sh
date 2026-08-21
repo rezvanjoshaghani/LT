@@ -7,6 +7,7 @@
 #   ./scripts/run_phase1_render.sh smoke              # tiny habitat pytest render
 #   ./scripts/run_phase1_render.sh all                # 18-scene batch (array job)
 #   ./scripts/run_phase1_render.sh validate [config]  # validate manifests, no GPU
+#   ./scripts/run_phase1_render.sh qc [config]        # regenerate QC sheets, no GPU
 #
 # Required for pilot, smoke, and all (never hard-coded, per CLAUDE.md):
 #   SLURM_ACCOUNT     SLURM account to charge
@@ -113,8 +114,13 @@ validate)
     PYTHONPATH="$REPO_ROOT/src" "$MM" run -n "$LOT_ENV" \
         python -m lot.render_replica --config "$CONFIG" --validate-only
     ;;
+qc)
+    CONFIG="${2:-$ALL_CONFIG}"
+    PYTHONPATH="$REPO_ROOT/src" "$MM" run -n "$LOT_ENV" \
+        python -m lot.render_replica --config "$CONFIG" --qc-only
+    ;;
 *)
-    echo "unknown mode '$MODE'; use pilot, smoke, all, or validate" >&2
+    echo "unknown mode '$MODE'; use pilot, smoke, all, validate, or qc" >&2
     exit 1
     ;;
 esac

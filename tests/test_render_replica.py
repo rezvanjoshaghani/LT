@@ -411,11 +411,28 @@ def test_contact_sheet_smoke(tmp_path):
         depth = rng.uniform(0.5, 5.0, size=(32, 32)).astype(np.float32)
         depth[0, 0] = 0.0  # invalid pixel must not break rendering
         entries.append((f"frame_{i}", rgb, depth))
+    # A frame with no valid depth at all must render (black tile), not crash.
+    entries.append(
+        (
+            "all_invalid",
+            rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8),
+            np.zeros((32, 32), dtype=np.float32),
+        )
+    )
     out = tmp_path / "qc" / "qc_rotation.png"
     write_contact_sheet(out, entries, ncols=3)
     assert out.is_file() and out.stat().st_size > 1000
     with pytest.raises(ValueError):
         write_contact_sheet(tmp_path / "empty.png", [])
+
+
+def test_write_scene_qc_from_manifest(tmp_path):
+    from lot.render_replica import write_scene_qc
+
+    root, manifest = fake_scene_dir(tmp_path)
+    write_scene_qc(root, manifest, frames_per_regime=2)
+    out = root / "qc" / "qc_rotation.png"
+    assert out.is_file() and out.stat().st_size > 1000
 
 
 def test_scene_split_is_canonical():

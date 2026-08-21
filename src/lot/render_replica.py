@@ -631,8 +631,11 @@ def write_contact_sheet(
     for ax_row in axes:
         for ax in ax_row:
             ax.set_axis_off()
-    cmap = plt.get_cmap("viridis").copy()
-    cmap.set_bad("black")
+    # Depth tiles are colormapped by hand into RGBA so the result does not
+    # depend on the matplotlib version. Colormap.copy and set_bad only
+    # exist from matplotlib 3.4 on, and cluster environments resolve older
+    # builds.
+    cmap = plt.get_cmap("viridis")
     for i, (title, rgb, depth) in enumerate(entries):
         r, c = divmod(i, ncols)
         ax_rgb = axes[2 * r][c]
@@ -640,12 +643,18 @@ def write_contact_sheet(
         ax_rgb.imshow(rgb)
         ax_rgb.set_title(title, fontsize=6)
         d = np.asarray(depth, dtype=np.float64)
-        d = np.where(np.isfinite(d) & (d > 0), d, np.nan)
-        ax_depth.imshow(d, cmap=cmap)
-        if np.isfinite(d).any():
-            ax_depth.set_title(
-                f"depth {np.nanmin(d):.2f}..{np.nanmax(d):.2f} m", fontsize=6
-            )
+        valid = np.isfinite(d) & (d > 0)
+        rgba = np.zeros(d.shape + (4,))
+        rgba[..., 3] = 1.0  # invalid pixels render black
+        if valid.any():
+            vmin = float(d[valid].min())
+            vmax = float(d[valid].max())
+            span = vmax - vmin if vmax > vmin else 1.0
+            norm = np.clip((np.where(valid, d, vmin) - vmin) / span, 0.0, 1.0)
+            rgba = np.asarray(cmap(norm))
+            rgba[~valid] = (0.0, 0.0, 0.0, 1.0)
+            ax_depth.set_title(f"depth {vmin:.2f}..{vmax:.2f} m", fontsize=6)
+        ax_depth.imshow(rgba)
     fig.tight_layout()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1122,10 +1131,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--list-scenes", action="store_true", help="print the scene list and exit"
     )
-    parser.add_argument(
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
         "--validate-only",
         action="store_true",
         help="validate existing manifests instead of rendering",
+    )
+    action_group.add_argument(
+        "--qc-only",
+        action="store_true",
+        help="regenerate QC contact sheets from existing manifests",
     )
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
@@ -1148,6 +1163,12 @@ def main(argv: list[str] | None = None) -> None:
                 load_manifest(out_dir / MANIFEST_NAME), out_dir, check_files=True
             )
             print(f"[{scene}] manifest valid")
+        elif args.qc_only:
+            out_dir = cfg.output_root / scene
+            manifest = load_manifest(out_dir / MANIFEST_NAME)
+            validate_manifest(manifest, out_dir, check_files=True)
+            write_scene_qc(out_dir, manifest, cfg.qc_frames_per_regime)
+            print(f"[{scene}] QC sheets written under {out_dir / 'qc'}")
         else:
             render_scene(cfg, scene)
 

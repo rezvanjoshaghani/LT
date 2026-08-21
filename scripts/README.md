@@ -168,12 +168,28 @@ The transportability test. No training, no new environment: it runs in
 `lot-encode` and needs only `pyarrow` on top of what Phase 2 installed.
 
 ```bash
-micromamba run -n lot-encode pip install pyarrow
+micromamba run -n lot-encode pip install --only-binary=:all: "pyarrow<17"
 ```
 
-pandas is deliberately not required. Its wheels do not resolve on this
-cluster's toolchain, and pip falls back to building numpy from source against
-GCC 4.8.5, which fails. pyarrow writes the parquet directly.
+The pin matters. Borah is CentOS 7 with glibc 2.17, and pyarrow 17 and later
+publish only manylinux_2_28 wheels, which need glibc 2.28. pip then falls back
+to a source build, which pulls numpy 2.4.6 and tries to compile it against the
+system GCC 4.8.5, and numpy requires GCC 9.3 or newer. pyarrow 16 still ships
+manylinux2014 wheels and installs without touching numpy. `--only-binary`
+makes a wheel-less resolution fail immediately instead of starting that build.
+
+pandas is deliberately not a dependency, for the same reason and because
+nothing here needs it: pyarrow writes the parquet directly, and the
+aggregation figures.py does is a few group-bys over a table this size.
+
+If a future cluster image makes even the pin unworkable, conda-forge builds
+against its own toolchain and does not care about the system glibc:
+
+```bash
+micromamba install -y -n lot-encode -c conda-forge pyarrow "numpy=1.26"
+```
+
+Pin numpy there as well, since VGGT needs numpy below 2.
 
 All 18 scenes run in one process, or as an array if you prefer:
 

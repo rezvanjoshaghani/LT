@@ -13,7 +13,9 @@ dependencies = [
     "pyyaml",
     "pillow",
     "matplotlib",
-    "pyarrow",
+    # Pinned below 17: later releases ship only manylinux_2_28 wheels, and the
+    # cluster is CentOS 7 with glibc 2.17.
+    "pyarrow<17",
 ]
 
 [project.optional-dependencies]

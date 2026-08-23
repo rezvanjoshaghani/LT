@@ -152,20 +152,28 @@ at the top of the parallax range will be genuinely hard.
 
 DINOv2 ViT-B/14 is the encoder for all later phases. Its patch features behave
 like properties of the surface they sit on: transporting them with ground-truth
-geometry beats copying them unwarped by 0.140 cosine on centered features, the
-advantage grows with parallax from 0.075 to 0.147, and landing one patch off
-the correct location costs 0.088, so the agreement is sharply localized rather
-than a general similarity between any two features of the same room. VGGT's
-last-layer aggregator tokens do not behave that way: their margin is 0.013, a
-tenth of DINOv2's, and landing one patch off costs nothing measurable at
--0.009, which says those tokens vary too slowly across the image to carry the
-surface identity transport exists to move.
+geometry beats copying them unwarped by 0.152 cosine on centered features, and
+landing one patch off the correct location costs 0.072, so the agreement is
+sharply localized rather than a general similarity between any two features of
+the same room. VGGT's last-layer aggregator tokens do the opposite: their
+overall margin is -0.0001, and resolved by rotation angle it falls from +0.055
+between 5 and 10 degrees to -0.279 beyond 40, where copying a feature from the
+same image position beats moving it to the same surface by a wide margin, which
+is what a position-indexed quantity looks like and not what a surface property
+looks like.
 
 The full numbers, pooled over everything, centered, per-point path:
 
     encoder        Random  Mean-Feature  No-Warp  Neighbor  Oracle  margin
-    dinov2_vitb14  0.0879        0.2465   0.5247    0.5765  0.6642  +0.1395
-    vggt_1b        0.1761        0.3433   0.7873    0.7783  0.8002  +0.0129
+    dinov2_vitb14  0.0852        0.2368   0.4769    0.5486  0.6285  +0.1516
+    vggt_1b        0.1646        0.3193   0.7516    0.7316  0.7514  -0.0001
+
+These are from the run stratified on both axes of viewpoint change. The earlier
+parallax-only run gave +0.1395 and +0.0129 on a sample half the size weighted
+differently; per parallax bin the two runs agree to better than 0.015
+everywhere, so the estimates are not sampling artifacts. The pooled figures
+moved because the two-axis strata draw far more large-viewpoint-change pairs,
+which is also why VGGT's pooled margin fell to exactly zero.
 
 Reading VGGT's row across is the whole story. Its floor sits at 0.787 while its
 correct answer sits at 0.800, and its one-patch-off null sits between them at
@@ -177,6 +185,37 @@ in the two regimes with the largest image displacement, pure rotation at -0.046
 and the largest parallax bin at -0.013, because moving a position-indexed
 quantity to a geometrically correct location destroys the positional agreement
 that made the unwarped copy match.
+
+Geometry's value is a hump, not a slope, and an earlier reading here was wrong.
+Resolved by rotation angle, DINOv2 centered on the per-point path:
+
+    angle    ceiling  floor   margin      VGGT ceiling  floor   margin
+    5-10      0.7711  0.4893  +0.2818           0.8804  0.8252  +0.0553
+    10-20     0.7025  0.3705  +0.3319           0.7570  0.7386  +0.0184
+    20-40     0.5594  0.2798  +0.2796           0.5453  0.6373  -0.0920
+    40+       0.4124  0.2228  +0.1896           0.2595  0.5384  -0.2788
+
+The mechanism is in the two columns beside the margin. From 5-10 to 10-20 the
+floor falls faster than the ceiling, 0.119 against 0.068, so the margin grows.
+Past 20 degrees the ceiling falls faster, so it shrinks. Transport is worth most
+where the unwarped copy has already collapsed and correct transport has not yet.
+
+This corrects what was recorded after the first run, that transport's advantage
+grows with viewpoint change and contradicts PLAN's expectation that it shrinks.
+The parallax axis alone showed only the rising side of the hump and the first
+hint of the turn, +0.1476 at 0.2-0.4 falling to +0.1428 at 0.4+. PLAN's
+expectation is right beyond the peak and wrong before it. Only the finer
+stratification made the shape visible, which is the argument for having done it
+before Phase 4 rather than after.
+
+The same table makes VGGT's mechanism unmistakable. Beyond 40 degrees, copying
+a feature from the same image position scores 0.538 while moving it to the same
+surface scores 0.260. Transport is 0.279 worse than doing nothing. That is not
+a small negative to be explained away; it is a large monotonic effect, and the
+pooled -0.0001 was the average of a strong trend through zero. A representation
+whose values are better predicted by where they sit in the frame than by what
+surface they are on is position indexed, and this is the measurement that says
+so directly.
 
 Why the inversion happens, and why it is the useful result. The August 18
 hypothesis was that VGGT should transport best, having been trained to match

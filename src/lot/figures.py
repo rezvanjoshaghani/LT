@@ -175,23 +175,34 @@ def write_table(path: Path, table: Sequence[dict[str, Any]]) -> None:
     pq.write_table(pa.Table.from_pylist(list(table)), path)
 
 
-def format_console_summary(records: Sequence[dict[str, Any]]) -> str:
-    """A compact reading of the result, for the run log and for the writeup."""
-    lines: list[str] = []
-    order = [b for b in parallax_bin_order()]
-    encoders = sorted({r["encoder"] for r in records})
-
-    oracle = [r for r in records if r["variant"] == ORACLE_TRANSPORT]
-    lines.append("Oracle-Transport, mean cosine and margin over No-Warp-Copy")
-    lines.append(f"{'encoder':18s} {'path':11s} {'bin':>10s} {'pairs':>6s} "
-                 f"{'cosine':>7s} {'floor':>7s} {'margin':>7s}")
+def _axis_table(
+    records: Sequence[dict[str, Any]],
+    axis: str,
+    order: Sequence[str],
+    title: str,
+    regimes: Sequence[str] | None = None,
+) -> list[str]:
+    """Oracle-Transport against one axis of viewpoint change, beside its floor."""
+    if regimes is not None:
+        records = [r for r in records if r["regime"] in regimes]
+    lines = [title]
+    if not records:
+        return lines + ["  (no pairs)"]
+    lines.append(
+        f"{'encoder':18s} {'path':11s} {'bin':>10s} {'pairs':>6s} "
+        f"{'cosine':>7s} {'floor':>7s} {'margin':>7s}"
+    )
     floors = aggregate(
         [r for r in records if r["variant"] == NO_WARP_COPY],
-        ("encoder", "path", "parallax_bin"),
+        ("encoder", "path", axis),
         ("value",),
     )
-    stats = aggregate(oracle, ("encoder", "path", "parallax_bin"), ("value", "margin"))
-    for encoder in encoders:
+    stats = aggregate(
+        [r for r in records if r["variant"] == ORACLE_TRANSPORT],
+        ("encoder", "path", axis),
+        ("value", "margin"),
+    )
+    for encoder in sorted({r["encoder"] for r in records}):
         for path in PATH_ORDER:
             for bin_label in order:
                 key = (encoder, path, bin_label)
@@ -203,6 +214,30 @@ def format_console_summary(records: Sequence[dict[str, Any]]) -> str:
                     f"{entry['value']:7.4f} {floors[key]['value']:7.4f} "
                     f"{entry['margin']:+7.4f}"
                 )
+    return lines
+
+
+def format_console_summary(records: Sequence[dict[str, Any]]) -> str:
+    """A compact reading of the result, for the run log and for the writeup."""
+    encoders = sorted({r["encoder"] for r in records})
+    oracle = [r for r in records if r["variant"] == ORACLE_TRANSPORT]
+
+    lines = _axis_table(
+        records,
+        "parallax_bin",
+        parallax_bin_order(),
+        "Oracle-Transport by parallax, with its No-Warp-Copy floor",
+    )
+    lines.append("")
+    # In-place rotation has no baseline, so the table above holds all of it in
+    # one cell. The angle is the axis it actually varies on.
+    lines += _axis_table(
+        records,
+        "rotation_bin",
+        rotation_bin_order(),
+        "Oracle-Transport by rotation angle, in-place rotation only",
+        regimes=("rotation",),
+    )
     lines.append("")
     lines.append("By regime, pooled over parallax")
     lines.append(f"{'encoder':18s} {'path':11s} {'regime':12s} {'pairs':>6s} "

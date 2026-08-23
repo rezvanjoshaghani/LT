@@ -196,3 +196,30 @@ def test_a_figure_with_no_matching_regime_says_so(tmp_path):
     records = paired_records(one_comparison({ORACLE_TRANSPORT: 0.9, NO_WARP_COPY: 0.5}))
     with pytest.raises(ValueError, match="no records"):
         margin_versus_axis_figure(records, tmp_path / "x.png", regimes=("rotation",))
+
+
+def test_console_summary_breaks_rotation_out_by_angle():
+    """The parallax table holds every in-place rotation pair in one cell.
+
+    Rotation has no baseline, so parallax cannot separate 7.5 degrees from 60.
+    The summary has to show the axis that regime actually varies on, or the
+    reader cannot tell an average from a trend.
+    """
+    rows = []
+    for index, (angle_bin, cosine) in enumerate((("5-10", 0.9), ("20-40", 0.6))):
+        rows += one_comparison(
+            {ORACLE_TRANSPORT: cosine, NO_WARP_COPY: 0.5},
+            regime="rotation",
+            parallax_bin="zero",
+            rotation_bin=angle_bin,
+            context_frame_id=f"c{index}",
+        )
+    text = format_console_summary(paired_records(rows))
+    assert "by rotation angle" in text
+    assert "5-10" in text and "20-40" in text
+
+
+def test_rotation_table_says_so_when_there_is_nothing_to_show():
+    rows = one_comparison({ORACLE_TRANSPORT: 0.9, NO_WARP_COPY: 0.5}, regime="translation")
+    text = format_console_summary(paired_records(rows))
+    assert "(no pairs)" in text

@@ -229,6 +229,32 @@ def mean_margin(records: Sequence[dict[str, Any]]) -> float:
     return float(np.mean(values)) if values else float("nan")
 
 
+def comparison_weighted(records: Sequence[dict[str, Any]], field: str) -> float:
+    """The same cell estimate with each record weighted by its comparison count.
+
+    Reported as a diagnostic column, never as a headline number. The estimand is
+    the unweighted mean above, where the camera pair is the unit. PROTOCOL 3.4
+    fixes that unit twice over: support "depends primarily on independent camera
+    pairs and scene coverage, not raw comparison counts", and the bootstrap is
+    over scenes and pairs with points and patches excluded by name. Weighting a
+    pair by how many correspondences survived in it would make the point the
+    unit of the point estimate while the interval around it kept the pair, and
+    the two would then describe different quantities.
+
+    It is worth computing because the weighting is not neutral. A pair's
+    comparison count is largely set by how much of the target the context still
+    sees, so within a bin the weight rises with the easier geometry, and the
+    weighted number is expected to sit above the unweighted one. The gap
+    measures how much of any reported margin rides on that.
+    """
+    values = np.array([r[field] for r in records], dtype=np.float64)
+    weights = np.array([r["n"] for r in records], dtype=np.float64)
+    total = weights.sum()
+    if values.size == 0 or total <= 0:
+        return float("nan")
+    return float(np.dot(values, weights) / total)
+
+
 def cell_estimates(
     records: Sequence[dict[str, Any]],
     keys: Sequence[str],
@@ -842,10 +868,12 @@ def summary_table(
         keys = ("encoder", "metric", "path", axis, "variant")
         values = summaries_for(scoped, keys, config, statistic=mean_value)
         margins = summaries_for(scoped, keys, config, statistic=mean_margin)
+        cells = group_by(scoped, keys)
         for key in values:
             encoder, metric, path, label, variant = key
             summary = values[key]
             margin = margins[key]
+            cell = cells[key]
             table.append(
                 {
                     "analysis": regime,
@@ -864,6 +892,9 @@ def summary_table(
                     "margin_ci_high": margin["ci_high"],
                     "margin_pair_ci_low": margin["pair_ci_low"],
                     "margin_pair_ci_high": margin["pair_ci_high"],
+                    # Diagnostics, not headline numbers. See comparison_weighted.
+                    "value_comparison_weighted": comparison_weighted(cell, "value"),
+                    "margin_comparison_weighted": comparison_weighted(cell, "margin"),
                     "n_scenes": summary["n_scenes"],
                     "n_camera_pairs": summary["n_camera_pairs"],
                     "n_feature_comparisons": summary["n_feature_comparisons"],

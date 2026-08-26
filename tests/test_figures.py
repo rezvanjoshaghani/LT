@@ -434,3 +434,36 @@ def test_path_agreement_gates_the_aggregate_and_reports_the_spread():
     # The aggregate difference is small even though one pair is far out.
     assert result["aggregate_abs_difference"] == pytest.approx(0.05, abs=1e-9)
     assert not result["within_tolerance"]
+
+
+def test_the_estimand_is_the_unweighted_pair_mean_with_the_weighted_one_beside_it():
+    """PROTOCOL 3.4 makes the camera pair the unit, so the pair mean is the estimand.
+
+    The weighted number is emitted beside it because the weighting is not
+    neutral: a pair's comparison count rises with the easier geometry, so a
+    weighted mean leans on the pairs that were least difficult to transport.
+    """
+    from lot.figures import comparison_weighted, mean_margin
+
+    cell = [{"margin": 0.10, "n": 1}, {"margin": 0.50, "n": 99}]
+    assert mean_margin(cell) == pytest.approx(0.30)
+    assert comparison_weighted(cell, "margin") == pytest.approx(0.4960)
+    assert math.isnan(comparison_weighted([], "margin"))
+    assert math.isnan(comparison_weighted([{"margin": 0.5, "n": 0}], "margin"))
+
+
+def test_the_summary_table_carries_both_estimands():
+    """Every per-regime row, but not the matched difference.
+
+    orbit_minus_translation is a difference of two arms, so there is no single
+    record set to weight and no weighted counterpart to report.
+    """
+    table = summary_table(full_records(), ANALYSIS)
+    per_regime = [r for r in table if r["analysis"] != "orbit_minus_translation"]
+    matched = [r for r in table if r["analysis"] == "orbit_minus_translation"]
+    assert per_regime and matched
+    for row in per_regime:
+        assert math.isfinite(row["margin_comparison_weighted"])
+        assert math.isfinite(row["value_comparison_weighted"])
+    for row in matched:
+        assert "margin_comparison_weighted" not in row

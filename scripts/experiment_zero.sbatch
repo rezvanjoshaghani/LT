@@ -43,13 +43,18 @@ fi
 
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
-# PROTOCOL 3.1 keeps the single-frame shape test and the batch-equality test in
-# the suite permanently. Setting the variable alone does nothing: it only lifts
-# a pytest skip, and this job runs a module, not pytest. So the job runs them,
-# and refuses to do its own work if they fail. A cluster run is then a run that
-# has checked the encoder contract rather than one that could have.
-export LOT_ENCODER_SMOKE=1
-"$MM" run -n "$LOT_ENV" python -m pytest tests/test_encoder_cache.py     -k "vggt_batching or grid_orientation or sees_one_frame" -q
+# This job reads cached features and never loads an encoder, so it does not
+# request a GPU. An earlier revision ran the real-weight encoder tests here to
+# make PROTOCOL 3.1's permanent tests actually execute on the cluster. That was
+# the wrong place: those tests fall back to CPU when CUDA is absent, so all 18
+# array tasks would have loaded and run VGGT-1B on CPU before doing any
+# evaluation. They belong in the caching job, which holds the GPU and is where
+# the encoder contract is exercised, and they run there.
+#
+# The contract this job depends on is that the caches it reads carry the
+# provenance saying which weights produced them. It needs no step here:
+# evaluation validates each scene cache against its manifest before opening it,
+# on metadata alone, for the one scene this task evaluates.
 
 "$MM" run -n "$LOT_ENV" python -m lot.evaluate \
     --config "$CONFIG" \

@@ -468,7 +468,11 @@ def load_encoder(name: str, device: str = "cpu") -> FrozenEncoder:
 # Feature cache
 # ---------------------------------------------------------------------------
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+# 2: meta records features_digest, a content hash of the stored feature arrays,
+#    and weights_fingerprint is required rather than merely recorded. A cache
+#    written under 1 carries neither, so nothing downstream can tell whether it
+#    came from the weights this run believes it did.
 FEATURES_NAME = "features.npz"
 DEPTH_NAME = "depth.npz"
 CACHE_META_NAME = "meta.json"
@@ -573,6 +577,7 @@ def cache_scene_features(
         "device": str(encoder.device),
         "source": encoder.spec.source,
         "weights_fingerprint": encoder.fingerprint,
+        "features_digest": features_digest(features),
         "encode_seconds": round(encode_seconds, 3),
         "total_seconds": round(total_seconds, 3),
         "frames_per_second": round(len(manifest.frames) / max(total_seconds, 1e-9), 3),
@@ -583,6 +588,25 @@ def cache_scene_features(
         _write_npz(out_dir / DEPTH_NAME, depths)
     meta_path.write_text(json.dumps(meta, indent=1), encoding="utf-8")
     return meta
+
+
+def features_digest(features: dict[str, np.ndarray]) -> str:
+    """Content hash of a scene's feature arrays, over frame ids and bytes.
+
+    Computed once when the cache is written and stored in its metadata, so
+    everything downstream can check what it is reading without re-reading it.
+    The alternative, hashing at every use, would make the mean-vector cache
+    pointless: it exists so an 18-task array does not read the whole feature
+    cache eighteen times.
+
+    Frame ids are hashed alongside the bytes because a cache with the right
+    arrays under the wrong names is not the same cache.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for name in sorted(features):
+        digest.update(name.encode("utf-8"))
+        digest.update(np.ascontiguousarray(features[name]).tobytes())
+    return digest.hexdigest()
 
 
 def _batched(items: list, size: int) -> Iterator[list]:
@@ -623,14 +647,35 @@ def load_cached_depth(cache_root: Path, encoder_name: str, scene: str, frame_id:
         return torch.from_numpy(archive[frame_id])
 
 
-def validate_feature_cache(cache_root: Path, encoder_name: str, manifest: Any) -> dict[str, Any]:
+def validate_feature_cache(
+    cache_root: Path,
+    encoder_name: str,
+    manifest: Any,
+    check_digest: bool = False,
+) -> dict[str, Any]:
     """Check a scene cache against the manifest it was built from.
 
     Raises ValueError with the first problem found. Returns the metadata.
+
+    The provenance fields are required, not merely read when present. Recording
+    a weights fingerprint that nothing compares against documents a cache
+    without validating it, and a cache from a silently updated checkpoint would
+    still be accepted.
+
+    check_digest re-reads every array and recomputes the content hash. It is off
+    by default because it costs a full pass over the cache, and on for the
+    validation entrypoint, whose job is exactly that pass.
     """
     meta = load_cache_meta(cache_root, encoder_name, manifest.scene)
     if meta["encoder"] != encoder_name or meta["scene"] != manifest.scene:
         raise ValueError(f"cache is for {meta['encoder']} / {meta['scene']}")
+    for field in ("weights_fingerprint", "features_digest"):
+        if not meta.get(field):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache metadata carries no "
+                f"{field}. Re-cache this scene; a cache whose provenance is "
+                "unknown cannot be told apart from one built with other weights"
+            )
     manifest_ids = [f.frame_id for f in manifest.frames]
     if meta["frame_ids"] != manifest_ids:
         missing = sorted(set(manifest_ids) - set(meta["frame_ids"]))
@@ -650,6 +695,16 @@ def validate_feature_cache(cache_root: Path, encoder_name: str, manifest: Any) -
                 raise ValueError(f"{frame_id}: features {array.shape}, expected {expected}")
             if array.dtype != np.float16:
                 raise ValueError(f"{frame_id}: features dtype {array.dtype}, expected float16")
+    if check_digest:
+        with np.load(path) as archive:
+            stored_arrays = {name: archive[name] for name in archive.files}
+        found = features_digest(stored_arrays)
+        if found != meta["features_digest"]:
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: features digest {found} does "
+                f"not match the {meta['features_digest']} recorded when the cache "
+                "was written. The archive has been rebuilt or modified in place"
+            )
     if meta["has_depth"]:
         depth_path = cache_dir(cache_root, encoder_name, manifest.scene) / DEPTH_NAME
         image_hw = tuple(int(v) for v in meta["image_hw"])
@@ -870,10 +925,13 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.validate_only:
         failures = []
+        fingerprints: dict[str, list[str]] = {}
         for scene in scenes:
             try:
                 manifest = load_manifest(cfg.renders_root / scene / MANIFEST_NAME)
-                meta = validate_feature_cache(cfg.cache_root, cfg.encoder, manifest)
+                meta = validate_feature_cache(
+                    cfg.cache_root, cfg.encoder, manifest, check_digest=True
+                )
             except (FileNotFoundError, KeyError) as e:
                 print(f"[{scene}] MISSING: {e}")
                 failures.append(scene)
@@ -881,7 +939,22 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[{scene}] INVALID: {e}")
                 failures.append(scene)
             else:
-                print(f"[{scene}] cache valid, {meta['frame_count']} frames")
+                fingerprints.setdefault(meta["weights_fingerprint"], []).append(scene)
+                print(
+                    f"[{scene}] cache valid, {meta['frame_count']} frames, "
+                    f"weights {meta['weights_fingerprint'][:12]}"
+                )
+        if len(fingerprints) > 1:
+            # One encoder, one set of weights. Scenes cached from different
+            # checkpoints are not one frozen representation, and every
+            # cross-scene aggregate over them is a mixture.
+            print("weights differ across scenes:")
+            for fingerprint, scene_list in sorted(fingerprints.items()):
+                print(f"  {fingerprint[:12]}  {len(scene_list)} scenes: {scene_list[:4]}")
+            raise SystemExit(
+                f"{len(fingerprints)} distinct weight fingerprints for {cfg.encoder}; "
+                "re-cache the minority scenes"
+            )
         if failures:
             raise SystemExit(
                 f"{len(failures)} of {len(scenes)} scenes failed validation: "

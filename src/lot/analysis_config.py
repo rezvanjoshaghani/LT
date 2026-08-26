@@ -49,6 +49,7 @@ class AnalysisConfig:
     path_agreement_tolerance: float
 
     rotation_position_bound_m: float
+    translation_rotation_bound_deg: float
 
     epsilon_margin: float
     depth_boundary_dilation_px: int

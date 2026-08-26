@@ -32,6 +32,7 @@ from the persisted masks and refuses to subtract across a mismatch.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -41,6 +42,7 @@ import numpy as np
 from .analysis_config import DEFAULT_CONFIG_PATH, AnalysisConfig, load_analysis_config
 from .datasets import bin_order, parallax_bin, rotation_bin
 from .evaluate import (
+    EVAL_VERSION,
     MEAN_FEATURE,
     NEIGHBOR_PATCH,
     NO_WARP_COPY,
@@ -72,17 +74,94 @@ CENTERED = "cosine_centered_mean"
 
 
 def read_eval_dir(eval_dir: Path) -> list[dict[str, Any]]:
-    """Read every per-scene parquet in a directory into one list of rows."""
+    """Read every per-scene parquet in a directory, checking they are one run.
+
+    Globbing a directory and concatenating whatever is there treats the file
+    system as the population definition. That is wrong in three ways at once,
+    and every one of them produces a table that looks finished.
+
+    A parquet from an earlier version is not comparable with a current one: the
+    repair changed sample identity, so every hash-derived null draws
+    differently, and scoring moved to the path's common valid set. Rows from
+    either side of that would be averaged together.
+
+    A missing scene is invisible. Each sidecar records the full scene list of
+    the run that wrote it, so any one file declares what a complete directory
+    should hold, and a failed array task shows up as an absent scene rather
+    than as a smaller population nobody counted.
+
+    Two runs at different commits, or with a different seed, sampling depth, or
+    encoder set, differ in what they measured. They are refused rather than
+    concatenated.
+    """
     import pyarrow.parquet as pq
 
     eval_dir = Path(eval_dir)
     files = sorted(eval_dir.glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"no parquet files in {eval_dir}")
+
+    sidecars: dict[str, dict[str, Any]] = {}
+    for path in files:
+        meta_path = path.with_suffix(".meta.json")
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"{path} has no {meta_path.name}. Its provenance is unknown, so "
+                "it cannot be shown to belong with the others"
+            )
+        sidecars[path.stem] = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    for field in ("eval_version", "encoders", "seed", "max_pairs_per_stratum",
+                  "git_commit", "run_scenes"):
+        found = {json.dumps(meta.get(field), sort_keys=True) for meta in sidecars.values()}
+        if len(found) > 1:
+            raise ValueError(
+                f"{eval_dir} mixes runs: {field} takes {len(found)} values "
+                f"{sorted(found)[:3]}. These scenes did not measure the same thing"
+            )
+
+    any_meta = next(iter(sidecars.values()))
+    if any_meta.get("eval_version") != EVAL_VERSION:
+        raise ValueError(
+            f"{eval_dir} was written by eval_version {any_meta.get('eval_version')}, "
+            f"this analysis expects {EVAL_VERSION}. Re-run the evaluation"
+        )
+    expected = set(any_meta.get("run_scenes") or ())
+    if not expected:
+        raise ValueError(f"{eval_dir} sidecars declare no run_scenes")
+    present = set(sidecars)
+    if present != expected:
+        missing = sorted(expected - present)
+        extra = sorted(present - expected)
+        raise ValueError(
+            f"{eval_dir} holds {len(present)} of the {len(expected)} scenes the "
+            f"run declares. Missing: {missing}. Unexpected: {extra}. An "
+            "incomplete directory is a different population, not a smaller one"
+        )
+    if str(any_meta.get("git_commit", "")).endswith("-dirty"):
+        print(
+            f"warning: results were produced at {any_meta['git_commit']}, from a "
+            "worktree with uncommitted changes"
+        )
+
     rows: list[dict[str, Any]] = []
     for path in files:
         rows.extend(pq.read_table(path).to_pylist())
     return rows
+
+
+def neighbor_omitted_total(eval_dir: Path) -> int:
+    """Neighbor-Patch samples omitted across the run, from the sidecars.
+
+    Evaluation accumulates this once per pair, which is the grain it happens
+    at. The per-row column carries the same pair-level number duplicated into
+    every encoder and path row, so summing rows over-counts by their product.
+    """
+    total = 0
+    for meta_path in sorted(Path(eval_dir).glob("*.meta.json")):
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        total += int(meta.get("neighbor_patch_omitted_records", 0))
+    return total
 
 
 def _finite(value: Any) -> bool:
@@ -154,12 +233,30 @@ def paired_records(
     of means would be a difference of populations wearing the shape of a method
     effect.
 
+    A duplicate row raises rather than counting, unlike a mask mismatch. A
+    mismatch is a property of one comparison and the analysis can proceed
+    without it; a repeated (comparison, variant) means the parquet directory
+    holds two runs, or one run written twice, and every aggregate over it is
+    then drawn from a population nobody chose. Assigning into the dictionary
+    silently kept the last row and reported nothing.
+
     Returns (records, mask_mismatches).
     """
     grouped: dict[tuple, dict[str, dict[str, Any]]] = {}
+    duplicates: list[tuple] = []
     for row in rows:
         key = tuple(row[k] for k in COMPARISON_KEYS)
-        grouped.setdefault(key, {})[row["variant"]] = row
+        slot = grouped.setdefault(key, {})
+        if row["variant"] in slot:
+            duplicates.append((*key, row["variant"]))
+        slot[row["variant"]] = row
+    if duplicates:
+        raise ValueError(
+            f"{len(duplicates)} duplicate (comparison, variant) rows, first "
+            f"{duplicates[0]}. The evaluation directory holds more than one run "
+            "for these comparisons; analysing it would silently keep whichever "
+            "row was read last"
+        )
 
     records: list[dict[str, Any]] = []
     mismatches = 0
@@ -441,6 +538,12 @@ def matched_summaries(
 # PROTOCOL 3.9: the operational transport check
 # ---------------------------------------------------------------------------
 
+INTERSECT_METRICS = {
+    RAW: "cosine_intersect_mean",
+    CENTERED: "cosine_centered_intersect_mean",
+}
+
+
 def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> dict[str, Any]:
     """Compare the two paths on the cells both scored, per PROTOCOL 3.9.
 
@@ -449,58 +552,84 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
     two operators. Comparing the full-population scores instead would fold the
     coverage difference into the operator difference, and the coverage
     difference is exactly what is reported beside it rather than inside it.
+
+    The gated quantity is the mean of the per-pair absolute differences. Two
+    earlier choices were both wrong, in opposite directions. Gating the largest
+    single pair applies a tolerance established on pooled scores to a statistic
+    it was never measured against. Gating the absolute difference of the two
+    pooled means fixes that but destroys the thing being measured: a pair where
+    the per-point path reads high and a pair where it reads low cancel, so two
+    pairs disagreeing by 0.2 in opposite directions produce an aggregate of
+    zero and a passing gate. Taking absolute values per pair before aggregating
+    keeps the comparison paired, keeps it an aggregate, and cannot cancel.
+
+    Both metrics are gated. Centering subtracts a fixed vector from both sides,
+    but it does not act equally on the two paths: the splat path's pooled output
+    is a weighted mean over a cell and the per-point path's is a single sample,
+    so a disagreement invisible in raw cosine can appear once the shared
+    component is removed. A gate that checked only the raw metric would certify
+    a centered table it never looked at, and the centered metric is the one the
+    VGGT reading rests on.
     """
     by_key: dict[tuple, dict[str, dict[str, Any]]] = {}
+    duplicates = 0
     for row in rows:
         if row["variant"] != ORACLE_TRANSPORT:
             continue
         key = (row["scene"], row["context_frame_id"], row["target_frame_id"], row["encoder"])
-        by_key.setdefault(key, {})[row["path"]] = row
+        slot = by_key.setdefault(key, {})
+        if row["path"] in slot:
+            duplicates += 1
+        slot[row["path"]] = row
 
-    per_point_values: list[float] = []
-    splat_values: list[float] = []
-    differences: list[float] = []
+    per_metric: dict[str, list[float]] = {name: [] for name in INTERSECT_METRICS}
     coverage: list[int] = []
+    complete = 0
     for paths in by_key.values():
         if set(paths) != set(PATH_ORDER):
             continue
-        a = paths[PER_POINT]["cosine_intersect_mean"]
-        b = paths[SPLAT_POOL]["cosine_intersect_mean"]
-        if _finite(a) and _finite(b):
-            per_point_values.append(a)
-            splat_values.append(b)
-            differences.append(abs(a - b))
-            coverage.append(
-                int(paths[PER_POINT]["coverage_difference"])
-                + int(paths[SPLAT_POOL]["coverage_difference"])
-            )
-    if not differences:
-        return {
-            "comparisons": 0,
-            "aggregate_abs_difference": float("nan"),
-            "max_abs_difference": float("nan"),
-            "within_tolerance": False,
-        }
+        complete += 1
+        for name, column in INTERSECT_METRICS.items():
+            a = paths[PER_POINT][column]
+            b = paths[SPLAT_POOL][column]
+            if _finite(a) and _finite(b):
+                per_metric[name].append(abs(a - b))
+        coverage.append(
+            int(paths[PER_POINT]["coverage_difference"])
+            + int(paths[SPLAT_POOL]["coverage_difference"])
+        )
+
     tolerance = config.path_agreement_tolerance
-    # The gate is the difference of the two aggregates, which is the quantity the
-    # 0.003 tolerance was established on: the completed run compared pooled
-    # per-path scores. The per-pair maximum is reported beside it as a
-    # diagnostic, not gated, because a tolerance calibrated on an aggregate says
-    # nothing about the worst single pair, and gating on the maximum would apply
-    # a number to a statistic it was never measured against.
-    aggregate = abs(float(np.mean(per_point_values)) - float(np.mean(splat_values)))
-    return {
-        "comparisons": len(differences),
-        "aggregate_abs_difference": aggregate,
-        "mean_abs_difference": float(np.mean(differences)),
-        "median_abs_difference": float(np.median(differences)),
-        "max_abs_difference": float(np.max(differences)),
-        "pairs_over_tolerance": int(np.sum(np.asarray(differences) > tolerance)),
+    result: dict[str, Any] = {
+        "comparisons": complete,
+        "duplicate_rows": duplicates,
         "tolerance": tolerance,
-        "within_tolerance": bool(aggregate <= tolerance),
-        "mean_coverage_difference_cells": float(np.mean(coverage)),
-        "max_coverage_difference_cells": int(np.max(coverage)),
+        "within_tolerance": complete > 0 and duplicates == 0,
     }
+    for name, differences in per_metric.items():
+        if not differences:
+            result[f"{name}_mean_abs_difference"] = float("nan")
+            result[f"{name}_max_abs_difference"] = float("nan")
+            result[f"{name}_pairs_over_tolerance"] = 0
+            result[f"{name}_n"] = 0
+            result["within_tolerance"] = False
+            continue
+        values = np.asarray(differences, dtype=np.float64)
+        mean_abs = float(values.mean())
+        result[f"{name}_mean_abs_difference"] = mean_abs
+        result[f"{name}_median_abs_difference"] = float(np.median(values))
+        result[f"{name}_max_abs_difference"] = float(values.max())
+        result[f"{name}_pairs_over_tolerance"] = int((values > tolerance).sum())
+        result[f"{name}_n"] = int(values.size)
+        if mean_abs > tolerance:
+            result["within_tolerance"] = False
+    if coverage:
+        result["mean_coverage_difference_cells"] = float(np.mean(coverage))
+        result["max_coverage_difference_cells"] = int(np.max(coverage))
+    else:
+        result["mean_coverage_difference_cells"] = float("nan")
+        result["max_coverage_difference_cells"] = 0
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +1016,8 @@ def summary_table(
                     "value": summary["estimate"],
                     "value_ci_low": summary["ci_low"],
                     "value_ci_high": summary["ci_high"],
+                    "value_pair_ci_low": summary["pair_ci_low"],
+                    "value_pair_ci_high": summary["pair_ci_high"],
                     "margin": margin["estimate"],
                     "margin_ci_low": margin["ci_low"],
                     "margin_ci_high": margin["ci_high"],
@@ -1076,54 +1207,77 @@ def main(argv: list[str] | None = None) -> None:
     if args.counts_only:
         table = counts_table(records, config)
         print(format_counts(table, config))
+        # Rewritten every time, unlike the results table. The runbook has the
+        # user read counts, edit the support thresholds, and read them again,
+        # so a write-once artifact would keep the supported_at_current_threshold
+        # column from the configuration that has just been replaced, and the
+        # file would contradict the verdict printed beside it. The counts
+        # themselves are a function of the parquet alone; only the threshold
+        # verdict moves, and re-deriving it is the point.
         counts_path = Path(out_dir) / "tables" / "support_counts.parquet"
-        if not counts_path.exists():
-            write_table(counts_path, table)
-            print(f"{chr(10)}counts -> {counts_path}")
+        counts_path.parent.mkdir(parents=True, exist_ok=True)
+        if counts_path.exists():
+            counts_path.unlink()
+        write_table(counts_path, table)
+        print(f"{chr(10)}counts -> {counts_path}")
         return
 
     agreement = path_agreement(rows, config)
     print(
         f"PROTOCOL 3.9 path agreement on the cross-path intersection, over "
-        f"{agreement['comparisons']} comparisons:"
+        f"{agreement['comparisons']} comparisons, tolerance "
+        f"{agreement['tolerance']}:"
     )
-    print(
-        f"  gated: |mean(per_point) - mean(splat_pool)| = "
-        f"{agreement['aggregate_abs_difference']:.5f}, tolerance "
-        f"{agreement.get('tolerance', float('nan'))}, within = "
-        f"{agreement['within_tolerance']}"
-    )
-    print(
-        f"  diagnostic, not gated: per-pair |difference| median "
-        f"{agreement.get('median_abs_difference', float('nan')):.5f}, max "
-        f"{agreement['max_abs_difference']:.5f}, "
-        f"{agreement.get('pairs_over_tolerance', 0)} pairs above the tolerance"
-    )
+    for name in INTERSECT_METRICS:
+        print(
+            f"  gated, {name}: mean per-pair |difference| = "
+            f"{agreement[f'{name}_mean_abs_difference']:.5f} over "
+            f"{agreement[f'{name}_n']} pairs"
+        )
+        print(
+            f"    diagnostic: median "
+            f"{agreement.get(f'{name}_median_abs_difference', float('nan')):.5f}, max "
+            f"{agreement[f'{name}_max_abs_difference']:.5f}, "
+            f"{agreement[f'{name}_pairs_over_tolerance']} pairs above the tolerance"
+        )
     print(
         f"  coverage difference beside it: mean "
-        f"{agreement.get('mean_coverage_difference_cells', float('nan')):.2f} cells, "
-        f"max {agreement.get('max_coverage_difference_cells', 0)}"
+        f"{agreement['mean_coverage_difference_cells']:.2f} cells, "
+        f"max {agreement['max_coverage_difference_cells']}"
     )
+    if agreement["duplicate_rows"]:
+        raise SystemExit(
+            f"{agreement['duplicate_rows']} duplicate path rows in the evaluation "
+            "parquet. One comparison scored twice means the directory mixes runs, "
+            "and the second silently replaces the first."
+        )
     if not agreement["within_tolerance"]:
         # PROTOCOL 3.9 states the two paths must agree within the tolerance. A
         # run that fails it has a transport operator that does not reach the
         # representational ceiling, which changes what every later rung means,
         # so it stops here rather than producing a table that reads as if it had.
+        failed = [
+            f"{name} at {agreement[f'{name}_mean_abs_difference']:.5f}"
+            for name in INTERSECT_METRICS
+            if not (agreement[f"{name}_mean_abs_difference"] <= agreement["tolerance"])
+        ]
         raise SystemExit(
-            "PROTOCOL 3.9 path agreement failed: aggregate difference "
-            f"{agreement['aggregate_abs_difference']:.5f} exceeds tolerance "
-            f"{agreement['tolerance']}. Do not report these results; find the "
-            "difference between the two paths first."
+            "PROTOCOL 3.9 path agreement failed: mean per-pair absolute "
+            f"difference exceeds the {agreement['tolerance']} tolerance for "
+            f"{', '.join(failed) or 'no scored comparisons'}. Do not report "
+            "these results; find the difference between the two paths first."
         )
 
     # PROTOCOL 3.7 reports per-variant omission counts beside Figure A in place
     # of differing n, since the common-valid rule gives every variant one n.
-    omissions = {
-        NEIGHBOR_PATCH: int(
-            sum(r["neighbor_omitted"] for r in rows if r["variant"] == NEIGHBOR_PATCH)
-            / max(1, len({r["metric"] for r in records}))
-        )
-    }
+    #
+    # Read from the run sidecars, where evaluation accumulates it once per pair.
+    # Summing the row column instead counted each pair once per encoder and once
+    # per path, and the divisor it was corrected by, the number of metrics, has
+    # no relation to that duplication: rows are wide in metric and long in
+    # encoder and path. With two encoders and two paths it reported twice the
+    # true count.
+    omissions = {NEIGHBOR_PATCH: neighbor_omitted_total(args.eval_dir)}
     table_path = Path(out_dir) / "tables" / "experiment_zero.parquet"
     write_table(table_path, summary_table(records, config))
     print(f"table  -> {table_path}")

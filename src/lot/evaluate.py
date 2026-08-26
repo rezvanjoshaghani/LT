@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -55,7 +57,14 @@ from .datasets import (
     load_scene_pairs,
     subsample_by_stratum,
 )
-from .encoders import ENCODERS, PATCH_SIZE, cache_dir, patch_grid_shape
+from .encoders import (
+    ENCODERS,
+    PATCH_SIZE,
+    cache_dir,
+    load_cache_meta,
+    patch_grid_shape,
+    validate_feature_cache,
+)
 from .geometry import relative_pose
 from .render_replica import (
     MANIFEST_NAME,
@@ -94,7 +103,13 @@ _READ_NAMES = {
     "random": RANDOM_PATCH,
 }
 
-EVAL_VERSION = 2
+EVAL_VERSION = 3
+# 3: the validation repair. Sample identity is a full-width digest, so every
+#    hash-derived null draws differently; Random-Patch returns an index rather
+#    than a bilinear read; scoring is on the path's common valid set; rows carry
+#    the intersection columns and the persisted mask. No row written under 2 can
+#    be compared with one written under 3, and mixing them in a directory would
+#    produce a table drawn from two populations.
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +173,9 @@ def agreement_metrics(
 # The global mean vector: floor and centering statistic in one object
 # ---------------------------------------------------------------------------
 
-def dataset_mean_vector(cache_root: Path, encoder: str, scenes: Sequence[str]) -> Tensor:
+def dataset_mean_vector(
+    cache_root: Path, encoder: str, scenes: Sequence[str]
+) -> tuple[Tensor, str]:
     """One global D-vector per encoder, over all frames and all positions.
 
     PROTOCOL 3.6 freezes Mean-Feature as exactly this object, and PROTOCOL 3.7
@@ -168,20 +185,49 @@ def dataset_mean_vector(cache_root: Path, encoder: str, scenes: Sequence[str]) -
     position-indexed VGGT finding measures, and a map used as a prediction can
     beat the correct answer, which is the artifact the frozen definition exists
     to prevent.
+
     """
     total: Tensor | None = None
     count = 0
-    for scene in scenes:
+    for scene in sorted(scenes):
         path = cache_dir(cache_root, encoder, scene) / "features.npz"
         with np.load(path) as archive:
-            for name in archive.files:
-                array = torch.from_numpy(archive[name]).to(torch.float32)
-                per_frame = array.reshape(array.shape[0], -1).mean(dim=1)
+            for name in sorted(archive.files):
+                values = torch.from_numpy(archive[name]).to(torch.float32)
+                per_frame = values.reshape(values.shape[0], -1).mean(dim=1)
                 total = per_frame if total is None else total + per_frame
                 count += 1
     if total is None or count == 0:
         raise ValueError(f"no cached features for {encoder} in {list(scenes)}")
     return total / count
+
+
+def mean_vector_cache_digest(cache_root: Path, encoder: str, scenes: Sequence[str]) -> str:
+    """Identity of the cache contents the mean vector is built from.
+
+    Read from each scene's cache metadata, where the content hash was computed
+    once when the cache was written. Hashing the arrays here instead would make
+    the stored mean vector pointless: it exists so an 18-task array does not
+    read the whole feature cache eighteen times.
+
+    Naming the cache directory, which is what this recorded before, cannot see
+    the failure it was meant to catch. Features at a path can be rebuilt in
+    place with different weights, a different image size, or a different frame
+    set. Every one of those leaves the path identical while moving the
+    Mean-Feature floor and the centering statistic together, and the stale
+    vector would be returned in silence.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for scene in sorted(scenes):
+        meta = load_cache_meta(cache_root, encoder, scene)
+        for field in ("features_digest", "weights_fingerprint"):
+            if not meta.get(field):
+                raise ValueError(
+                    f"{encoder} / {scene}: cache metadata carries no {field}; "
+                    "re-cache it before building a floor from it"
+                )
+        digest.update(f"{scene}|{meta['features_digest']}|{meta['weights_fingerprint']}".encode())
+    return digest.hexdigest()
 
 
 def load_or_build_mean_vector(
@@ -208,7 +254,7 @@ def load_or_build_mean_vector(
     provenance = {
         "encoder": encoder,
         "scenes": sorted(scenes),
-        "cache_root": str(cache_root),
+        "cache_digest": mean_vector_cache_digest(cache_root, encoder, scenes),
         "eval_version": EVAL_VERSION,
     }
     if path.exists() and record.exists():
@@ -763,9 +809,25 @@ def load_eval_config(path: Path) -> EvalConfig:
 class _SceneCache:
     """Lazily read depth maps and cached features for one scene, once each."""
 
-    def __init__(self, scene_root: Path, cache_root: Path, encoders: Sequence[str], scene: str):
+    def __init__(
+        self,
+        scene_root: Path,
+        cache_root: Path,
+        encoders: Sequence[str],
+        scene: str,
+        manifest: Any | None = None,
+    ):
         self.scene_root = Path(scene_root)
         self._depth: dict[str, Tensor] = {}
+        # Validate before opening, not after. Reading an archive directly gets
+        # arrays of the right shape from a cache built with any weights, at any
+        # image size, over any frame set, and nothing downstream would notice.
+        # The digest is not recomputed here, which would cost a full pass per
+        # scene per task; the metadata check is what the caching job's own
+        # validation pass backs.
+        if manifest is not None:
+            for encoder in encoders:
+                validate_feature_cache(cache_root, encoder, manifest)
         self._archives = {
             encoder: np.load(cache_dir(cache_root, encoder, scene) / "features.npz")
             for encoder in encoders
@@ -803,13 +865,14 @@ def evaluate_scene(
         scene_root,
         check_files=False,
         rotation_position_bound_m=analysis.rotation_position_bound_m,
+        translation_rotation_bound_deg=analysis.translation_rotation_bound_deg,
     )
     frames = {f.frame_id: f for f in manifest.frames}
     all_pairs = load_scene_pairs(cfg.renders_root, scene, config=analysis)
     pairs = subsample_by_stratum(
         all_pairs, analysis.max_pairs_per_stratum, seed=cfg.seed, config=analysis
     )
-    cache = _SceneCache(scene_root, cfg.cache_root, cfg.encoders, scene)
+    cache = _SceneCache(scene_root, cfg.cache_root, cfg.encoders, scene, manifest)
     rows: list[dict[str, Any]] = []
     dropped_unscorable = 0
     neighbor_omitted = 0
@@ -875,6 +938,8 @@ def evaluate_scene(
         "neighbor_patch_omitted_records": neighbor_omitted,
         "universe_size": universe_size,
         "encoders": list(cfg.encoders),
+        "run_scenes": sorted(cfg.scenes),
+        "git_commit": git_commit(),
         "seed": cfg.seed,
         "max_pairs_per_stratum": analysis.max_pairs_per_stratum,
         # Why realized bin populations differ from the design targets. Strata are
@@ -896,6 +961,31 @@ def evaluate_scene(
         ),
     }
     return rows, metadata
+
+
+def git_commit() -> str:
+    """The commit these results were produced at, or a marker if unknown.
+
+    Recorded per scene so a directory assembled from two runs can be detected
+    rather than averaged. A dirty worktree is marked, because a commit hash
+    that does not describe the code that ran is worse than no hash.
+    """
+    try:
+        root = Path(__file__).resolve().parents[2]
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, timeout=30
+        )
+        if head.returncode != 0:
+            return "unknown"
+        commit = head.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=30
+        )
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            return f"{commit}-dirty"
+        return commit
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def write_rows(path: Path, rows: Sequence[dict[str, Any]], metadata: dict[str, Any]) -> None:
@@ -979,10 +1069,38 @@ def main(argv: list[str] | None = None) -> None:
     for scene in scenes:
         path = cfg.eval_dir / f"{scene}.parquet"
         if path.exists():
-            if args.resume:
-                print(f"[{scene}] results exist, skipping")
-                continue
-            raise SystemExit(f"{path} exists; pass --resume to skip finished scenes")
+            if not args.resume:
+                raise SystemExit(f"{path} exists; pass --resume to skip finished scenes")
+            # Existence is not completion. A parquet can be left by an earlier
+            # version, a different seed, or a directory reused across runs, and
+            # skipping it on the strength of its filename silently adopts it
+            # into this run's population.
+            meta_path = path.with_suffix(".meta.json")
+            if not meta_path.exists():
+                raise SystemExit(
+                    f"{path} exists with no {meta_path.name}. It cannot be shown "
+                    "to belong to this run; delete it or move the directory aside"
+                )
+            stored = json.loads(meta_path.read_text(encoding="utf-8"))
+            differing = {
+                field: (stored.get(field), value)
+                for field, value in (
+                    ("eval_version", EVAL_VERSION),
+                    ("encoders", list(cfg.encoders)),
+                    ("seed", cfg.seed),
+                    ("max_pairs_per_stratum", analysis.max_pairs_per_stratum),
+                    ("run_scenes", sorted(cfg.scenes)),
+                )
+                if stored.get(field) != value
+            }
+            if differing:
+                raise SystemExit(
+                    f"{path} was written by a different run: {differing}. "
+                    "Resuming over it would mix populations; move the directory "
+                    "aside rather than adding to it"
+                )
+            print(f"[{scene}] results exist, skipping")
+            continue
         started = time.perf_counter()
         rows, metadata = evaluate_scene(cfg, scene, mean_vectors, analysis)
         write_rows(path, rows, metadata)

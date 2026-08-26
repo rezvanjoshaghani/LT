@@ -508,9 +508,26 @@ def test_the_mean_vector_is_written_atomically_and_checked_on_reuse(tmp_path):
     from lot.encoders import cache_dir
     from lot.evaluate import load_or_build_mean_vector
 
-    directory = cache_dir(tmp_path / "cache", "dinov2_vitb14", "room_0")
-    directory.mkdir(parents=True)
-    np.savez(directory / "features.npz", a=np.full((4, 2, 2), 3.0, dtype=np.float16))
+    def write_cache(scene, value):
+        from lot.encoders import CACHE_VERSION, features_digest
+
+        directory = cache_dir(tmp_path / "cache", "dinov2_vitb14", scene)
+        directory.mkdir(parents=True, exist_ok=True)
+        arrays = {"a": np.full((4, 2, 2), value, dtype=np.float16)}
+        np.savez(directory / "features.npz", **arrays)
+        (directory / "meta.json").write_text(
+            json.dumps(
+                {
+                    "cache_version": CACHE_VERSION,
+                    "features_digest": features_digest(arrays),
+                    "weights_fingerprint": "abc123",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return directory
+
+    directory = write_cache("room_0", 3.0)
 
     out = tmp_path / "out"
     first = load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
@@ -519,5 +536,15 @@ def test_the_mean_vector_is_written_atomically_and_checked_on_reuse(tmp_path):
     # Reuse is validated against provenance, not taken on trust.
     again = load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
     assert torch.equal(first, again)
+    write_cache("room_1", 3.0)
     with pytest.raises(ValueError, match="built for"):
         load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_1"], out)
+
+    # Rebuilding the cache in place, at the same path, with different features.
+    # Naming the directory in the provenance record cannot see this: the path is
+    # unchanged, so the stale vector was returned and both the Mean-Feature floor
+    # and the centering statistic silently described features that no longer
+    # existed. The digest is over the bytes that went into the vector.
+    write_cache("room_0", 9.0)
+    with pytest.raises(ValueError, match="built for"):
+        load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)

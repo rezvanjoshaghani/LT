@@ -627,11 +627,39 @@ def rotation_position_residuals(manifest: Manifest) -> dict[int, float]:
     return residuals
 
 
+def translation_rotation_residuals(manifest: Manifest) -> dict[int, float]:
+    """Largest pairwise rotation, in degrees, among each viewpoint's translation frames.
+
+    The mirror of rotation_position_residuals. PROTOCOL 3.3 makes translation
+    the sole source of the primary parallax curve precisely because it holds
+    rotation at exactly zero, so a translation frame whose orientation drifted
+    would put an unlabelled rotation into the marginal that exists to exclude
+    it. Nothing downstream could see it: rows carry rotation_deg per pair, but
+    the regime tag is what routes a pair onto the curve.
+    """
+    from .geometry import rotation_angle_deg
+
+    orientations: dict[int, list[Tensor]] = {}
+    for frame in manifest.frames:
+        if frame.regime != "translation":
+            continue
+        viewpoint = int(frame.params.get("viewpoint", -1))
+        orientations.setdefault(viewpoint, []).append(frame.T_world_from_camera[:3, :3])
+    residuals: dict[int, float] = {}
+    for viewpoint, values in orientations.items():
+        reference = values[0].to(torch.float64)
+        residuals[viewpoint] = max(
+            rotation_angle_deg(reference.mT @ R.to(torch.float64)) for R in values
+        )
+    return residuals
+
+
 def validate_manifest(
     manifest: Manifest,
     root: Path,
     check_files: bool = True,
     rotation_position_bound_m: float | None = None,
+    translation_rotation_bound_deg: float | None = None,
 ) -> dict[str, Any]:
     """Validate a manifest. Raises ValueError with the first problem found.
 
@@ -642,13 +670,30 @@ def validate_manifest(
     True, every referenced file exists and the depth arrays have the declared
     shape and float32 dtype.
 
-    rotation_position_bound_m comes from the normative analysis config. Passing
-    None skips only that assertion, for callers validating a manifest before the
-    config exists. Returns the per-viewpoint rotation residuals.
+    Both bounds come from the normative analysis config. Passing None skips only
+    that assertion, for callers validating a manifest before the config exists.
+    Returns the per-viewpoint rotation-program position residuals.
     """
     if not manifest.frames:
         raise ValueError("manifest has no frames")
     residuals = rotation_position_residuals(manifest)
+    rotation_residuals = translation_rotation_residuals(manifest)
+    if translation_rotation_bound_deg is not None:
+        offenders = {
+            viewpoint: value
+            for viewpoint, value in rotation_residuals.items()
+            if value > translation_rotation_bound_deg
+        }
+        if offenders:
+            worst = max(offenders, key=offenders.get)
+            raise ValueError(
+                f"translation frames do not share one orientation: viewpoint "
+                f"{worst} spreads {offenders[worst]:.3e} deg, bound "
+                f"{translation_rotation_bound_deg:.3e} deg, across "
+                f"{len(offenders)} viewpoints. PROTOCOL 3.3 makes translation "
+                "the sole source of the primary parallax curve because it holds "
+                "rotation at exactly zero"
+            )
     if rotation_position_bound_m is not None:
         offenders = {
             viewpoint: value
@@ -1082,7 +1127,7 @@ def _navmesh_matches_geometry(sim, eye_height_m: float, n_points: int = 3) -> bo
             [0.0, eye_height_m, 0.0], dtype=torch.float64
         )
         _, depth_raw, _ = render_at_pose(sim, look_at_cv(eye, eye + down, up_ref))
-        valid = np.isfinite(depth_raw) & (depth_raw > 0.05)
+        valid = np.isfinite(depth_raw) & (depth_raw > _analysis().frame_near_depth_floor_m)
         fractions.append(float(valid.mean()))
     return float(np.median(np.asarray(fractions))) >= 0.5
 
@@ -1298,7 +1343,13 @@ def sample_viewpoints(
     enough clearance in the central crop, and enough distance from already
     accepted viewpoints. Returns viewpoint dicts with the base pose and the
     median depth used to size translation and orbit programs.
+
+    The near-depth floor comes from the normative analysis config, the same
+    value depth_stats uses. Held as a literal here it would have meant that
+    changing the normative number moved which frames were kept but not which
+    viewpoints were chosen in the first place.
     """
+    near_m = _analysis().frame_near_depth_floor_m
     accepted: list[dict[str, Any]] = []
     positions: list[np.ndarray] = []
     attempts = 0
@@ -1318,7 +1369,7 @@ def sample_viewpoints(
         T_base = look_at_cv(eye, eye + direction, _UP_WORLD)
         _, depth_raw, _ = render_at_pose(sim, T_base)
         depth = to_planar(depth_raw)
-        valid = np.isfinite(depth) & (depth > 0.05)
+        valid = np.isfinite(depth) & (depth > near_m)
         valid_fraction = float(valid.mean())
         if valid_fraction < cfg.min_valid_fraction:
             continue
@@ -1328,7 +1379,7 @@ def sample_viewpoints(
         h, w = depth.shape
         ch, cw = h // 4, w // 4
         center = depth[ch : h - ch, cw : w - cw]
-        center_valid = center[np.isfinite(center) & (center > 0.05)]
+        center_valid = center[np.isfinite(center) & (center > near_m)]
         if center_valid.size == 0 or float(center_valid.min()) < cfg.min_clearance_m:
             continue
         accepted.append(
@@ -1466,6 +1517,7 @@ def render_scene(cfg: RenderConfig, scene: str) -> Path:
         out_dir,
         check_files=True,
         rotation_position_bound_m=_analysis().rotation_position_bound_m,
+        translation_rotation_bound_deg=_analysis().translation_rotation_bound_deg,
     )
     write_scene_qc(out_dir, manifest, cfg.qc_frames_per_regime)
     print(f"[{scene}] {len(records)} frames {per_regime}; manifest {manifest_path}")
@@ -1548,6 +1600,7 @@ def main(argv: list[str] | None = None) -> None:
                     out_dir,
                     check_files=True,
                     rotation_position_bound_m=_analysis().rotation_position_bound_m,
+        translation_rotation_bound_deg=_analysis().translation_rotation_bound_deg,
                 )
             except FileNotFoundError:
                 print(f"[{scene}] MISSING: no manifest at {out_dir / MANIFEST_NAME}")
@@ -1602,6 +1655,7 @@ def main(argv: list[str] | None = None) -> None:
                 out_dir,
                 check_files=True,
                 rotation_position_bound_m=_analysis().rotation_position_bound_m,
+        translation_rotation_bound_deg=_analysis().translation_rotation_bound_deg,
             )
             write_scene_qc(out_dir, manifest, cfg.qc_frames_per_regime)
             print(f"[{scene}] QC sheets written under {out_dir / 'qc'}")

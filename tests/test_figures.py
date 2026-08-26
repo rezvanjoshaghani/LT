@@ -17,6 +17,7 @@ from lot.evaluate import (
     pack_mask,
     write_rows,
 )
+from lot.evaluate import EVAL_VERSION
 from lot.figures import (
     CENTERED,
     RAW,
@@ -78,6 +79,19 @@ def make_row(**overrides):
 
 def comparison(scores, **overrides):
     return [make_row(variant=v, cosine_mean=c, **overrides) for v, c in scores.items()]
+
+
+def run_meta(scene, run_scenes=None):
+    """The provenance sidecar a complete run writes beside each parquet."""
+    return {
+        "scene": scene,
+        "eval_version": EVAL_VERSION,
+        "encoders": ["dinov2_vitb14"],
+        "seed": 0,
+        "max_pairs_per_stratum": ANALYSIS.max_pairs_per_stratum,
+        "git_commit": "0" * 40,
+        "run_scenes": sorted(run_scenes or [scene]),
+    }
 
 
 def population(scenes=4, pairs=40, regime="translation", parallax=0.08, rotation=0.0):
@@ -292,8 +306,8 @@ def test_path_agreement_uses_the_intersection_columns():
         )
     result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
     assert result["comparisons"] == 1
-    assert result["aggregate_abs_difference"] == pytest.approx(0.0005, abs=1e-9)
-    assert result["max_abs_difference"] == pytest.approx(0.0005, abs=1e-9)
+    assert result["cosine_mean_mean_abs_difference"] == pytest.approx(0.0005, abs=1e-9)
+    assert result["cosine_mean_max_abs_difference"] == pytest.approx(0.0005, abs=1e-9)
     assert result["within_tolerance"]
     assert result["max_coverage_difference_cells"] == 6
 
@@ -308,7 +322,7 @@ def test_path_agreement_reports_coverage_beside_it_not_inside_it():
             coverage_difference=17,
         )
     result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
-    assert result["aggregate_abs_difference"] == pytest.approx(0.0)
+    assert result["cosine_mean_mean_abs_difference"] == pytest.approx(0.0)
     assert result["mean_coverage_difference_cells"] == pytest.approx(34.0)
 
 
@@ -374,7 +388,7 @@ def test_table_and_figures_regenerate_from_the_parquet_alone(tmp_path):
     for parallax in (0.03, 0.08, 0.3):
         rows += population(scenes=4, pairs=40, parallax=parallax)
     eval_dir = tmp_path / "eval"
-    write_rows(eval_dir / "room_0.parquet", rows, {"scene": "room_0"})
+    write_rows(eval_dir / "room_0.parquet", rows, run_meta("room_0"))
 
     reread = assign_bins(read_eval_dir(eval_dir), ANALYSIS)
     records, mismatches = paired_records(reread)
@@ -389,6 +403,45 @@ def test_table_and_figures_regenerate_from_the_parquet_alone(tmp_path):
 def test_read_eval_dir_needs_something_to_read(tmp_path):
     with pytest.raises(FileNotFoundError):
         read_eval_dir(tmp_path)
+
+
+def test_read_eval_dir_refuses_an_incomplete_directory(tmp_path):
+    """A failed array task is an absent scene, not a smaller population."""
+    eval_dir = tmp_path / "eval"
+    rows = population(scenes=1, pairs=4)
+    write_rows(eval_dir / "room_0.parquet", rows, run_meta("room_0", ["room_0", "room_1"]))
+    with pytest.raises(ValueError, match="1 of the 2 scenes"):
+        read_eval_dir(eval_dir)
+
+
+def test_read_eval_dir_refuses_a_mixed_directory(tmp_path):
+    """Two runs that measured different things are not concatenated."""
+    eval_dir = tmp_path / "eval"
+    scenes = ["room_0", "room_1"]
+    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0", scenes))
+    other = run_meta("room_1", scenes)
+    other["seed"] = 99
+    write_rows(eval_dir / "room_1.parquet", population(scenes=1, pairs=4), other)
+    with pytest.raises(ValueError, match="mixes runs: seed"):
+        read_eval_dir(eval_dir)
+
+
+def test_read_eval_dir_refuses_a_parquet_with_no_sidecar(tmp_path):
+    eval_dir = tmp_path / "eval"
+    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0"))
+    (eval_dir / "room_0.meta.json").unlink()
+    with pytest.raises(FileNotFoundError, match="no room_0.meta.json"):
+        read_eval_dir(eval_dir)
+
+
+def test_read_eval_dir_refuses_an_older_eval_version(tmp_path):
+    """Rows written before the repair draw their nulls from other hashes."""
+    eval_dir = tmp_path / "eval"
+    stale = run_meta("room_0")
+    stale["eval_version"] = EVAL_VERSION - 1
+    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), stale)
+    with pytest.raises(ValueError, match="eval_version"):
+        read_eval_dir(eval_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -411,15 +464,18 @@ def test_matched_difference_support_needs_both_arms():
         assert not summary["supported"]
 
 
-def test_path_agreement_gates_the_aggregate_and_reports_the_spread():
-    """The 0.003 tolerance was established on pooled per-path scores.
+def test_path_agreement_cannot_pass_through_cancellation():
+    """Opposite-signed pair errors must not sum away.
 
-    Gating on the worst single pair would apply that number to a statistic it
-    was never measured against, so the aggregate is gated and the per-pair
-    spread is reported beside it.
+    The gated quantity is the mean of the per-pair absolute differences. Two
+    earlier choices were both wrong. Gating the largest single pair applies a
+    tolerance established on pooled scores to a statistic it was never measured
+    against. Gating |mean(a) - mean(b)| fixes that and destroys the measurement:
+    here one pair reads 0.2 high and one reads 0.2 low, so that quantity is
+    exactly zero while both pairs disagree by far more than the tolerance.
     """
     rows = []
-    for index, (a, b) in enumerate([(0.90, 0.90), (0.90, 0.90), (0.80, 0.95)]):
+    for index, (a, b) in enumerate([(0.90, 0.70), (0.70, 0.90)]):
         for path, value in ((PER_POINT, a), (SPLAT_POOL, b)):
             rows += comparison(
                 {ORACLE_TRANSPORT: 0.5, NO_WARP_COPY: 0.4},
@@ -429,10 +485,41 @@ def test_path_agreement_gates_the_aggregate_and_reports_the_spread():
                 target_frame_id=f"t{index}",
             )
     result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
-    assert result["max_abs_difference"] == pytest.approx(0.15, abs=1e-9)
-    assert result["pairs_over_tolerance"] == 1
-    # The aggregate difference is small even though one pair is far out.
-    assert result["aggregate_abs_difference"] == pytest.approx(0.05, abs=1e-9)
+    assert abs(np.mean([0.90, 0.70]) - np.mean([0.70, 0.90])) == pytest.approx(0.0)
+    assert result["cosine_mean_mean_abs_difference"] == pytest.approx(0.20, abs=1e-9)
+    assert result["cosine_mean_pairs_over_tolerance"] == 2
+    assert not result["within_tolerance"]
+
+
+def test_path_agreement_gates_the_centered_metric_too():
+    """Centering does not act equally on the two paths.
+
+    The splat path's pooled output is a weighted mean over a cell and the
+    per-point path's is a single sample, so removing the shared component can
+    expose a disagreement the raw metric hides. A gate that read only the raw
+    column would certify a centered table it never looked at.
+    """
+    rows = []
+    for path, centered in ((PER_POINT, 0.80), (SPLAT_POOL, 0.50)):
+        rows += comparison(
+            {ORACLE_TRANSPORT: 0.5, NO_WARP_COPY: 0.4},
+            path=path,
+            cosine_intersect_mean=0.9,           # raw agrees exactly
+            cosine_centered_intersect_mean=centered,
+        )
+    result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
+    assert result["cosine_mean_mean_abs_difference"] == pytest.approx(0.0)
+    assert result["cosine_centered_mean_mean_abs_difference"] == pytest.approx(0.30, abs=1e-9)
+    assert not result["within_tolerance"]
+
+
+def test_path_agreement_refuses_duplicate_rows():
+    """A comparison scored twice means the directory mixes runs."""
+    rows = comparison({ORACLE_TRANSPORT: 0.5, NO_WARP_COPY: 0.4}, path=PER_POINT)
+    rows += comparison({ORACLE_TRANSPORT: 0.5, NO_WARP_COPY: 0.4}, path=SPLAT_POOL)
+    rows += comparison({ORACLE_TRANSPORT: 0.9, NO_WARP_COPY: 0.4}, path=PER_POINT)
+    result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
+    assert result["duplicate_rows"] == 1
     assert not result["within_tolerance"]
 
 
@@ -467,3 +554,49 @@ def test_the_summary_table_carries_both_estimands():
         assert math.isfinite(row["value_comparison_weighted"])
     for row in matched:
         assert "margin_comparison_weighted" not in row
+
+
+def test_paired_records_refuses_a_repeated_comparison_and_variant():
+    """A duplicate is a corrupt population, not a per-comparison defect.
+
+    A mask mismatch is a property of one comparison and the analysis proceeds
+    without it. A repeated (comparison, variant) means the directory holds two
+    runs, so every aggregate over it is drawn from a population nobody chose.
+    """
+    rows = comparison({ORACLE_TRANSPORT: 0.6, NO_WARP_COPY: 0.4})
+    rows += comparison({ORACLE_TRANSPORT: 0.9})
+    with pytest.raises(ValueError, match="duplicate"):
+        paired_records(assign_bins(rows, ANALYSIS))
+
+
+def test_omission_count_comes_from_the_sidecars_not_the_duplicated_column(tmp_path):
+    """The row column repeats a pair-level number into every encoder and path.
+
+    Summing it over-counts by their product, and the divisor it was corrected
+    by, the number of metrics, has no relation to that duplication: rows are
+    wide in metric and long in encoder and path.
+    """
+    from lot.figures import neighbor_omitted_total
+
+    eval_dir = tmp_path / "eval"
+    scenes = ["room_0", "room_1"]
+    for scene, omitted in zip(scenes, (7, 5)):
+        meta = run_meta(scene, scenes)
+        meta["neighbor_patch_omitted_records"] = omitted
+        write_rows(eval_dir / f"{scene}.parquet", population(scenes=1, pairs=4), meta)
+    assert neighbor_omitted_total(eval_dir) == 12
+
+
+def test_absolute_scores_carry_the_camera_pair_interval_too():
+    """PROTOCOL 3.4 makes the pair interval secondary for every reported number.
+
+    Margins had it and absolute scores did not, so half the table carried only
+    the scene-level interval.
+    """
+    table = summary_table(full_records(), ANALYSIS)
+    per_regime = [r for r in table if r["analysis"] != "orbit_minus_translation"]
+    assert per_regime
+    for row in per_regime:
+        for column in ("value_pair_ci_low", "value_pair_ci_high",
+                       "margin_pair_ci_low", "margin_pair_ci_high"):
+            assert column in row

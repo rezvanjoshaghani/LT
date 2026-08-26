@@ -69,6 +69,11 @@ path_agreement_tolerance: 0.003
 # than against exact equality.
 rotation_position_bound_m: 1.0e-6
 
+# The mirror of rotation_position_bound_m, on the other regime's other axis.
+# Translation frames share one orientation by construction, so this is a
+# read-back tolerance on the stored pose, not a design allowance.
+translation_rotation_bound_deg: 1.0e-4
+
 # --- PROTOCOL 4.x, reserved for Phase 4 ------------------------------------
 # Declared now because PROTOCOL 3.4 requires the config be committed before any
 # Phase 4 result exists. Structurally not applicable until Phase 4 runs.

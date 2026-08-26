@@ -56,8 +56,19 @@ check)
     echo "== frame stats sidecars (reused, not regenerated) =="
     ls -1 data/replica_renders/*/frame_stats.json 2>/dev/null | wc -l
     echo
-    echo "== suite, with the permanent encoder tests ungated =="
-    LOT_ENCODER_SMOKE=1 run_lot python -m pytest tests/ -q
+    echo "== cache provenance =="
+    for ENCODER_CONFIG in configs/cache_features_all.yaml configs/cache_features_vggt.yaml; do
+        run_lot python -m lot.encoders --config "$ENCODER_CONFIG" --validate-only
+    done
+    echo
+    echo "== suite =="
+    # LOT_ENCODER_SMOKE is deliberately not set. It ungates two tests that load
+    # real weights, and they fall back to CPU when CUDA is absent, so on a login
+    # node they would run VGGT-1B on the CPU. Those tests run inside the caching
+    # job, which holds a GPU. The validation pass above is what this step needs:
+    # it re-reads every cached array and checks the content hash recorded when
+    # the cache was written.
+    run_lot python -m pytest tests/ -q
     ;;
 evaluate)
     if [ -d "$EVAL_DIR" ]; then

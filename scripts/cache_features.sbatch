@@ -46,16 +46,27 @@ fi
 
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+# The weight caches are set before anything loads a model. The encoder tests
+# below download the same checkpoints this job then encodes with, so setting
+# these afterwards would have sent the test downloads to the default locations
+# in the home directory: a different copy of the weights, on a filesystem with
+# its own quota, fetched once per array task.
+export TORCH_HOME="${TORCH_HOME:-$PWD/cache/torch}"
+export HF_HOME="${HF_HOME:-$PWD/cache/huggingface}"
+mkdir -p "$TORCH_HOME" "$HF_HOME"
+
 # PROTOCOL 3.1 keeps the single-frame shape test and the batch-equality test in
 # the suite permanently. Setting the variable alone does nothing: it only lifts
 # a pytest skip, and this job runs a module, not pytest. So the job runs them,
 # and refuses to do its own work if they fail. A cluster run is then a run that
 # has checked the encoder contract rather than one that could have.
+#
+# They run here and not in the evaluation job. These tests load real weights and
+# fall back to CPU when CUDA is absent, so they belong with the GPU allocation
+# that is loading those weights anyway, not in an 18-task CPU array that never
+# opens an encoder.
 export LOT_ENCODER_SMOKE=1
 "$MM" run -n "$LOT_ENV" python -m pytest tests/test_encoder_cache.py     -k "vggt_batching or grid_orientation or sees_one_frame" -q
-export TORCH_HOME="${TORCH_HOME:-$PWD/cache/torch}"
-export HF_HOME="${HF_HOME:-$PWD/cache/huggingface}"
-mkdir -p "$TORCH_HOME" "$HF_HOME"
 
 "$MM" run -n "$LOT_ENV" python -m lot.encoders \
     --config "$CONFIG" \

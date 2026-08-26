@@ -206,3 +206,70 @@ needs for its Mean-Feature floor is computed once into
 skips it.
 
 The run is CPU bound on geometry, not on the GPU, so a GPU is not requested.
+
+# Stream D: the corrected re-run
+
+Validation returned FAIL on the first Experiment Zero results, so the
+Phase 3 numbers are being regenerated under the frozen definitions.
+Renders and cached features are unaffected and are reused as they stand.
+Everything downstream of them is rebuilt: correspondence sampling, the
+nulls, the scoring, and the parquet.
+
+`scripts/run_stream_d.sh` wraps the four steps.
+
+```bash
+git fetch origin && git checkout repair/validation-streams-abc
+./scripts/run_stream_d.sh check
+```
+
+`check` prints the branch, confirms renders and features are present, and
+runs the whole suite with `LOT_ENCODER_SMOKE=1`, so the real-encoder tests
+run rather than skipping. Nothing is written.
+
+The previous results cannot be mixed with these: the schema changed, and
+the numbers were produced under definitions since corrected. Move them
+aside, keeping them, because the re-audit compares against them.
+
+```bash
+mv outputs/experiment_zero outputs/experiment_zero_precorrection
+```
+
+Then the run itself, as an array or in one process.
+
+```bash
+sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+       --array 0-17 scripts/experiment_zero.sbatch configs/experiment_zero.yaml
+```
+
+```bash
+./scripts/run_stream_d.sh evaluate
+```
+
+## Counts before figures
+
+```bash
+./scripts/run_stream_d.sh counts
+```
+
+This prints n_scenes, n_camera_pairs, and n_feature_comparisons per cell
+and nothing else. No margin, no floor, no outcome value of any kind.
+
+The order is deliberate. PROTOCOL 3.4 allows bin edges and support
+thresholds to be set from realized counts and never from outcome values,
+so the counts view exists to make that decision possible without seeing
+what it would do to the result. Read it, decide whether
+`support_min_scenes` and `support_min_camera_pairs` in
+`configs/analysis.yaml` need to change, and make that edit before running
+figures. After the freeze commit the thresholds are locked.
+
+```bash
+./scripts/run_stream_d.sh figures
+```
+
+Writes `outputs/experiment_zero/tables/experiment_zero.parquet` and the
+four figures. Every figure is regenerable from the table alone.
+
+The gates in this step stop the run rather than warn: a mask mismatch, a
+path-agreement failure, or a figure that cannot be built all exit
+non-zero. A gate that reported a stop condition and then produced the
+table anyway was one of the findings this branch repairs.

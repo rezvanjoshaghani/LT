@@ -1,0 +1,35 @@
+==============================================================================
+Building baseline and the two semantic controls
+==============================================================================
+  PROVENANCE lot.__file__ = D:\LT\validation\mutants\3.6_baseline_unmutated\src\lot\__init__.py | inside mutant dir = True
+  PROVENANCE lot.__file__ = D:\LT\validation\mutants\3.6_leak_target\src\lot\__init__.py | inside mutant dir = True
+  PROVENANCE lot.__file__ = D:\LT\validation\mutants\3.7_shuffle_correspondences\src\lot\__init__.py | inside mutant dir = True
+
+==============================================================================
+3.6 TARGET LEAK -- pre-registered signature: per-point Oracle-Transport
+    cosine becomes 1 within 1e-6, raw and (where defined) centered.
+    bug: Oracle-Transport per-point prediction replaced by the true target feature
+==============================================================================
+  cosine_mean              baseline +0.950631  leaked +1.000000 (min +1.000000000, max +1.000000119, n=44)  -> SIGNATURE PRESENT
+  cosine_centered_mean     baseline +0.946878  leaked +1.000000 (min +1.000000000, max +1.000000000, n=44)  -> SIGNATURE PRESENT
+  verdict: PASS -- the leak is unambiguous and the shipped path is not leaking
+
+==============================================================================
+3.7 CORRESPONDENCE SHUFFLE -- pre-registered kill criterion: shuffling
+    destroys at least half the paired Oracle-over-No-Warp-Copy margin,
+    with the degradation statistically clear.
+    bug: warp locations permuted within each pair
+==============================================================================
+  cosine_mean              per_point
+    baseline margin +0.1471  95% CI [+0.0831, +0.2152]  n_pairs=44
+    shuffled margin -0.6496  95% CI [-0.7096, -0.5867]  n_pairs=44
+    fraction of margin destroyed = 541.5%; intervals disjoint = True
+    -> CRITERION MET
+  cosine_centered_mean     per_point
+    baseline margin +0.1571  95% CI [+0.0887, +0.2292]  n_pairs=44
+    shuffled margin -0.7270  95% CI [-0.7913, -0.6603]  n_pairs=44
+    fraction of margin destroyed = 562.7%; intervals disjoint = True
+    -> CRITERION MET
+  verdict: PASS -- correspondence identity is load bearing
+
+evidence: D:\LT\validation\evidence\semantic_controls.json

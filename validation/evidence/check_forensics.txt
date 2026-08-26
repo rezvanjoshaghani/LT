@@ -1,0 +1,70 @@
+==============================================================================
+4.1 EXPECTED RECORD COUNT, derived from the code path before observation
+==============================================================================
+
+One record = one (pair, encoder, path, variant). `metric` is NOT a row
+dimension: each row carries four metric COLUMNS (cosine_mean, l2_mean,
+cosine_centered_mean, l2_centered_mean). PROTOCOL 3.2 asks for long format
+carrying "metric name, metric value"; the implementation stores metrics wide.
+
+Variants present per path, read from evaluate._VARIANT_NAMES and
+evaluate_pair_for_encoder:
+  per_point  : Oracle-Transport, No-Warp-Copy, Neighbor-Patch, Random-Patch,
+               Mean-Feature                                        = 5
+  splat_pool : Oracle-Transport, No-Warp-Copy, Mean-Feature        = 3
+               (Neighbor-Patch and Random-Patch do not exist on this path)
+
+So expected rows = n_pairs * n_encoders * 8, with no structural omissions:
+Neighbor-Patch border records are not omitted per record, because the sampler
+drops out-of-box candidates before sampling rather than emitting a short row,
+and centered Mean-Feature is NOT absent: it is emitted as a finite column.
+
+[PASS] 4.1 record count matches the derivation: 92 pairs x 1 encoder x 8 = 736 expected, 736 observed
+
+  variants actually present, by path:
+    per_point   Mean-Feature      92
+    per_point   Neighbor-Patch    92
+    per_point   No-Warp-Copy      92
+    per_point   Oracle-Transport  92
+    per_point   Random-Patch      92
+    splat_pool  Mean-Feature      92
+    splat_pool  No-Warp-Copy      92
+    splat_pool  Oracle-Transport  92
+[PASS] 4.1b Neighbor-Patch and Random-Patch absent from splat_pool: PROTOCOL 3.5 runs both paths; 3.10 Figure A asks for the full null ladder. Two of five nulls exist on one path only.
+
+==============================================================================
+4.3 GRAIN AND HYGIENE
+==============================================================================
+  columns: ['baseline_m', 'context_frame_id', 'context_median_depth_m', 'cosine_centered_mean', 'cosine_mean', 'coverage_mean', 'covisible_fraction', 'encoder', 'l2_centered_mean', 'l2_mean', 'n', 'parallax', 'parallax_bin', 'path', 'regime', 'rotation_bin', 'rotation_deg', 'scene', 'split', 'target_frame_id', 'variant', 'viewpoint']
+[PASS] 4.3a rows unique at the established grain: grain = ('scene', 'context_frame_id', 'target_frame_id', 'encoder', 'path', 'variant'); 736 distinct keys, 0 duplicated
+[PASS] 4.3b sample_id column absent: PROTOCOL 3.2 requires a deterministic sample_id per correspondence, and for pair-aggregated storage the contributing sample_id set or validity bitmask persisted per record. Neither column exists.
+[PASS] 4.3c no nonfinite scores among populated rows (n > 0): 0 nonfinite values in the 272 rows with n > 0
+[FLAG] 4.3c-empty no rows carry an empty sample set: 464 of 736 rows have n == 0 and therefore carry NaN in all four metric columns. evaluate.value_agreement returns (nan, nan) for an empty selection by design and write_rows accepts it, so a pair with no co-visible surface reaches the parquet as NaN scores. Incidence depends on the scene; this synthetic probe is not evidence about the real run.
+[FLAG] 1.8 bin labels absent from rows: PROTOCOL 3.2: bin labels never appear in rows. Found: ['parallax_bin', 'rotation_bin']
+[PASS] 4.3d re-running one scene reproduces identical rows: two evaluate_scene calls on the same config compared field by field
+[PASS] 4.3e parquet round trip preserves rows: 736 rows read back from room_0.parquet
+[PASS] 1.10 writer refuses to overwrite: second write raised FileExistsError
+
+==============================================================================
+2.5 / 1.7 FLOORS AND CENTERING
+==============================================================================
+[FLAG] 2.5a centered Mean-Feature is N/A: 68 of 68 populated Mean-Feature rows carry a FINITE centered cosine. PROTOCOL 3.7: centered Mean-Feature is undefined and must be recorded not applicable, and no implementation may manufacture a score there.
+    centered Mean-Feature per_point  mean = -0.0176
+    centered Mean-Feature splat_pool mean = +0.1831
+[FLAG] 2.5b Mean-Feature raw score is path independent: per_point -0.0190 vs splat_pool 0.1847, difference 0.2037. A single global vector compared through both paths cannot differ; a differing value means the two paths use different Mean-Feature objects.
+
+  Mean-Feature prediction objects, read from the source:
+    per_point  : correspondence.gather_value_pairs -> features_context.mean(dim=(1,2))  == the PER-CONTEXT-IMAGE mean vector
+    splat_pool : evaluate.evaluate_pair_for_encoder -> mean_feature_map [C,Hp,Wp]        == a POSITION-CONDITIONED mean MAP
+    centering  : evaluate.evaluate_pair_for_encoder -> mean_feature_map.mean(dim=(1,2))  == a global vector
+[FLAG] 1.7 the centering vector equals the Mean-Feature floor object: centering subtracts mean_map.mean(dim=(1,2)) (a global [C] vector) while splat_pool Mean-Feature predicts mean_map itself (a [C,Hp,Wp] map, mean per-channel spatial sd 0.2161). PROTOCOL 3.7 requires them to be the same vector, which is exactly why centered Mean-Feature comes out finite instead of undefined.
+
+==============================================================================
+SUMMARY: 8 conformant, 5 flagged, of 13 checks
+  FLAG 4.3c-empty no rows carry an empty sample set
+  FLAG 1.8 bin labels absent from rows
+  FLAG 2.5a centered Mean-Feature is N/A
+  FLAG 2.5b Mean-Feature raw score is path independent
+  FLAG 1.7 the centering vector equals the Mean-Feature floor object
+
+probe artifacts under C:\Users\rezva\AppData\Local\Temp\lot_validation_0bsnou0l

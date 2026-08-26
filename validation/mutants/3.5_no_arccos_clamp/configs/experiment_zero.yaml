@@ -1,0 +1,42 @@
+# PLAN Phase 3: Experiment Zero, the transportability test. No training.
+# Ground-truth depth warps the context features into the target camera; the
+# result is scored against the target's own features and against the floors.
+#
+# Run one scene at a time on the cluster:
+#   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#          --array 0-17 scripts/experiment_zero.sbatch configs/experiment_zero.yaml
+# Or all 18 in one process, which is fine at this size:
+#   python -m lot.evaluate --config configs/experiment_zero.yaml --resume
+experiment_name: experiment_zero
+renders_root: data/replica_renders
+cache_root: cache/features
+output_root: outputs
+encoders:
+  - dinov2_vitb14
+  - vggt_1b
+scenes:
+  - apartment_0
+  - apartment_1
+  - apartment_2
+  - frl_apartment_0
+  - frl_apartment_1
+  - frl_apartment_2
+  - frl_apartment_3
+  - frl_apartment_4
+  - frl_apartment_5
+  - hotel_0
+  - office_0
+  - office_1
+  - office_2
+  - office_3
+  - office_4
+  - room_0
+  - room_1
+  - room_2
+# Strata are (scene, regime, parallax bin). Camera programs produce far more
+# small-parallax pairs than large ones, so an unstratified sample would report
+# mostly the easy end.
+max_pairs_per_stratum: 40
+points_per_pair: 512
+min_covisible_fraction: 0.5
+seed: 0

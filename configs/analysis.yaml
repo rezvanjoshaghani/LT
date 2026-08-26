@@ -1,0 +1,80 @@
+# Normative analysis constants. PROTOCOL.md's preamble makes this file part of
+# the protocol: "changing any value in it is an amendment."
+#
+# Nothing here may also exist as a literal in src/. The audit's BLOCKER-1 was
+# that every one of these lived as a module constant or a function default, so
+# the target of an audit could drift without trace.
+
+analysis_config_version: 1
+
+# --- PROTOCOL 3.4, binning -------------------------------------------------
+# Rotation: fixed equal-width 10-degree bins from 0 to 50, with a retained
+# 50-plus overflow bin. Quantile bins are not used.
+rotation_bin_edges_deg: [10.0, 20.0, 30.0, 40.0, 50.0]
+# Parallax: the adopted edges, plus the zero bin for exact-zero-parallax pairs.
+parallax_bin_edges: [0.025, 0.05, 0.1, 0.2, 0.4]
+# Bin intervals are closed on the right: a value equal to an edge belongs to the
+# lower bin. Recorded as MINOR-5, a protocol gap closed before the freeze.
+bin_right_closed: true
+# A pair with no baseline at all is a different physical situation from one with
+# a small baseline, so exact zero gets its own bin rather than the smallest.
+zero_parallax_tol: 1.0e-9
+zero_rotation_tol_deg: 1.0e-6
+# PROTOCOL 3.4: for translation-program pairs the open interval (0, 0.025) is
+# empty by the program's design floor, and the assertion is enforced rather than
+# silently absorbed by a bin. Orbit pairs may legitimately fall there.
+assert_translation_parallax_floor: true
+
+# --- PROTOCOL 3.4, support and uncertainty ---------------------------------
+# The support decision depends primarily on independent camera pairs and scene
+# coverage, not on raw comparison counts. Bins below these remain plotted, are
+# greyed, show their n, and are never used for headline claims.
+support_min_scenes: 3
+support_min_camera_pairs: 30
+bootstrap_resamples: 1000
+bootstrap_confidence: 0.95
+bootstrap_seed: 20260825
+
+# --- PROTOCOL 3.5 to 3.7, scoring -----------------------------------------
+# Co-visibility: the context camera must see the target surface point within
+# this relative depth tolerance.
+covisible_relative_depth_tol: 0.015
+# A target patch is scored on the splat path when at least this fraction of its
+# pixels are co-visible by ground truth and the splat landed something.
+min_covisible_fraction: 0.5
+# Correspondences scored per pair on the per-point path. "all" means exhaustive:
+# every co-visible patch centre that passes the filters is scored, with no
+# subsampling step at all. This is a design choice, not a loose cap. It removes
+# within-pair sampling noise and any dependence on a sampler seed, and it makes
+# the cross-path record-set assertion exact rather than conditional on matched
+# subsets. A record count derived from first principles therefore has no cap
+# term: the per-point count of a pair is the number of eligible cells, full
+# stop. An integer here would reinstate subsampling and the cap term with it.
+points_per_pair: all
+# Pairs sampled per stratum of (scene, regime, parallax bin, rotation bin).
+max_pairs_per_stratum: 40
+# PROTOCOL 3.9: the two paths must agree within this.
+path_agreement_tolerance: 0.003
+
+# --- PROTOCOL 3.3, manifest assertions -------------------------------------
+# In-place rotation frames must share a camera position. Manifest poses are
+# simulator read-backs, so the assertion is against the read-back bound rather
+# than against exact equality.
+rotation_position_bound_m: 1.0e-6
+
+# --- PROTOCOL 4.x, reserved for Phase 4 ------------------------------------
+# Declared now because PROTOCOL 3.4 requires the config be committed before any
+# Phase 4 result exists. Structurally not applicable until Phase 4 runs.
+epsilon_margin: 0.02
+depth_boundary_dilation_px: 3
+depth_boundary_gradient_threshold: 0.05
+texture_gradient_threshold: 0.02
+depth_convention_slope_threshold: 0.05
+
+# --- Phase 1 thresholds, named by PROTOCOL's preamble ----------------------
+depth_convention_flat_tol: 0.01
+depth_convention_margin: 3.0
+depth_convention_center_crop: 0.5
+frame_min_valid_fraction: 0.5
+frame_min_clearance_m: 0.15
+frame_near_depth_floor_m: 0.05

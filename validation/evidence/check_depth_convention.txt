@@ -1,0 +1,18 @@
+=== 2.6a renderer depth-convention classifier vs known ground truth ===
+[PASS] 2.6a fronto-parallel, stored as planar_z: verdict='planar_z' spread_planar=5.921e-16 spread_euclidean=2.878e-02
+[PASS] 2.6a fronto-parallel, stored as euclidean_ray: verdict='euclidean_ray' spread_planar=2.890e-02 spread_euclidean=0.000e+00
+[PASS] 2.6a tilted 6 deg, stored as planar_z: verdict='planar_z' spread_planar=3.219e-04 spread_euclidean=2.845e-02
+[PASS] 2.6a tilted 6 deg, stored as euclidean_ray: verdict='euclidean_ray' spread_planar=2.954e-02 spread_euclidean=3.219e-04
+[FLAG] 2.6a-cfg decision thresholds come from a committed config: classify_depth_convention thresholds are function defaults in source: {'center_crop': 0.5, 'flat_tol': 0.01, 'margin': 3.0, 'max_samples': 20000}. PROTOCOL preamble requires the depth-convention decision threshold to live in configs/analysis.yaml, which does not exist.
+
+=== 2.6b PROTOCOL 4.1 secant regression, independent implementation ===
+[PASS] 2.6b secant regression classifies planar_z: slope=-0.0000 intercept=+0.8300 verdict='planar_z'
+[PASS] 2.6b secant regression classifies ray_distance: slope=+0.8300 intercept=+0.0000 verdict='ray_distance'
+[FLAG] 2.6b-impl the PROTOCOL 4.1 secant regression exists in src/: no occurrence of a secant regression against a VGGT/GT depth ratio anywhere in src/lot. PROTOCOL 4.1 requires it to run before any alignment level.
+[FLAG] 2.6b-resample VGGT depth resampling to render resolution exists: 0 actual resampling calls in src/lot (the words resize and interpolate occur only in docstrings stating that nothing is resized). PROTOCOL 4.1 requires nearest-neighbor resampling of VGGT depth to render resolution and forbids bilinear. No resampling exists, so the rule is so far neither obeyed nor broken; FINDINGS records VGGT depth exported at 518x518, the render resolution, in which case the step may be a no-op, but nothing in code asserts that.
+
+=== SUMMARY ===
+6 conformant, 3 flagged, of 9
+  FLAG 2.6a-cfg decision thresholds come from a committed config
+  FLAG 2.6b-impl the PROTOCOL 4.1 secant regression exists in src/
+  FLAG 2.6b-resample VGGT depth resampling to render resolution exists

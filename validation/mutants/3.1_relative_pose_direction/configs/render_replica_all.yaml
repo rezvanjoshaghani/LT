@@ -1,0 +1,45 @@
+# Phase 1 batch: all 18 Replica scenes, same parameters as the pilot.
+# Split (recorded in lot/render_replica.py as the single source of truth):
+#   train (13): apartment_0 apartment_1 frl_apartment_0 frl_apartment_1
+#               frl_apartment_2 frl_apartment_3 frl_apartment_5 office_0
+#               office_1 office_2 office_3 room_0 room_1
+#   test  (5):  apartment_2 frl_apartment_4 hotel_0 office_4 room_2
+# Submit on the cluster:
+#   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#          --array 0-17 scripts/render_replica.sbatch configs/render_replica_all.yaml
+replica_root: data/replica
+output_root: data/replica_renders
+scenes:
+  - apartment_0
+  - apartment_1
+  - apartment_2
+  - frl_apartment_0
+  - frl_apartment_1
+  - frl_apartment_2
+  - frl_apartment_3
+  - frl_apartment_4
+  - frl_apartment_5
+  - hotel_0
+  - office_0
+  - office_1
+  - office_2
+  - office_3
+  - office_4
+  - room_0
+  - room_1
+  - room_2
+seed: 0
+image_height: 518
+image_width: 518
+hfov_deg: 90.0
+eye_height_m: 1.5
+viewpoints_per_scene: 6
+# Matches the pilot: reject base viewpoints with median depth under 1.5 m
+# (wall-stare views found in pilot QC).
+min_median_depth_m: 1.5
+yaw_offsets_deg: [-30.0, -22.5, -15.0, -7.5, 0.0, 7.5, 15.0, 22.5, 30.0]
+pitch_offsets_deg: [-15.0, -7.5, 7.5, 15.0]
+parallax_values: [0.05, 0.1, 0.2, 0.4]
+orbit_radius_scales: [0.6, 1.0]
+orbit_azimuth_offsets_deg: [-20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0]
+qc_frames_per_regime: 12

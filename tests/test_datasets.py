@@ -242,13 +242,13 @@ def test_translation_floor_is_enforced_on_the_reported_statistic():
     would let a pair pass here and still be reported inside the interval this
     forbids, since the two are different numbers over different populations.
     """
-    first_edge = ANALYSIS.parallax_edges()[0]
+    floor = ANALYSIS.translation_parallax_design_floor
     # A translation pair inside the forbidden interval is refused.
     with pytest.raises(ValueError, match="asserts empty"):
-        assert_translation_parallax_floor("translation", first_edge / 2, ANALYSIS, "a pair")
-    # Exact zero, and anything at or above the first edge, are fine.
+        assert_translation_parallax_floor("translation", floor / 2, ANALYSIS, "a pair")
+    # Exact zero, and anything at or above the floor, are fine.
     assert_translation_parallax_floor("translation", 0.0, ANALYSIS, "a pair")
-    assert_translation_parallax_floor("translation", first_edge, ANALYSIS, "a pair")
+    assert_translation_parallax_floor("translation", floor, ANALYSIS, "a pair")
     # A pair with no co-visible surface has no reported parallax to check.
     assert_translation_parallax_floor("translation", float("nan"), ANALYSIS, "a pair")
 
@@ -400,3 +400,52 @@ def test_bin_right_closed_decides_which_side_an_edge_belongs_to():
     assert rotation_bin(15.0, ANALYSIS) == rotation_bin(15.0, right_open) == "10-20"
     # And the overflow bin still catches everything above the last edge.
     assert rotation_bin(500.0, ANALYSIS) == rotation_bin(500.0, right_open) == "50+"
+
+
+def test_the_floor_assertion_does_not_move_with_a_reporting_edit():
+    """The design floor is a measurement value, not the first reporting edge.
+
+    The reporting edges may be widened once from counts after the run. An
+    evaluation-time gate that read the first edge would then reject at 0.08
+    under one identity what it accepted under an equal one: widening the first
+    edge to 0.1 left the measurement digest unchanged while moving the gate.
+    """
+    import dataclasses
+
+    widened = dataclasses.replace(ANALYSIS, parallax_bin_edges=(0.1, 0.2, 0.4))
+    assert widened.measurement_digest() == ANALYSIS.measurement_digest()
+    # 0.08 is above the design floor, so it passes under both configs even
+    # though it is below the widened first reporting edge.
+    assert_translation_parallax_floor("translation", 0.08, ANALYSIS, "a pair")
+    assert_translation_parallax_floor("translation", 0.08, widened, "a pair")
+
+    # Moving the floor itself is a measurement change and is gated as one.
+    raised = dataclasses.replace(ANALYSIS, translation_parallax_design_floor=0.1)
+    assert raised.measurement_digest() != ANALYSIS.measurement_digest()
+    with pytest.raises(ValueError, match="asserts empty"):
+        assert_translation_parallax_floor("translation", 0.08, raised, "a pair")
+
+
+def test_bin_right_closed_is_a_measurement_value():
+    """Flipping it moves which pairs a capped stratum draws.
+
+    A 10-degree pair sits in the 0-10 stratum right-closed and the 10-20
+    stratum right-open, and sampling is capped per stratum, so the flag decides
+    the selected population. It was classified as reporting, so two samples
+    drawn under opposite conventions compared as one measurement. PROTOCOL 3.4
+    also froze the convention outright, so no post-run edit to it is permitted
+    in the first place.
+    """
+    import dataclasses
+
+    from lot.datasets import stratum_of
+
+    flipped = dataclasses.replace(ANALYSIS, bin_right_closed=False)
+    assert flipped.measurement_digest() != ANALYSIS.measurement_digest()
+    pair = PairRecord(
+        scene="room_0", split="train", viewpoint=0, regime="rotation",
+        context_frame_id="c", target_frame_id="t",
+        baseline_m=0.0, context_median_depth_m=2.0,
+        rotation_deg=10.0, stratum_parallax=0.0,
+    )
+    assert stratum_of(pair, ANALYSIS) != stratum_of(pair, flipped)

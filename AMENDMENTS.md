@@ -185,6 +185,46 @@ digest differs. The reporting digest covers bin edges, support thresholds,
 bootstrap settings and gate tolerances; a difference there is reported, not
 refused. Both are recorded per scene.
 
+### 2026-08-26: the sampling design, the edge convention, and the design floor are measurement values
+
+Three additions to configs/analysis.yaml, all pre-freeze, all forced by the
+same defect found from three directions: a value that decides which pairs are
+drawn or gated was classified as a reporting value, so a permitted post-run
+reporting edit could silently change the sample or an evaluation-time gate
+while two runs compared as one measurement.
+
+stratum_parallax_edges and stratum_rotation_edges_deg freeze the strata the
+pair sample is drawn within, separately from the reporting bins, which PROTOCOL
+3.4 permits to be widened once from counts after the run. They hold the same
+numbers as the reporting edges today; the point is that one set can now move
+without the other.
+
+bin_right_closed moves into the measurement identity. It governs the stratum
+labels as well as the reporting bins, so flipping it moves which pairs a capped
+stratum draws; and PROTOCOL 3.4 froze the convention outright, so no post-run
+edit to it was permitted anyway.
+
+translation_parallax_design_floor: 0.025 is the floor the evaluation-time
+assertion reads. It previously read the first reporting edge, so widening that
+edge to 0.1, a permitted reporting edit, would have made evaluation reject at
+0.08 under one identity what it accepted under an equal one. The floor is the
+translation program's own design property and does not move with reporting.
+
+### 2026-08-26: unpinned encoder provenance refuses a report
+
+PROTOCOL locks the encoders. Recording that a run was unpinned, and warning
+about it, is not a lock: the complete Phase 3 table and figures could be
+generated from unpinned caches. The reporting layer now refuses provenance
+whose weights_revision or code_revision reads unpinned or unknown, the caching
+job refuses to start without LOT_DINOV2_REVISION and LOT_VGGT_REVISION set, and
+cross-scene aggregation compares the full encoder identity, weights fingerprint
+plus both revisions, rather than the fingerprint alone.
+
+The one accepted exception is a declaration, not an omission: DINOv2's
+checkpoint bytes are served from an unversioned URL and its loader records
+weights_revision as "unpinnable: ..." while pinning the hub ref it can pin.
+A declared impossibility is provenance; an unset variable is not.
+
 ---
 
 ## Post-freeze

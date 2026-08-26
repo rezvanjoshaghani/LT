@@ -110,7 +110,12 @@ def run_meta(scene, run_scenes=None):
         "analysis_measurement_digest": ANALYSIS.measurement_digest(),
         "analysis_reporting_digest": ANALYSIS.reporting_digest(),
         "cache_provenance": {
-            "dinov2_vitb14": {"features_digest": f"d-{scene}", "weights_fingerprint": "w0"}
+            "dinov2_vitb14": {
+                "features_digest": f"d-{scene}",
+                "weights_fingerprint": "w0",
+                "weights_revision": "unpinnable: torch.hub checkpoint URL is unversioned",
+                "code_revision": "c" * 40,
+            }
         },
     }
 
@@ -769,10 +774,23 @@ def test_the_interval_says_how_many_replicates_produced_it():
 
 
 def test_the_table_carries_the_replicate_counts():
+    """Every interval on every row kind carries its replicate count.
+
+    The matched orbit-minus-translation rows matter most: that statistic is NaN
+    in any replicate whose resample drops an arm, so its interval is the one
+    most likely to rest on a subset of the draws.
+    """
     table = summary_table(full_records(), ANALYSIS)
     per_regime = [r for r in table if r["analysis"] != "orbit_minus_translation"]
-    assert per_regime
+    matched = [r for r in table if r["analysis"] == "orbit_minus_translation"]
+    assert per_regime and matched
     for row in per_regime:
+        assert row["bootstrap_resamples"] == ANALYSIS.bootstrap_resamples
+        assert 0 <= row["margin_ci_replicates"] <= row["bootstrap_resamples"]
+        assert 0 <= row["margin_pair_ci_replicates"] <= row["bootstrap_resamples"]
+        assert 0 <= row["value_ci_replicates"] <= row["bootstrap_resamples"]
+        assert 0 <= row["value_pair_ci_replicates"] <= row["bootstrap_resamples"]
+    for row in matched:
         assert row["bootstrap_resamples"] == ANALYSIS.bootstrap_resamples
         assert 0 <= row["margin_ci_replicates"] <= row["bootstrap_resamples"]
         assert 0 <= row["margin_pair_ci_replicates"] <= row["bootstrap_resamples"]
@@ -813,3 +831,45 @@ def test_counts_cover_both_paths():
     assert by_path[PER_POINT] == 40 and by_path[SPLAT_POOL] == 12
     printed = format_counts(table, ANALYSIS)
     assert "path" in printed and SPLAT_POOL in printed
+
+
+def test_scenes_evaluated_through_different_inference_code_are_refused(tmp_path):
+    """The encoder's identity is weights, revision, and inference code together.
+
+    The same state dict run through two VGGT inference commits produces
+    different features, so comparing fingerprints alone accepted a mixture
+    wearing one fingerprint.
+    """
+    import copy
+
+    eval_dir = tmp_path / "eval"
+    scenes = ["room_0", "room_1"]
+    for scene, commit in zip(scenes, ("a" * 40, "b" * 40)):
+        meta = copy.deepcopy(run_meta(scene, scenes))
+        meta["cache_provenance"]["dinov2_vitb14"]["code_revision"] = commit
+        write_rows(eval_dir / f"{scene}.parquet", population(scenes=1, pairs=4), meta)
+    with pytest.raises(ValueError, match="different encoder identities"):
+        read_eval_dir(eval_dir)
+
+
+def test_unpinned_provenance_refuses_the_report(tmp_path):
+    """PROTOCOL locks the encoders, so a warning was not a gate.
+
+    'unpinnable: ...' is a declaration that there is nothing to pin, made by a
+    loader that pinned everything it could, and it is accepted. 'unpinned' and
+    'unknown' mean nobody pinned what could have been.
+    """
+    import copy
+
+    eval_dir = tmp_path / "eval"
+    meta = copy.deepcopy(run_meta("room_0"))
+    meta["cache_provenance"]["dinov2_vitb14"]["code_revision"] = "unpinned"
+    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), meta)
+    with pytest.raises(ValueError, match="without a full pin"):
+        read_eval_dir(eval_dir)
+
+    # The declared-unpinnable weights marker alone is not a refusal: the
+    # default run_meta fixture carries it and reads cleanly.
+    clean_dir = tmp_path / "eval_clean"
+    write_rows(clean_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0"))
+    assert read_eval_dir(clean_dir)

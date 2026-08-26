@@ -644,3 +644,35 @@ def test_random_patch_draws_from_the_grid_it_reads(monkeypatch):
     cols = geometry.samples.random_patch_index[:, 1].cpu().numpy()
     per_point_flat = rows * features.shape[2] + cols
     assert np.array_equal(per_point_flat, geometry.random_patch[geometry.per_point_cells])
+
+
+def test_evaluation_verifies_the_bytes_it_consumes(tmp_path):
+    """Same-shape corruption must stop the run, not enter the scoring.
+
+    The metadata check alone accepts an archive rebuilt in place: shapes and
+    keys stay right while every value differs, and the run record then repeats
+    the old digest as a description of bytes it never covered. Nothing required
+    the caching job's own digest pass to have run before evaluation read the
+    archive, so the evaluator verifies what it consumes.
+    """
+    from test_encoder_cache import StubEncoder, fake_scene_dir, stub_spec
+
+    from lot.encoders import cache_scene_features
+    from lot.evaluate import _SceneCache
+
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+
+    # Intact: constructing the cache reader validates and succeeds.
+    _SceneCache(root, cache_root, ["stub"], manifest.scene, manifest).close()
+
+    # Rebuild the archive in place with the same keys and shapes.
+    from lot.encoders import cache_dir
+
+    path = cache_dir(cache_root, "stub", manifest.scene) / "features.npz"
+    with np.load(path) as archive:
+        tampered = {name: np.full_like(archive[name], 9.0) for name in archive.files}
+    np.savez(path, **tampered)
+    with pytest.raises(ValueError, match="features digest"):
+        _SceneCache(root, cache_root, ["stub"], manifest.scene, manifest)

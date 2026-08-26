@@ -23,6 +23,12 @@ parallax_bin_edges: [0.025, 0.05, 0.1, 0.2, 0.4]
 # with nothing comparing the two. These are measurement values and are gated as
 # such; changing one invalidates an existing run.
 stratum_parallax_edges: [0.025, 0.05, 0.1, 0.2, 0.4]
+
+# The translation program's design floor: PROTOCOL 3.4 asserts (0, this value)
+# empty for translation-program pairs. Frozen here rather than read off the
+# first reporting edge, because that edge may be widened once from counts and
+# an evaluation-time gate must not move with a reporting edit.
+translation_parallax_design_floor: 0.025
 stratum_rotation_edges_deg: [10.0, 20.0, 30.0, 40.0, 50.0]
 # Bin intervals are closed on the right: a value equal to an edge belongs to the
 # lower bin. Recorded as MINOR-5, a protocol gap closed before the freeze.

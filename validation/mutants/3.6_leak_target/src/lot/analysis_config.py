@@ -30,6 +30,7 @@ class AnalysisConfig:
 
     rotation_bin_edges_deg: tuple[float, ...]
     parallax_bin_edges: tuple[float, ...]
+    translation_parallax_design_floor: float
     stratum_parallax_edges: tuple[float, ...]
     stratum_rotation_edges_deg: tuple[float, ...]
     bin_right_closed: bool
@@ -101,6 +102,11 @@ class AnalysisConfig:
 
     MEASUREMENT_FIELDS = (
         "assert_translation_parallax_floor",
+        # The translation program's own floor, which the evaluation-time
+        # assertion reads. It used to read the first reporting edge, which is
+        # excluded below precisely because it may be widened from counts, so a
+        # permitted reporting edit silently moved an evaluation gate.
+        "translation_parallax_design_floor",
         # The sampling design. These decide which pairs were drawn, so a run is
         # not comparable across a change to them. The reporting bin edges are
         # deliberately not here: PROTOCOL 3.4 permits those to be widened once
@@ -108,6 +114,12 @@ class AnalysisConfig:
         # change a sample.
         "stratum_parallax_edges",
         "stratum_rotation_edges_deg",
+        # Which side of an edge a value belongs to. This governs the stratum
+        # labels above as well as the reporting bins, so flipping it moves
+        # which pairs a capped stratum draws; and unlike the edges, PROTOCOL
+        # 3.4 froze it outright ("closed on the right ... frozen here"), so no
+        # post-run edit to it is permitted anyway.
+        "bin_right_closed",
         "covisible_relative_depth_tol",
         "min_covisible_fraction",
         "points_per_pair",

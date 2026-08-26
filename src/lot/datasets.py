@@ -332,10 +332,10 @@ def hash_stratum(stratum: tuple[str, ...]) -> int:
 def assert_translation_parallax_floor(
     regime: str, parallax: float, config: AnalysisConfig, where: str
 ) -> None:
-    """PROTOCOL 3.4: (0, first edge) is empty for translation-program pairs.
+    """PROTOCOL 3.4: (0, design floor) is empty for translation-program pairs.
 
     The translation program sizes its moves from a design floor, so no
-    translation pair should land between exact zero and the first edge. The
+    translation pair should land between exact zero and that floor. The
     assertion is enforced rather than silently absorbed by a bin, because a bin
     that quietly accepts them would hide a program that stopped honouring its
     own floor.
@@ -345,16 +345,22 @@ def assert_translation_parallax_floor(
     the strata are formed on. Those differ, so asserting on the proxy would let
     a pair pass here and still be reported inside the interval this forbids.
     Orbit pairs may legitimately fall there and are not checked.
+
+    The floor is its own measurement value, not the first reporting edge. The
+    two hold the same number today, but the reporting edges may be widened once
+    from counts after the run, and an evaluation-time gate that moved with that
+    edit would reject pairs under one identity that it accepted under an equal
+    one.
     """
     if not config.assert_translation_parallax_floor:
         return
     if regime != "translation" or not math.isfinite(parallax):
         return
-    first_edge = config.parallax_edges()[0]
-    if config.zero_parallax_tol <= parallax < first_edge:
+    floor = config.translation_parallax_design_floor
+    if config.zero_parallax_tol <= parallax < floor:
         raise ValueError(
             f"{where}: translation pair at reported parallax {parallax:g} falls "
-            f"in the open interval (0, {first_edge:g}) that PROTOCOL 3.4 asserts "
+            f"in the open interval (0, {floor:g}) that PROTOCOL 3.4 asserts "
             "empty by the program's design floor"
         )
 

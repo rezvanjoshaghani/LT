@@ -174,40 +174,56 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
             f"content ({any_meta.get('analysis_config_digest')}), so an edit to it "
             "cannot hide here, but source edits are not covered"
         )
-    # Every scene must have been evaluated from the same weights. The digests
-    # differ per scene, since they are per-scene caches; the fingerprints must
-    # not, or the run mixes checkpoints.
-    fingerprints = {
-        (scene, encoder, entry.get("weights_fingerprint"))
-        for scene, meta in sidecars.items()
-        for encoder, entry in (meta.get("cache_provenance") or {}).items()
-    }
+    # Every scene must have been evaluated from the same encoder, and an
+    # encoder's identity is the whole triple: the weight bytes, the recorded
+    # weights revision, and the inference implementation. Comparing the
+    # fingerprint alone accepted two scenes with identical weights run through
+    # different VGGT inference commits, which produce different features from
+    # the same state dict; that is a mixture wearing one fingerprint.
     by_encoder: dict[str, set] = {}
-    for _, encoder, fingerprint in fingerprints:
-        by_encoder.setdefault(encoder, set()).add(fingerprint)
-    mixed = {encoder: sorted(v) for encoder, v in by_encoder.items() if len(v) > 1}
+    for meta in sidecars.values():
+        for encoder, entry in (meta.get("cache_provenance") or {}).items():
+            by_encoder.setdefault(encoder, set()).add(
+                (
+                    entry.get("weights_fingerprint"),
+                    entry.get("weights_revision"),
+                    entry.get("code_revision"),
+                )
+            )
+    mixed = {encoder: sorted(map(str, v)) for encoder, v in by_encoder.items() if len(v) > 1}
     if mixed:
         raise ValueError(
-            f"scenes were evaluated from different encoder weights: {mixed}. "
-            "One encoder is one frozen representation, and a cross-scene "
-            "aggregate over two checkpoints is a mixture"
+            f"scenes were evaluated from different encoder identities: {mixed}. "
+            "One encoder is one frozen representation: same weights, same "
+            "revisions, same inference code. A cross-scene aggregate over two "
+            "of these is a mixture"
         )
-    unpinned = sorted(
+    # PROTOCOL locks the encoders, so unpinned provenance refuses the report
+    # rather than annotating it. The distinction that matters: "unpinnable: ..."
+    # is a declaration that there is nothing to pin, made by a loader that
+    # pinned everything it could, and it is accepted; "unpinned" and "unknown"
+    # mean nobody pinned what could have been, and they are not.
+    not_pinned = sorted(
         {
-            encoder
+            f"{encoder} ({field}={value!r})"
             for meta in sidecars.values()
             for encoder, entry in (meta.get("cache_provenance") or {}).items()
-            if "unpinn" in str(entry.get("weights_revision", "unpinned"))
-            or entry.get("code_revision", "unpinned") in ("unpinned", "unknown")
+            for field, value in (
+                ("weights_revision", entry.get("weights_revision")),
+                ("code_revision", entry.get("code_revision")),
+            )
+            if value in (None, "", "unpinned", "unknown", "n/a", "absent")
         }
     )
-    if unpinned:
-        print(
-            f"warning: {', '.join(unpinned)} were cached without a full pin. "
-            "The fingerprint would notice a change, but what these results used "
-            "is not fully retrievable. DINOv2's checkpoint URL is unversioned "
-            "and cannot be pinned at all; its hub ref and VGGT's revisions can. "
-            "See scripts/pin_encoder_revisions.py"
+    if not_pinned:
+        raise ValueError(
+            "results were produced from encoders without a full pin: "
+            + ", ".join(not_pinned)
+            + ". PROTOCOL locks the encoders, so what a run used must be "
+            "retrievable before it can be reported. DINOv2's checkpoint bytes "
+            "are declared unpinnable and that declaration is accepted; its hub "
+            "ref and both VGGT revisions are pinnable and required. Resolve "
+            "them with scripts/pin_encoder_revisions.py and re-cache"
         )
 
     # The config that reads a run must be the config that produced it, in every
@@ -1192,6 +1208,7 @@ def summary_table(
                     "value_pair_ci_low": summary["pair_ci_low"],
                     "value_pair_ci_high": summary["pair_ci_high"],
                     "value_ci_replicates": summary["ci_replicates"],
+                    "value_pair_ci_replicates": summary["pair_ci_replicates"],
                     "margin": margin["estimate"],
                     "margin_ci_low": margin["ci_low"],
                     "margin_ci_high": margin["ci_high"],
@@ -1242,6 +1259,13 @@ def summary_table(
                 "margin_ci_high": summary["ci_high"],
                 "margin_pair_ci_low": summary["pair_ci_low"],
                 "margin_pair_ci_high": summary["pair_ci_high"],
+                # The matched difference is NaN in any replicate whose resample
+                # drops an arm, so of every statistic in this table it is the
+                # one whose interval is most likely to rest on a subset of the
+                # draws. Its counts are correspondingly the least optional.
+                "margin_ci_replicates": summary["ci_replicates"],
+                "margin_pair_ci_replicates": summary["pair_ci_replicates"],
+                "bootstrap_resamples": summary["bootstrap_resamples"],
                 "n_scenes": summary["n_scenes"],
                 "n_camera_pairs": summary["n_camera_pairs"],
                 "n_feature_comparisons": summary["n_feature_comparisons"],

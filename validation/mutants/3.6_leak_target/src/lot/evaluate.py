@@ -883,15 +883,18 @@ class _SceneCache:
     ):
         self.scene_root = Path(scene_root)
         self._depth: dict[str, Tensor] = {}
-        # Validate before opening, not after. Reading an archive directly gets
-        # arrays of the right shape from a cache built with any weights, at any
-        # image size, over any frame set, and nothing downstream would notice.
-        # The digest is not recomputed here, which would cost a full pass per
-        # scene per task; the metadata check is what the caching job's own
-        # validation pass backs.
+        # Validate before opening, not after, and verify the bytes, not the
+        # metadata's claim about them. An earlier revision skipped the digest
+        # here for cost and trusted the caching job's validation pass to have
+        # run, but nothing required that it had: same-shape corruption would be
+        # scored while the run record repeated the old digest as if it
+        # described what was consumed. The cost objection did not survive
+        # arithmetic either. Evaluation reads every frame of the scene anyway,
+        # so the streamed digest adds one sequential pass over an archive this
+        # task already reads in full, against a four-hour budget.
         if manifest is not None:
             for encoder in encoders:
-                validate_feature_cache(cache_root, encoder, manifest)
+                validate_feature_cache(cache_root, encoder, manifest, check_digest=True)
         self._archives = {
             encoder: np.load(cache_dir(cache_root, encoder, scene) / "features.npz")
             for encoder in encoders

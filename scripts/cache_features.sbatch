@@ -65,12 +65,21 @@ mkdir -p "$TORCH_HOME" "$HF_HOME"
 # fall back to CPU when CUDA is absent, so they belong with the GPU allocation
 # that is loading those weights anyway, not in an 18-task CPU array that never
 # opens an encoder.
-# Which checkpoints this job is about to bake into a cache. Unpinned is
-# permitted and recorded as such: a fingerprint still notices a change, it just
-# cannot get the old weights back. scripts/pin_encoder_revisions.py resolves
-# both, and they belong in AMENDMENTS.md once chosen.
-echo "LOT_DINOV2_REVISION=${LOT_DINOV2_REVISION:-unpinned}"
-echo "LOT_VGGT_REVISION=${LOT_VGGT_REVISION:-unpinned}"
+# The pins are required, not recorded-if-present. PROTOCOL locks the
+# encoders, and an earlier revision of this job permitted unpinned runs while
+# only a downstream warning noticed; the reporting layer now refuses unpinned
+# provenance outright, so a cache built here without pins would be rebuilt
+# anyway. Failing before the GPU allocation does any work is the cheap place.
+# scripts/pin_encoder_revisions.py resolves both values.
+for VAR in LOT_DINOV2_REVISION LOT_VGGT_REVISION; do
+    if [ -z "${!VAR:-}" ]; then
+        echo "$VAR is not set. PROTOCOL locks the encoders; resolve the pins" >&2
+        echo "first with: python scripts/pin_encoder_revisions.py" >&2
+        exit 1
+    fi
+done
+echo "LOT_DINOV2_REVISION=$LOT_DINOV2_REVISION"
+echo "LOT_VGGT_REVISION=$LOT_VGGT_REVISION"
 
 export LOT_ENCODER_SMOKE=1
 "$MM" run -n "$LOT_ENV" python -m pytest tests/test_encoder_cache.py     -k "vggt_batching or grid_orientation or sees_one_frame" -q

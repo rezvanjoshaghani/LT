@@ -665,6 +665,24 @@ def package_revision(name: str) -> str:
         return "absent"
 
 
+def archive_digest(path: Path) -> str:
+    """features_digest of a stored npz, streamed one array at a time.
+
+    Byte-identical to features_digest over the same arrays: both iterate names
+    in sorted order and hash the name then the contiguous bytes. This one never
+    holds more than one array, because the caller that needs it most is an
+    18-task evaluation array whose VGGT archives run to gigabytes, and loading
+    a whole archive into a dict to hash it would spend the memory the weight
+    matrix reformulation exists to save.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    with np.load(path) as archive:
+        for name in sorted(archive.files):
+            digest.update(name.encode("utf-8"))
+            digest.update(np.ascontiguousarray(archive[name]).tobytes())
+    return digest.hexdigest()
+
+
 def features_digest(features: dict[str, np.ndarray]) -> str:
     """Content hash of a scene's feature arrays, over frame ids and bytes.
 
@@ -830,9 +848,7 @@ def validate_feature_cache(
             if array.dtype != np.float16:
                 raise ValueError(f"{frame_id}: features dtype {array.dtype}, expected float16")
     if check_digest:
-        with np.load(path) as archive:
-            stored_arrays = {name: archive[name] for name in archive.files}
-        found = features_digest(stored_arrays)
+        found = archive_digest(path)
         if found != meta["features_digest"]:
             raise ValueError(
                 f"{encoder_name} / {manifest.scene}: features digest {found} does "
@@ -853,43 +869,40 @@ def validate_feature_cache(
         depth_path = cache_dir(cache_root, encoder_name, manifest.scene) / DEPTH_NAME
         image_hw = tuple(int(v) for v in meta["image_hw"])
         with np.load(depth_path) as archive:
-            stored_depth = {name: archive[name] for name in archive.files}
-        allowed = set(manifest_ids) | {f"{frame_id}__conf" for frame_id in manifest_ids}
-        extra_depth = sorted(set(stored_depth) - allowed)
-        if extra_depth:
+            depth_files = set(archive.files)
+            allowed = set(manifest_ids) | {f"{fid}__conf" for fid in manifest_ids}
+            extra_depth = sorted(depth_files - allowed)
+            if extra_depth:
+                raise ValueError(
+                    f"{encoder_name} / {manifest.scene}: {len(extra_depth)} depth "
+                    f"arrays the manifest does not name, first {extra_depth[:3]}"
+                )
+            missing_depth = sorted(set(manifest_ids) - depth_files)
+            if missing_depth:
+                raise ValueError(f"{missing_depth[0]}: missing from {depth_path}")
+            # One streamed pass checks shape and dtype and, when asked, hashes.
+            # Confidence rides in the same archive under a suffixed key; it
+            # gates which depths Phase 4 trusts, so an unchecked confidence map
+            # is an unchecked depth map by another route.
+            digest = hashlib.blake2b(digest_size=16)
+            for name in sorted(depth_files):
+                array = archive[name]
+                if array.shape != image_hw:
+                    kind = "confidence" if name.endswith("__conf") else "depth"
+                    raise ValueError(f"{name}: {kind} {array.shape}, expected {image_hw}")
+                if array.dtype != np.float16:
+                    kind = "confidence" if name.endswith("__conf") else "depth"
+                    raise ValueError(f"{name}: {kind} dtype {array.dtype}, expected float16")
+                if check_digest:
+                    digest.update(name.encode("utf-8"))
+                    digest.update(np.ascontiguousarray(array).tobytes())
+        if check_digest and digest.hexdigest() != meta["depth_digest"]:
             raise ValueError(
-                f"{encoder_name} / {manifest.scene}: {len(extra_depth)} depth "
-                f"arrays the manifest does not name, first {extra_depth[:3]}"
+                f"{encoder_name} / {manifest.scene}: depth digest "
+                f"{digest.hexdigest()} does not match the {meta['depth_digest']} "
+                "recorded when the cache was written. The archive has been "
+                "rebuilt or modified in place"
             )
-        for frame_id in manifest_ids:
-            if frame_id not in stored_depth:
-                raise ValueError(f"{frame_id}: missing from {depth_path}")
-            if stored_depth[frame_id].shape != image_hw:
-                raise ValueError(
-                    f"{frame_id}: depth {stored_depth[frame_id].shape}, expected {image_hw}"
-                )
-            if stored_depth[frame_id].dtype != np.float16:
-                raise ValueError(
-                    f"{frame_id}: depth dtype {stored_depth[frame_id].dtype}, expected float16"
-                )
-            # Confidence rides in the same archive under a suffixed key. It gates
-            # which depths Phase 4 trusts, so an unchecked confidence map is an
-            # unchecked depth map by another route.
-            conf_key = f"{frame_id}__conf"
-            if conf_key in stored_depth:
-                conf = stored_depth[conf_key]
-                if conf.shape != image_hw:
-                    raise ValueError(f"{conf_key}: confidence {conf.shape}, expected {image_hw}")
-                if conf.dtype != np.float16:
-                    raise ValueError(f"{conf_key}: confidence dtype {conf.dtype}, expected float16")
-        if check_digest:
-            found = features_digest(stored_depth)
-            if found != meta["depth_digest"]:
-                raise ValueError(
-                    f"{encoder_name} / {manifest.scene}: depth digest {found} does "
-                    f"not match the {meta['depth_digest']} recorded when the cache "
-                    "was written. The archive has been rebuilt or modified in place"
-                )
     return meta
 
 
@@ -1113,21 +1126,32 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[{scene}] INVALID: {e}")
                 failures.append(scene)
             else:
-                fingerprints.setdefault(meta["weights_fingerprint"], []).append(scene)
+                identity = (
+                    meta["weights_fingerprint"],
+                    meta.get("weights_revision", "unpinned"),
+                    meta.get("code_revision", "unknown"),
+                )
+                fingerprints.setdefault(identity, []).append(scene)
                 print(
                     f"[{scene}] cache valid, {meta['frame_count']} frames, "
                     f"weights {meta['weights_fingerprint'][:12]}, "
-                    f"revision {meta.get('weights_revision', 'unpinned')}"
+                    f"revision {meta.get('weights_revision', 'unpinned')}, "
+                    f"code {meta.get('code_revision', 'unknown')}"
                 )
         if len(fingerprints) > 1:
-            # One encoder, one set of weights. Scenes cached from different
-            # checkpoints are not one frozen representation, and every
-            # cross-scene aggregate over them is a mixture.
-            print("weights differ across scenes:")
-            for fingerprint, scene_list in sorted(fingerprints.items()):
-                print(f"  {fingerprint[:12]}  {len(scene_list)} scenes: {scene_list[:4]}")
+            # One encoder, one identity: weight bytes, recorded revision, and
+            # the inference implementation. The same state dict through two
+            # inference commits produces different features, so grouping on the
+            # fingerprint alone would call that one representation.
+            print("encoder identities differ across scenes:")
+            for identity, scene_list in sorted(fingerprints.items()):
+                fingerprint, weights_rev, code_rev = identity
+                print(
+                    f"  {fingerprint[:12]} / {weights_rev} / {code_rev}  "
+                    f"{len(scene_list)} scenes: {scene_list[:4]}"
+                )
             raise SystemExit(
-                f"{len(fingerprints)} distinct weight fingerprints for {cfg.encoder}; "
+                f"{len(fingerprints)} distinct encoder identities for {cfg.encoder}; "
                 "re-cache the minority scenes"
             )
         if failures:

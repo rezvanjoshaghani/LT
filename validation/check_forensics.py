@@ -170,34 +170,30 @@ def main():
     print("=" * 78)
     print("""
 One record = one (pair, encoder, path, variant). `metric` is NOT a row
-dimension: each row carries four metric COLUMNS (cosine_mean, l2_mean,
-cosine_centered_mean, l2_centered_mean). PROTOCOL 3.2 asks for long format
-carrying "metric name, metric value"; the implementation stores metrics wide.
+dimension: each row carries wide metric COLUMNS. Every variant exists on both
+paths, per PROTOCOL 3.6, so a fully scorable pair yields 5 variants x 2 paths
+= 10 rows per encoder.
 
-Variants present per path, read from evaluate._VARIANT_NAMES and
-evaluate_pair_for_encoder:
-  per_point  : Oracle-Transport, No-Warp-Copy, Neighbor-Patch, Random-Patch,
-               Mean-Feature                                        = 5
-  splat_pool : Oracle-Transport, No-Warp-Copy, Mean-Feature        = 3
-               (Neighbor-Patch and Random-Patch do not exist on this path)
-
-So expected rows = n_pairs * n_encoders * 8, with no structural omissions:
-Neighbor-Patch border records are not omitted per record, because the sampler
-drops candidates with no admissible offset before sampling rather than emitting
-a short row. Centered Mean-Feature IS absent: the vector subtracted is the
-prediction itself, so the centered prediction is the zero vector and the cosine
-is undefined.
+The expected pair count comes from the run metadata, never from the rows being
+checked. An earlier version derived n_pairs from the produced rows, and a pair
+dropped entirely then shrank the expected and the observed count by ten
+together, so the check was an identity: it compared the rows against
+themselves. pairs_considered and pairs_dropped_unscorable are recorded by the
+evaluator before and independent of row production.
 """)
-    rows, _ = evaluate_scene(
+    rows, run_meta = evaluate_scene(
         cfg, SCENE, {"dinov2_vitb14": mean_vector}, load_analysis_config()
     )
     pairs = {(r["context_frame_id"], r["target_frame_id"]) for r in rows}
-    # Five variants on each of two paths. The earlier count of eight described
-    # a schema in which Neighbor-Patch and Random-Patch were absent from the
-    # splat path; PROTOCOL 3.6 gives both paths every variant.
-    expected = len(pairs) * 1 * 10
-    record("4.1", "record count matches the derivation", len(rows) == expected,
-           f"{len(pairs)} pairs x 1 encoder x 10 = {expected} expected, {len(rows)} observed")
+    expected_pairs = run_meta["pairs_considered"] - run_meta["pairs_dropped_unscorable"]
+    # Five variants on each of two paths.
+    expected = expected_pairs * 1 * 10
+    record("4.1", "record count matches the metadata-derived population",
+           len(rows) == expected and len(pairs) == expected_pairs,
+           f"metadata: {run_meta['pairs_considered']} considered - "
+           f"{run_meta['pairs_dropped_unscorable']} dropped = {expected_pairs} pairs; "
+           f"x 1 encoder x 10 = {expected} expected rows. Observed: "
+           f"{len(pairs)} distinct pairs, {len(rows)} rows")
 
     by_path = Counter((r["path"], r["variant"]) for r in rows)
     print("\n  variants actually present, by path:")

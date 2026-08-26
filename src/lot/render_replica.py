@@ -593,17 +593,74 @@ def load_manifest(path: Path) -> Manifest:
     return Manifest(scene=payload["scene"], metadata=payload["metadata"], frames=frames)
 
 
-def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) -> None:
+def rotation_position_residuals(manifest: Manifest) -> dict[int, float]:
+    """Largest camera-position spread within each viewpoint's rotation frames.
+
+    PROTOCOL 3.3: in-place rotation has translation exactly zero by
+    construction, and that is asserted from the manifest rather than trusted.
+    The manifest stores the pose read back from the simulator, not the pose that
+    was planned, so the assertion is against a bound rather than against exact
+    equality. It matters twice: a pair whose read-back spread exceeds the
+    zero-parallax tolerance silently leaves the zero bin, and PROTOCOL 4.5 makes
+    exact zero translation a hard invariant for the Phase 4 gate.
+
+    Reported per viewpoint rather than as one scene aggregate, because a single
+    bad viewpoint hidden inside a scene maximum is exactly what an aggregate
+    conceals.
+    """
+    positions: dict[int, list[Tensor]] = {}
+    for frame in manifest.frames:
+        if frame.regime != "rotation":
+            continue
+        viewpoint = int(frame.params.get("viewpoint", -1))
+        positions.setdefault(viewpoint, []).append(frame.T_world_from_camera[:3, 3])
+    residuals: dict[int, float] = {}
+    for viewpoint, values in positions.items():
+        stacked = torch.stack([v.to(torch.float64) for v in values])
+        residuals[viewpoint] = float(
+            (stacked - stacked.mean(dim=0, keepdim=True)).norm(dim=1).max()
+        )
+    return residuals
+
+
+def validate_manifest(
+    manifest: Manifest,
+    root: Path,
+    check_files: bool = True,
+    rotation_position_bound_m: float | None = None,
+) -> dict[str, Any]:
     """Validate a manifest. Raises ValueError with the first problem found.
 
     Checks: frames exist, frame ids unique, regimes allowed, intrinsics and
-    poses well formed with orthonormal rotations, depth convention resolved
-    in metadata with planar z-depth on disk, and, when check_files is True,
-    every referenced file exists and the depth arrays have the declared
+    poses well formed with orthonormal rotations, in-place rotation frames
+    sharing a camera position within the read-back bound, depth convention
+    resolved in metadata with planar z-depth on disk, and, when check_files is
+    True, every referenced file exists and the depth arrays have the declared
     shape and float32 dtype.
+
+    rotation_position_bound_m comes from the normative analysis config. Passing
+    None skips only that assertion, for callers validating a manifest before the
+    config exists. Returns the per-viewpoint rotation residuals.
     """
     if not manifest.frames:
         raise ValueError("manifest has no frames")
+    residuals = rotation_position_residuals(manifest)
+    if rotation_position_bound_m is not None:
+        offenders = {
+            viewpoint: value
+            for viewpoint, value in residuals.items()
+            if value > rotation_position_bound_m
+        }
+        if offenders:
+            worst = max(offenders, key=offenders.get)
+            raise ValueError(
+                f"in-place rotation frames do not share a camera position: "
+                f"viewpoint {worst} spreads {offenders[worst]:.3e} m, bound "
+                f"{rotation_position_bound_m:.3e} m, across {len(offenders)} "
+                "viewpoints. PROTOCOL 3.3 asserts this regime's translation is "
+                "exactly zero, and a pair above the zero-parallax tolerance "
+                "silently leaves the zero bin"
+            )
     seen: set[str] = set()
     dc = manifest.metadata.get("depth_convention")
     if not isinstance(dc, dict):
@@ -646,6 +703,7 @@ def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) 
                 raise ValueError(f"{f.frame_id}: depth shape {shape}")
             if dtype != np.float32:
                 raise ValueError(f"{f.frame_id}: depth dtype {dtype}")
+    return {"rotation_position_residuals_m": residuals}
 
 
 # ---------------------------------------------------------------------------

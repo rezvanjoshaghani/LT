@@ -42,7 +42,7 @@ Rotation bins: fixed equal-width 10-degree bins from 0 to 50 with a retained 50-
 
 Parallax bins: the adopted edges (0.025, 0.05, 0.1, 0.2, 0.4, overflow) live in the same config, plus the zero bin for exact-zero-parallax pairs. For translation-program pairs, the open interval from 0 to 0.025 is asserted empty by the program's design floor, and the assertion is enforced rather than silently absorbed by a bin; orbit pairs may legitimately fall in that interval, and the (0, 0.025) bin exists for them in the joint analysis. Bin intervals are closed on the right: a value equal to an edge belongs to the lower bin, matching the implementation and frozen here.
 
-Support: every bin reports n_scenes, n_camera_pairs, and n_feature_comparisons. The support decision depends primarily on independent camera pairs and scene coverage, not raw comparison counts. Bins below the support threshold in the normative analysis config remain plotted, are greyed, show their n, and are never used for headline claims.
+Support: every bin reports n_scenes, n_camera_pairs, and n_feature_comparisons. The support decision depends primarily on independent camera pairs and scene coverage, not raw comparison counts. Bins below the support threshold in the normative analysis config remain plotted, are greyed, show their n, and are never used for headline claims. Like bin edges, support thresholds may be set or adjusted from realized counts alone before the freeze commit, never from outcome values, and are then locked.
 
 Uncertainty: bootstrap resampling at the scene level as the primary interval, camera-pair level as the secondary. Never bootstrap individual points or patches.
 

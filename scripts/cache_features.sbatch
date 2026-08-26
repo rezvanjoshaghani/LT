@@ -46,6 +46,12 @@ fi
 
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+# PROTOCOL 3.1 keeps the single-frame shape test and the batch-equality test in
+# the suite permanently. They are gated on this variable because they need
+# weights and a GPU; nothing set it, so the only runs that could execute them
+# were the runs that skipped them. Set here so a cluster run is a run that
+# checks them.
+export LOT_ENCODER_SMOKE=1
 export TORCH_HOME="${TORCH_HOME:-$PWD/cache/torch}"
 export HF_HOME="${HF_HOME:-$PWD/cache/huggingface}"
 mkdir -p "$TORCH_HOME" "$HF_HOME"

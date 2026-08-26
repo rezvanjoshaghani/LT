@@ -228,6 +228,89 @@ def mean_margin(records: Sequence[dict[str, Any]]) -> float:
     return float(np.mean(values)) if values else float("nan")
 
 
+def cell_estimates(
+    records: Sequence[dict[str, Any]],
+    keys: Sequence[str],
+    statistic: Callable[[Sequence[dict[str, Any]]], float],
+) -> dict[tuple, float]:
+    """The whole table of point estimates in one pass."""
+    return {key: statistic(cell) for key, cell in group_by(records, keys).items()}
+
+
+def bootstrap_cells(
+    records: Sequence[dict[str, Any]],
+    keys: Sequence[str],
+    statistic: Callable[[Sequence[dict[str, Any]]], float],
+    config: AnalysisConfig,
+    unit: str = "scene",
+) -> dict[tuple, tuple[float, float]]:
+    """Resample whole units once per replicate and recompute the entire table.
+
+    The loop is cells inside replicates, not replicates inside cells. Resampling
+    the scene ids once and recomputing every cell from that one draw costs a
+    thousand passes over the records in total rather than a thousand per cell,
+    and it has a second property worth more than the speed: every cell in a
+    replicate sees the same scenes, so the replicates carry the cross-cell
+    correlation that simultaneous bands would need.
+
+    The replicate calls the same function that produced the point estimate. For
+    a mean that agrees with resampling precomputed per-unit values; it is
+    written this way because Phase 4's retained fractions and selection
+    differentials are ratio statistics, where resampling precomputed values is
+    wrong, and one mechanism that is right everywhere beats two kept in step.
+    """
+    if not records:
+        return {}
+    by_unit: dict[Any, list[dict[str, Any]]] = {}
+    for record in records:
+        by_unit.setdefault(record[unit], []).append(record)
+    units = sorted(by_unit, key=repr)
+    rng = np.random.default_rng(config.bootstrap_seed)
+    collected: dict[tuple, list[float]] = {}
+    for _ in range(config.bootstrap_resamples):
+        drawn = rng.integers(0, len(units), size=len(units))
+        sample: list[dict[str, Any]] = []
+        for position in drawn:
+            sample.extend(by_unit[units[position]])
+        for key, value in cell_estimates(sample, keys, statistic).items():
+            if math.isfinite(value):
+                collected.setdefault(key, []).append(value)
+    tail = (1.0 - config.bootstrap_confidence) / 2.0
+    return {
+        key: (float(np.quantile(values, tail)), float(np.quantile(values, 1.0 - tail)))
+        for key, values in collected.items()
+        if values
+    }
+
+
+def summaries_for(
+    records: Sequence[dict[str, Any]],
+    keys: Sequence[str],
+    config: AnalysisConfig,
+    statistic: Callable[[Sequence[dict[str, Any]]], float] = mean_margin,
+) -> dict[tuple, dict[str, Any]]:
+    """Point estimate, both intervals, and support for every cell, computed once."""
+    grouped = group_by(records, keys)
+    scene_ci = bootstrap_cells(records, keys, statistic, config, unit="scene")
+    pair_ci = bootstrap_cells(records, keys, statistic, config, unit="camera_pair")
+    nan = (float("nan"), float("nan"))
+    out: dict[tuple, dict[str, Any]] = {}
+    for key, cell in grouped.items():
+        counts = support_counts(cell)
+        low, high = scene_ci.get(key, nan)
+        pair_low, pair_high = pair_ci.get(key, nan)
+        out[key] = {
+            **counts,
+            "estimate": statistic(cell),
+            "ci_low": low,
+            "ci_high": high,
+            "pair_ci_low": pair_low,
+            "pair_ci_high": pair_high,
+            "supported": is_supported(counts, config),
+        }
+    return out
+
+
 def bootstrap_interval(
     records: Sequence[dict[str, Any]],
     statistic: Callable[[Sequence[dict[str, Any]]], float],
@@ -247,28 +330,8 @@ def bootstrap_interval(
     precomputed values is simply wrong, and one mechanism that is right
     everywhere beats two that must be kept in step.
     """
-    if not records:
-        return float("nan"), float("nan")
-    by_unit: dict[Any, list[dict[str, Any]]] = {}
-    for record in records:
-        by_unit.setdefault(record[unit], []).append(record)
-    keys = sorted(by_unit, key=repr)
-    rng = np.random.default_rng(config.bootstrap_seed)
-    replicates = np.empty(config.bootstrap_resamples, dtype=float)
-    for index in range(config.bootstrap_resamples):
-        drawn = rng.integers(0, len(keys), size=len(keys))
-        sample: list[dict[str, Any]] = []
-        for position in drawn:
-            sample.extend(by_unit[keys[position]])
-        replicates[index] = statistic(sample)
-    finite = replicates[np.isfinite(replicates)]
-    if finite.size == 0:
-        return float("nan"), float("nan")
-    tail = (1.0 - config.bootstrap_confidence) / 2.0
-    return (
-        float(np.quantile(finite, tail)),
-        float(np.quantile(finite, 1.0 - tail)),
-    )
+    intervals = bootstrap_cells(records, (), statistic, config, unit=unit)
+    return intervals.get((), (float("nan"), float("nan")))
 
 
 def cell_summary(
@@ -298,6 +361,24 @@ def group_by(
     for record in records:
         grouped.setdefault(tuple(record[k] for k in keys), []).append(record)
     return grouped
+
+
+def matched_orbit_minus_translation(records: Sequence[dict[str, Any]]) -> float:
+    """Orbit's margin minus translation's, within one parallax bin.
+
+    Figure D exists to ask whether rotation adds anything once parallax is
+    controlled, and the orbit band cannot answer that on its own: the circle
+    ties baseline to rotation, so orbit's low-rotation cells can be empty for
+    the same reason the band exists. Translation is the rotation-near-zero
+    reference at every parallax, so the comparison that carries the claim is
+    orbit against translation at matched parallax. Reading a colour gradient
+    along the band is suggestive; this is the test.
+    """
+    orbit = [r for r in records if r["regime"] == JOINT_REGIME]
+    translation = [r for r in records if r["regime"] == PRIMARY_REGIME["parallax_bin"]]
+    if not orbit or not translation:
+        return float("nan")
+    return mean_margin(orbit) - mean_margin(translation)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +486,12 @@ def figure_a_null_ladder(
     encoders = sorted({r["encoder"] for r in records})
     metrics = [RAW, CENTERED]
     figure, axes = plt.subplots(1, len(metrics), figsize=(6.0 * len(metrics), 4.6), squeeze=False)
+    ladder = summaries_for(
+        [r for r in records if r["path"] == PER_POINT],
+        ("metric", "encoder", "variant"),
+        config,
+        statistic=mean_value,
+    )
     for column, metric in enumerate(metrics):
         panel = axes[0][column]
         subset = [r for r in records if r["metric"] == metric and r["path"] == PER_POINT]
@@ -412,10 +499,9 @@ def figure_a_null_ladder(
         for offset, encoder in enumerate(encoders):
             xs, ys, low, high, counts = [], [], [], [], []
             for position, variant in enumerate(variants):
-                cell = [r for r in subset if r["encoder"] == encoder and r["variant"] == variant]
-                if not cell:
+                summary = ladder.get((metric, encoder, variant))
+                if summary is None:
                     continue
-                summary = cell_summary(cell, config, statistic=mean_value)
                 xs.append(position + (offset - (len(encoders) - 1) / 2) * 0.12)
                 ys.append(summary["estimate"])
                 low.append(max(0.0, summary["estimate"] - summary["ci_low"]))
@@ -474,6 +560,9 @@ def figure_ceiling_and_floor(
     edges = config.parallax_edges() if axis == "parallax_bin" else config.rotation_edges()
     order = [b for b in bin_order(edges) if any(r[axis] == b for r in subset)]
     metrics = [RAW, CENTERED]
+    cells = summaries_for(
+        subset, ("metric", "encoder", axis, "variant"), config, statistic=mean_value
+    )
 
     figure, axes = plt.subplots(
         len(metrics),
@@ -488,16 +577,14 @@ def figure_ceiling_and_floor(
             counts: list[int] = []
             series = {ORACLE_TRANSPORT: [], NO_WARP_COPY: []}
             bands = {ORACLE_TRANSPORT: ([], []), NO_WARP_COPY: ([], [])}
+            nan_summary = {
+                "estimate": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
+                "supported": False, "n_camera_pairs": 0,
+            }
             for position, label in enumerate(order):
-                pool = [
-                    r
-                    for r in subset
-                    if r[axis] == label and r["encoder"] == encoder and r["metric"] == metric
-                ]
                 supported = True
                 for variant in (ORACLE_TRANSPORT, NO_WARP_COPY):
-                    cell = [r for r in pool if r["variant"] == variant]
-                    summary = cell_summary(cell, config, statistic=mean_value)
+                    summary = cells.get((metric, encoder, label, variant), nan_summary)
                     series[variant].append(summary["estimate"])
                     bands[variant][0].append(summary["ci_low"])
                     bands[variant][1].append(summary["ci_high"])
@@ -572,37 +659,51 @@ def figure_d_orbit_joint(
         b for b in bin_order(config.parallax_edges()) if any(r["parallax_bin"] == b for r in subset)
     ]
 
+    cells = summaries_for(
+        subset, ("encoder", "rotation_bin", "parallax_bin"), config, statistic=mean_margin
+    )
     summaries: dict[tuple[str, int, int], dict[str, Any]] = {}
     grids: dict[str, np.ndarray] = {}
     for encoder in encoders:
         grid = np.full((len(rows), len(cols)), np.nan)
         for i, rot in enumerate(rows):
             for j, par in enumerate(cols):
-                cell = [
-                    r
-                    for r in subset
-                    if r["encoder"] == encoder
-                    and r["rotation_bin"] == rot
-                    and r["parallax_bin"] == par
-                ]
-                if not cell:
+                summary = cells.get((encoder, rot, par))
+                if summary is None:
                     continue
-                summary = cell_summary(cell, config)
                 summaries[(encoder, i, j)] = summary
                 grid[i, j] = summary["estimate"]
         grids[encoder] = grid
     pooled = np.concatenate([g[np.isfinite(g)] for g in grids.values()])
-    vmin, vmax = (float(pooled.min()), float(pooled.max())) if pooled.size else (0.0, 1.0)
+    # Diverging and centred on zero: the sign of the margin is the anchor. A
+    # sequential scale shared across encoders would spend its range on whichever
+    # encoder has the wider spread and bury the other's crossing of zero, which
+    # for a position-indexed representation is the whole story.
+    extent = float(np.max(np.abs(pooled))) if pooled.size else 1.0
+    vmin, vmax = -extent, extent
+
+    # The matched control: orbit minus translation at the same parallax.
+    joint = [
+        r
+        for r in records
+        if r["path"] == PER_POINT
+        and r["metric"] == metric
+        and r["variant"] == ORACLE_TRANSPORT
+        and r["regime"] in (JOINT_REGIME, PRIMARY_REGIME["parallax_bin"])
+    ]
+    matched = summaries_for(
+        joint, ("encoder", "parallax_bin"), config, statistic=matched_orbit_minus_translation
+    )
 
     figure, axes = plt.subplots(
-        1,
+        2,
         len(encoders),
-        figsize=(1.6 * max(len(cols), 3) * len(encoders) + 2, 1.15 * max(len(rows), 3) + 2.6),
+        figsize=(1.6 * max(len(cols), 3) * len(encoders) + 2, 2.1 * max(len(rows), 3) + 3.2),
         squeeze=False,
     )
     for column, encoder in enumerate(encoders):
         panel = axes[0][column]
-        image = panel.imshow(grids[encoder], cmap="viridis", vmin=vmin, vmax=vmax, aspect="auto")
+        image = panel.imshow(grids[encoder], cmap="RdBu_r", vmin=vmin, vmax=vmax, aspect="auto")
         for (owner, i, j), summary in summaries.items():
             if owner != encoder:
                 continue
@@ -637,9 +738,39 @@ def figure_d_orbit_joint(
             panel.set_ylabel("rotation bin", fontsize=9)
         panel.set_title(encoder, fontsize=9)
         figure.colorbar(image, ax=panel, fraction=0.046)
+
+        # Row two: the matched control the band cannot supply for itself.
+        control = axes[1][column]
+        present = [c for c in cols if (encoder, c) in matched]
+        xs = [cols.index(c) for c in present]
+        ys = [matched[(encoder, c)]["estimate"] for c in present]
+        low = [max(0.0, y - matched[(encoder, c)]["ci_low"]) for c, y in zip(present, ys)]
+        high = [max(0.0, matched[(encoder, c)]["ci_high"] - y) for c, y in zip(present, ys)]
+        unsupported = [
+            cols.index(c) for c in present if not matched[(encoder, c)]["supported"]
+        ]
+        _shade_unsupported(control, unsupported)
+        control.axhline(0.0, color="black", linewidth=1)
+        if xs:
+            control.errorbar(xs, ys, yerr=[low, high], fmt="-o", capsize=3, markersize=4)
+            _annotate_counts(
+                control,
+                xs,
+                [matched[(encoder, c)]["n_camera_pairs"] for c in present],
+                min(ys),
+            )
+        control.set_xticks(range(len(cols)))
+        control.set_xticklabels(cols, rotation=45, ha="right", fontsize=8)
+        control.set_xlabel("parallax bin", fontsize=9)
+        if column == 0:
+            control.set_ylabel("orbit margin minus translation margin", fontsize=8)
+        control.grid(alpha=0.3)
+        control.set_title("matched control: rotation's effect at equal parallax", fontsize=8)
     figure.suptitle(
         f"Figure D: orbit joint analysis, margin over No-Warp-Copy, {metric}. "
-        "Blank cell = combination the program cannot produce; hatched = below support.",
+        "Blank cell = combination the program cannot produce; hatched = below support. "
+        "Lower row is the matched comparison against translation, the rotation-near-zero "
+        "reference at each parallax.",
         fontsize=8,
     )
     figure.tight_layout()
@@ -660,10 +791,13 @@ def summary_table(
     for axis, regime in PRIMARY_REGIME.items():
         edges = config.parallax_edges() if axis == "parallax_bin" else config.rotation_edges()
         scoped = [r for r in records if r["regime"] == regime]
-        for key, cell in group_by(scoped, ("encoder", "metric", "path", axis, "variant")).items():
+        keys = ("encoder", "metric", "path", axis, "variant")
+        values = summaries_for(scoped, keys, config, statistic=mean_value)
+        margins = summaries_for(scoped, keys, config, statistic=mean_margin)
+        for key in values:
             encoder, metric, path, label, variant = key
-            summary = cell_summary(cell, config, statistic=mean_value)
-            margin = cell_summary(cell, config, statistic=mean_margin)
+            summary = values[key]
+            margin = margins[key]
             table.append(
                 {
                     "analysis": regime,
@@ -688,6 +822,47 @@ def summary_table(
                     "supported": summary["supported"],
                 }
             )
+    # The matched control for the orbit interaction claim, as table rows so it
+    # can be read without the figure.
+    joint = [
+        r
+        for r in records
+        if r["variant"] == ORACLE_TRANSPORT
+        and r["regime"] in (JOINT_REGIME, PRIMARY_REGIME["parallax_bin"])
+    ]
+    matched = summaries_for(
+        joint,
+        ("encoder", "metric", "path", "parallax_bin"),
+        config,
+        statistic=matched_orbit_minus_translation,
+    )
+    for (encoder, metric, path, label), summary in matched.items():
+        if not math.isfinite(summary["estimate"]):
+            continue
+        table.append(
+            {
+                "analysis": "orbit_minus_translation",
+                "axis": "parallax_bin",
+                "bin": label,
+                "bin_index": bin_order(config.parallax_edges()).index(label),
+                "encoder": encoder,
+                "metric": metric,
+                "path": path,
+                "variant": ORACLE_TRANSPORT,
+                "value": float("nan"),
+                "value_ci_low": float("nan"),
+                "value_ci_high": float("nan"),
+                "margin": summary["estimate"],
+                "margin_ci_low": summary["ci_low"],
+                "margin_ci_high": summary["ci_high"],
+                "margin_pair_ci_low": summary["pair_ci_low"],
+                "margin_pair_ci_high": summary["pair_ci_high"],
+                "n_scenes": summary["n_scenes"],
+                "n_camera_pairs": summary["n_camera_pairs"],
+                "n_feature_comparisons": summary["n_feature_comparisons"],
+                "supported": summary["supported"],
+            }
+        )
     table.sort(key=lambda r: (r["analysis"], r["encoder"], r["metric"], r["path"],
                               r["bin_index"], r["variant"]))
     return table

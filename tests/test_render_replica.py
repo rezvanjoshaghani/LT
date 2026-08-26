@@ -5,6 +5,7 @@ covered by test_habitat_render_smoke, which runs only where habitat_sim and
 the Replica dataset are available (the cluster).
 """
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -35,6 +36,7 @@ from lot.render_replica import (
     frame_is_usable,
     frame_stats_summary,
     load_frame_stats,
+    rotation_position_residuals,
     usable_frame_ids,
     write_frame_stats,
     intrinsics_from_hfov,
@@ -709,3 +711,47 @@ def test_usability_survives_the_json_round_trip(tmp_path):
     assert reloaded["frames"][manifest.frames[0].frame_id]["median_m"] is None
     assert len(usable_frame_ids(reloaded)) == len(manifest.frames) - 1
     assert frame_stats_summary(reloaded)["usable"] == len(manifest.frames) - 1
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.3: in-place rotation's zero translation, asserted from the manifest
+# ---------------------------------------------------------------------------
+
+def test_rotation_frames_sharing_a_position_pass(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    residuals = rotation_position_residuals(manifest)
+    assert residuals and max(residuals.values()) < 1e-9
+    diagnostics = validate_manifest(
+        manifest, root, check_files=True, rotation_position_bound_m=1e-6
+    )
+    assert diagnostics["rotation_position_residuals_m"] == residuals
+
+
+def test_a_shifted_rotation_frame_is_rejected(tmp_path):
+    """The regime's defining property is checked, not trusted.
+
+    Manifest poses are read back from the simulator rather than the planned
+    poses, so a drift can appear without anything else noticing. It matters
+    twice: a rotation pair whose spread exceeds the zero-parallax tolerance
+    silently leaves the zero bin, and PROTOCOL 4.5 makes exactly-zero
+    translation a hard invariant for the Phase 4 gate.
+    """
+    root, manifest = fake_scene_dir(tmp_path)
+    shifted = list(manifest.frames)
+    moved = shifted[1].T_world_from_camera.clone()
+    moved[0, 3] += 1e-3
+    shifted[1] = dataclasses.replace(shifted[1], T_world_from_camera=moved)
+    broken = dataclasses.replace(manifest, frames=shifted)
+
+    residuals = rotation_position_residuals(broken)
+    assert max(residuals.values()) > 1e-4
+    with pytest.raises(ValueError, match="do not share a camera position"):
+        validate_manifest(broken, root, check_files=False, rotation_position_bound_m=1e-6)
+    # Without the bound the assertion is skipped, for callers with no config.
+    validate_manifest(broken, root, check_files=False, rotation_position_bound_m=None)
+
+
+def test_the_bound_comes_from_the_analysis_config():
+    from lot.analysis_config import load_analysis_config
+
+    assert load_analysis_config().rotation_position_bound_m > 0

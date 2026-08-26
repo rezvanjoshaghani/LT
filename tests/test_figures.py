@@ -364,7 +364,7 @@ def test_summary_table_carries_support_and_intervals_on_every_row():
             "margin_ci_low", "margin_ci_high", "margin_pair_ci_low", "supported",
         ):
             assert key in row
-        assert row["analysis"] in ("translation", "rotation")
+        assert row["analysis"] in ("translation", "rotation", "orbit_minus_translation")
 
 
 def test_table_and_figures_regenerate_from_the_parquet_alone(tmp_path):

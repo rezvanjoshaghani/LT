@@ -219,12 +219,53 @@ nulls, the scoring, and the parquet.
 
 ```bash
 git fetch origin && git checkout repair/validation-streams-abc
+```
+
+## The caches must be rebuilt first
+
+CACHE_VERSION is 2. A cache written under 1 records no content digest and no
+weights fingerprint, so nothing downstream can tell whether it came from the
+weights this run believes it did, and `check` will reject it.
+
+The features themselves are unchanged: same weights, same code path. This is a
+provenance rebuild, not a new measurement. It exists because a fingerprint that
+is recorded and never compared documents a cache without validating it.
+
+A backfill would be cheaper and is deliberately not offered. Stamping the
+current weights' fingerprint onto archives produced at an unknown time asserts
+the provenance rather than recording it, which is the exact failure the check
+is for. Re-caching is about sixteen minutes of GPU per encoder at the measured
+5.4 frames per second, spread across an 18-task array.
+
+```bash
+mv cache/features cache/features_v1
+```
+
+```bash
+sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION"        --array 0-17 scripts/cache_features.sbatch configs/cache_features_all.yaml
+```
+
+```bash
+sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION"        --array 0-17 scripts/cache_features.sbatch configs/cache_features_vggt.yaml
+```
+
+These jobs hold the GPU, so they are where PROTOCOL 3.1's permanent encoder
+tests run. They also set TORCH_HOME and HF_HOME before loading anything, so the
+weights land in the project cache rather than the home directory.
+
+## Then the run
+
+```bash
 ./scripts/run_stream_d.sh check
 ```
 
-`check` prints the branch, confirms renders and features are present, and
-runs the whole suite with `LOT_ENCODER_SMOKE=1`, so the real-encoder tests
-run rather than skipping. Nothing is written.
+`check` prints the branch, confirms renders and features are present,
+re-reads every cached array to verify the content digest recorded when the
+cache was written, and runs the suite. Nothing is written.
+
+It does not set `LOT_ENCODER_SMOKE`. That flag ungates two tests that load real
+weights, and they fall back to CPU when CUDA is absent, so on a login node they
+would run VGGT-1B on the CPU. Those tests belong to the caching jobs above.
 
 The previous results cannot be mixed with these: the schema changed, and
 the numbers were produced under definitions since corrected. Move them

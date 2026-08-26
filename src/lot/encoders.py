@@ -341,7 +341,14 @@ class DinoV2Encoder(FrozenEncoder):
     HUB_REPO = "facebookresearch/dinov2"
 
     def _load(self) -> Any:
-        return torch.hub.load(self.HUB_REPO, self.spec.source, trust_repo=True)
+        # LOT_DINOV2_REVISION pins the Torch Hub ref. A fingerprint tells you the
+        # weights changed; only a pinned ref lets you get the old ones back, and
+        # a rebuild after an upstream update would otherwise leave every scene
+        # agreeing on a checkpoint that is not the preregistered one.
+        revision = os.environ.get("LOT_DINOV2_REVISION")
+        repo = f"{self.HUB_REPO}:{revision}" if revision else self.HUB_REPO
+        self.revision = revision or "unpinned"
+        return torch.hub.load(repo, self.spec.source, trust_repo=True)
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
         x = preprocess_images(images_uint8, self.spec, self.device)
@@ -385,6 +392,11 @@ class VggtEncoder(FrozenEncoder):
                 "on a machine with the weights cached. Every other part of this "
                 "module works without it."
             ) from e
+        # LOT_VGGT_REVISION pins the Hugging Face revision, for the same reason.
+        revision = os.environ.get("LOT_VGGT_REVISION")
+        self.revision = revision or "unpinned"
+        if revision:
+            return VGGT.from_pretrained(self.spec.source, revision=revision)
         return VGGT.from_pretrained(self.spec.source)
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
@@ -577,7 +589,9 @@ def cache_scene_features(
         "device": str(encoder.device),
         "source": encoder.spec.source,
         "weights_fingerprint": encoder.fingerprint,
+        "weights_revision": getattr(encoder, "revision", "unpinned"),
         "features_digest": features_digest(features),
+        "depth_digest": features_digest(depths) if export_depth else None,
         "encode_seconds": round(encode_seconds, 3),
         "total_seconds": round(total_seconds, 3),
         "frames_per_second": round(len(manifest.frames) / max(total_seconds, 1e-9), 3),
@@ -662,9 +676,10 @@ def validate_feature_cache(
     without validating it, and a cache from a silently updated checkpoint would
     still be accepted.
 
-    check_digest re-reads every array and recomputes the content hash. It is off
-    by default because it costs a full pass over the cache, and on for the
-    validation entrypoint, whose job is exactly that pass.
+    check_digest re-reads every array, features and depth alike, and recomputes
+    both content hashes. It is off by default because it costs a full pass over
+    the cache, and on for the validation entrypoint, whose job is exactly that
+    pass.
     """
     meta = load_cache_meta(cache_root, encoder_name, manifest.scene)
     if meta["encoder"] != encoder_name or meta["scene"] != manifest.scene:
@@ -706,16 +721,49 @@ def validate_feature_cache(
                 "was written. The archive has been rebuilt or modified in place"
             )
     if meta["has_depth"]:
+        # Depth and confidence are hashed too. Frame presence and shape do not
+        # protect content: every value in a depth archive can change while the
+        # keys and shapes stay right. That is inert for Experiment Zero, whose
+        # geometry is ground truth, and it is a Phase 4 blocker, because VGGT
+        # depth and its confidence become scientific inputs there.
+        if not meta.get("depth_digest"):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache declares depth and "
+                "records no depth_digest. Re-cache this scene"
+            )
         depth_path = cache_dir(cache_root, encoder_name, manifest.scene) / DEPTH_NAME
         image_hw = tuple(int(v) for v in meta["image_hw"])
         with np.load(depth_path) as archive:
-            for frame_id in manifest_ids:
-                if frame_id not in archive:
-                    raise ValueError(f"{frame_id}: missing from {depth_path}")
-                if archive[frame_id].shape != image_hw:
-                    raise ValueError(
-                        f"{frame_id}: depth {archive[frame_id].shape}, expected {image_hw}"
-                    )
+            stored_depth = {name: archive[name] for name in archive.files}
+        for frame_id in manifest_ids:
+            if frame_id not in stored_depth:
+                raise ValueError(f"{frame_id}: missing from {depth_path}")
+            if stored_depth[frame_id].shape != image_hw:
+                raise ValueError(
+                    f"{frame_id}: depth {stored_depth[frame_id].shape}, expected {image_hw}"
+                )
+            if stored_depth[frame_id].dtype != np.float16:
+                raise ValueError(
+                    f"{frame_id}: depth dtype {stored_depth[frame_id].dtype}, expected float16"
+                )
+            # Confidence rides in the same archive under a suffixed key. It gates
+            # which depths Phase 4 trusts, so an unchecked confidence map is an
+            # unchecked depth map by another route.
+            conf_key = f"{frame_id}__conf"
+            if conf_key in stored_depth:
+                conf = stored_depth[conf_key]
+                if conf.shape != image_hw:
+                    raise ValueError(f"{conf_key}: confidence {conf.shape}, expected {image_hw}")
+                if conf.dtype != np.float16:
+                    raise ValueError(f"{conf_key}: confidence dtype {conf.dtype}, expected float16")
+        if check_digest:
+            found = features_digest(stored_depth)
+            if found != meta["depth_digest"]:
+                raise ValueError(
+                    f"{encoder_name} / {manifest.scene}: depth digest {found} does "
+                    f"not match the {meta['depth_digest']} recorded when the cache "
+                    "was written. The archive has been rebuilt or modified in place"
+                )
     return meta
 
 

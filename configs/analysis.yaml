@@ -71,8 +71,11 @@ rotation_position_bound_m: 1.0e-6
 
 # The mirror of rotation_position_bound_m, on the other regime's other axis.
 # Translation frames share one orientation by construction, so this is a
-# read-back tolerance on the stored pose, not a design allowance.
-translation_rotation_bound_deg: 1.0e-4
+# read-back tolerance on the stored pose, not a design allowance. It sits an
+# order of magnitude below zero_rotation_tol_deg, and a load-time assertion
+# holds it there: a translation pair at this bound must still land in the
+# zero-rotation bin that PROTOCOL 3.3 puts its whole regime in.
+translation_rotation_bound_deg: 1.0e-7
 
 # --- PROTOCOL 4.x, reserved for Phase 4 ------------------------------------
 # Declared now because PROTOCOL 3.4 requires the config be committed before any

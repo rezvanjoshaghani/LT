@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from lot.analysis_config import load_analysis_config
-from lot.correspondence import NEIGHBOR_OFFSETS
+from lot.correspondence import NEIGHBOR_OFFSETS, choose_in_bounds_offset
 from lot.evaluate import (
     MEAN_FEATURE,
     NEIGHBOR_PATCH,
@@ -548,3 +548,49 @@ def test_the_mean_vector_is_written_atomically_and_checked_on_reuse(tmp_path):
     write_cache("room_0", 9.0)
     with pytest.raises(ValueError, match="built for"):
         load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
+
+
+def test_both_paths_choose_the_same_neighbour_direction_under_translation():
+    """The identity-geometry test could not see this, and it is the whole point.
+
+    The two paths ask different questions about whether an offset is usable. The
+    per-point path reads one location and asks whether it stays inside the
+    context sampling box. The splat path shifts a cell's whole transport support
+    and asks whether any of it leaves the grid. Under identity transport the two
+    answers coincide, so the original equality test passed while the property it
+    named was false in general.
+
+    Under a lateral translation they come apart: a cell whose support touches the
+    border while its center does not is admissible for one path and not the
+    other. The hash then ranks a different number of options and lands on a
+    different direction, so the supposedly identical null is two different nulls.
+    """
+    from lot.correspondence import _target_cell_index, sample_correspondences
+    from lot.evaluate import splat_neighbor_option_ok
+
+    depth = torch.full((SIDE, SIDE), 3.0, dtype=torch.float32)
+    K = intrinsics_from_hfov(SIDE, SIDE, 90.0).to(torch.float32)
+    T = torch.eye(4, dtype=torch.float32)
+    T[0, 3] = 0.05
+    geometry = pair_geometry(depth, depth, K, K, T, *IDENTITY, ANALYSIS)
+
+    shared = splat_neighbor_option_ok(geometry.plan, (SMALL_GRID, SMALL_GRID))
+    _, _, splat_direction = splat_neighbor_prediction(
+        geometry, torch.rand((4, SMALL_GRID, SMALL_GRID))
+    )
+
+    cells = _target_cell_index(geometry.samples.uv_target, (SIDE, SIDE), 14)
+    per_point_direction = choose_in_bounds_offset(geometry.samples.sample_id, shared[cells])
+    assert cells.size > 0
+    assert np.array_equal(per_point_direction, splat_direction[cells])
+
+    # And the two rules really do disagree here, so the test is not vacuous.
+    from lot.correspondence import _in_box, _sampling_box
+
+    box = _sampling_box((SIDE, SIDE), 14)
+    offsets = torch.tensor(
+        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]], dtype=torch.float32
+    ) * 14
+    warp = geometry.samples.uv_context_warp
+    point_rule = _in_box(warp[:, None, :] + offsets[None, :, :], box).cpu().numpy()
+    assert not np.array_equal(point_rule, shared[cells])

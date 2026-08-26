@@ -790,9 +790,9 @@ def test_translation_frames_must_share_one_orientation(tmp_path):
         metadata={"depth_convention": {"raw_verdict": "planar_z", "stored_depth": "planar_z"}},
         frames=records,
     )
-    assert max(translation_rotation_residuals(manifest).values()) < 1e-9
+    assert max(translation_rotation_residuals(manifest).values()) == 0.0
     validate_manifest(
-        manifest, tmp_path, check_files=False, translation_rotation_bound_deg=1e-4
+        manifest, tmp_path, check_files=False, translation_rotation_bound_deg=1e-7
     )
 
     # Two degrees of yaw about the camera's own vertical axis, which is what a
@@ -807,8 +807,49 @@ def test_translation_frames_must_share_one_orientation(tmp_path):
         records[-1], T_world_from_camera=records[-1].T_world_from_camera @ yaw
     )
     drifted = dataclasses.replace(manifest, frames=records)
-    assert max(translation_rotation_residuals(drifted).values()) == pytest.approx(2.0, abs=1e-6)
+    assert max(translation_rotation_residuals(drifted).values()) == pytest.approx(2.0, abs=1e-9)
     with pytest.raises(ValueError, match="do not share one orientation"):
         validate_manifest(
-            drifted, tmp_path, check_files=False, translation_rotation_bound_deg=1e-4
+            drifted, tmp_path, check_files=False, translation_rotation_bound_deg=1e-7
         )
+
+
+def test_translation_residual_is_over_every_pair_not_against_the_first_frame():
+    """A reference frame hides a spread the population really has.
+
+    Orientations at 0, +9e-5 and -9e-5 degrees are each within 9e-5 of the
+    first, so a bound of 1e-4 passes. The worst actual pair is 1.8e-4 and fails
+    it, and the pair is what becomes a camera pair downstream.
+    """
+    from lot.render_replica import translation_rotation_residuals
+
+    K = intrinsics_from_hfov(28, 28, 90.0)
+    records = []
+    for index, offset_deg in enumerate((0.0, 9e-5, -9e-5)):
+        a = math.radians(offset_deg)
+        yaw = torch.eye(4, dtype=torch.float64)
+        yaw[:3, :3] = torch.tensor(
+            [[math.cos(a), 0.0, math.sin(a)], [0.0, 1.0, 0.0], [-math.sin(a), 0.0, math.cos(a)]],
+            dtype=torch.float64,
+        )
+        records.append(
+            FrameRecord(
+                frame_id=f"room_0_vp00_translation_{index:03d}",
+                scene="room_0",
+                regime="translation",
+                params={"viewpoint": 0},
+                T_world_from_camera=base_pose() @ yaw,
+                K=K,
+                height=28,
+                width=28,
+                rgb_path=f"rgb/{index}.png",
+                depth_path=f"depth/{index}.npy",
+            )
+        )
+    manifest = Manifest(
+        scene="room_0",
+        metadata={"depth_convention": {"raw_verdict": "planar_z", "stored_depth": "planar_z"}},
+        frames=records,
+    )
+    worst = max(translation_rotation_residuals(manifest).values())
+    assert worst == pytest.approx(1.8e-4, rel=1e-6)

@@ -77,8 +77,22 @@ def make_row(**overrides):
     return row
 
 
-def comparison(scores, **overrides):
-    return [make_row(variant=v, cosine_mean=c, **overrides) for v, c in scores.items()]
+# Default scores for the variants a test does not name. PROTOCOL 3.7 gives every
+# variant of a path the same records, so a comparison carries all five; a fixture
+# that built three was modelling something the protocol forbids.
+DEFAULT_SCORES = {
+    RANDOM_PATCH: 0.05,
+    MEAN_FEATURE: 0.20,
+    NO_WARP_COPY: 0.50,
+    NEIGHBOR_PATCH: 0.70,
+    ORACLE_TRANSPORT: 0.90,
+}
+
+
+def comparison(scores, complete=True, **overrides):
+    """One comparison's rows. Pass complete=False to build a partial one on purpose."""
+    full = {**DEFAULT_SCORES, **scores} if complete else dict(scores)
+    return [make_row(variant=v, cosine_mean=c, **overrides) for v, c in full.items()]
 
 
 def run_meta(scene, run_scenes=None):
@@ -342,8 +356,10 @@ def full_records():
         rows += population(
             scenes=4, pairs=12, regime="orbit", parallax=parallax, rotation=rotation
         )
-    rows += [make_row(variant=RANDOM_PATCH, cosine_mean=0.1, scene=f"scene_{i}") for i in range(4)]
-    rows += [make_row(variant=NEIGHBOR_PATCH, cosine_mean=0.7, scene=f"scene_{i}") for i in range(4)]
+    # The two extra null rows that used to sit here are gone: population() now
+    # emits all five variants, so appending bare Random-Patch and Neighbor-Patch
+    # rows on the default frame ids built an incomplete comparison, which is what
+    # PROTOCOL 3.7 forbids and what paired_records now refuses.
     records = []
     for metric in (RAW, CENTERED):
         part, _ = paired_records(assign_bins(rows, ANALYSIS), metric=metric)
@@ -426,12 +442,21 @@ def test_read_eval_dir_refuses_a_mixed_directory(tmp_path):
         read_eval_dir(eval_dir)
 
 
-def test_read_eval_dir_refuses_a_parquet_with_no_sidecar(tmp_path):
+def test_the_parquet_alone_is_enough(tmp_path):
+    """CLAUDE.md: every figure regenerable from outputs/eval/*.parquet alone.
+
+    The provenance the analysis refuses to run without is carried inside the
+    parquet, so deleting the sidecars leaves intact results analysable. A run
+    record that lived only in a companion file would have made those files a
+    second required artifact set that nothing declared.
+    """
     eval_dir = tmp_path / "eval"
     write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0"))
     (eval_dir / "room_0.meta.json").unlink()
-    with pytest.raises(FileNotFoundError, match="no room_0.meta.json"):
-        read_eval_dir(eval_dir)
+    rows = read_eval_dir(eval_dir)
+    assert rows
+    records, _ = paired_records(assign_bins(rows, ANALYSIS))
+    assert summary_table(records, ANALYSIS)
 
 
 def test_read_eval_dir_refuses_an_older_eval_version(tmp_path):
@@ -569,22 +594,27 @@ def test_paired_records_refuses_a_repeated_comparison_and_variant():
         paired_records(assign_bins(rows, ANALYSIS))
 
 
-def test_omission_count_comes_from_the_sidecars_not_the_duplicated_column(tmp_path):
-    """The row column repeats a pair-level number into every encoder and path.
+def test_omission_count_deduplicates_the_pair_level_column(tmp_path):
+    """The column repeats a pair-level number into every row of that pair.
 
-    Summing it over-counts by their product, and the divisor it was corrected
-    by, the number of metrics, has no relation to that duplication: rows are
-    wide in metric and long in encoder and path.
+    Summing it over-counts by the number of encoders, paths, and variants, and
+    the divisor it was once corrected by, the number of metrics, has no relation
+    to that duplication. Deduplicating by pair recovers the quantity, from the
+    parquet rather than a sidecar.
     """
     from lot.figures import neighbor_omitted_total
 
-    eval_dir = tmp_path / "eval"
-    scenes = ["room_0", "room_1"]
-    for scene, omitted in zip(scenes, (7, 5)):
-        meta = run_meta(scene, scenes)
-        meta["neighbor_patch_omitted_records"] = omitted
-        write_rows(eval_dir / f"{scene}.parquet", population(scenes=1, pairs=4), meta)
-    assert neighbor_omitted_total(eval_dir) == 12
+    rows = []
+    for index, omitted in enumerate((7, 5)):
+        rows += comparison(
+            {},
+            context_frame_id=f"c{index}",
+            target_frame_id=f"t{index}",
+            neighbor_omitted=omitted,
+        )
+    # Five variants per pair, so the naive sum would be 60.
+    assert sum(r["neighbor_omitted"] for r in rows) == 60
+    assert neighbor_omitted_total(rows) == 12
 
 
 def test_absolute_scores_carry_the_camera_pair_interval_too():
@@ -600,3 +630,46 @@ def test_absolute_scores_carry_the_camera_pair_interval_too():
         for column in ("value_pair_ci_low", "value_pair_ci_high",
                        "margin_pair_ci_low", "margin_pair_ci_high"):
             assert column in row
+
+
+def test_a_comparison_missing_a_variant_is_refused_not_skipped():
+    """A failed method must not shrink the population invisibly.
+
+    Skipping an incomplete comparison takes its pair out of every aggregate and
+    leaves a table that reads as if the pair had never been sampled. If a method
+    failed on the hardest pairs, that is precisely the population the skip
+    removes.
+    """
+    rows = comparison({ORACLE_TRANSPORT: 0.9}, complete=False)
+    rows += comparison({NO_WARP_COPY: 0.5}, complete=False)
+    with pytest.raises(ValueError, match="do not carry all 5 variants"):
+        paired_records(assign_bins(rows, ANALYSIS))
+
+    # And an Oracle row with no floor at all produced nothing and said nothing.
+    orphan = comparison({ORACLE_TRANSPORT: 0.9, MEAN_FEATURE: 0.2}, complete=False)
+    with pytest.raises(ValueError, match="missing"):
+        paired_records(assign_bins(orphan, ANALYSIS))
+
+
+def test_nonfinite_is_permitted_only_for_centered_mean_feature():
+    """PROTOCOL 3.7 permits it there and nowhere else.
+
+    Mean-Feature has no centered value by construction: the vector subtracted is
+    the prediction itself, so the centered prediction is the zero vector and its
+    cosine is undefined. A nonfinite anywhere else is a failed method, and
+    dropping it silently biases the cell it was in.
+    """
+    ok = [
+        make_row(
+            variant=variant,
+            cosine_mean=score,
+            cosine_centered_mean=float("nan") if variant == MEAN_FEATURE else score - 0.1,
+        )
+        for variant, score in DEFAULT_SCORES.items()
+    ]
+    records, _ = paired_records(assign_bins(ok, ANALYSIS), metric=CENTERED)
+    assert {r["variant"] for r in records} == set(DEFAULT_SCORES) - {MEAN_FEATURE}
+
+    bad = comparison({ORACLE_TRANSPORT: float("nan")})
+    with pytest.raises(ValueError, match="nonfinite"):
+        paired_records(assign_bins(bad, ANALYSIS))

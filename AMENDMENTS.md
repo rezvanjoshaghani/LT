@@ -82,7 +82,7 @@ still sees, so within a bin the weight rises with the easier geometry.
 Consequence: the corrected Phase 3 figures will not match the numbers in the
 completed run, for this reason as well as the definitional corrections.
 
-### 2026-08-26: translation_rotation_bound_deg added, 1.0e-4
+### 2026-08-26: translation_rotation_bound_deg added, then set to 1.0e-7
 
 The mirror of rotation_position_bound_m on the other regime's other axis.
 PROTOCOL 3.3 makes translation the sole source of the primary parallax curve
@@ -94,6 +94,19 @@ onto the curve.
 
 Translation frames share one orientation by construction, so this is a
 read-back tolerance on the stored pose, not a design allowance.
+
+Set at 1.0e-4 first, which was inconsistent with zero_rotation_tol_deg at
+1.0e-6: a translation pair at the manifest bound would have passed validation
+and then been binned outside the zero-rotation bin its own regime defines. A
+load-time assertion now holds the bound at or below the tolerance, and the
+value is 1.0e-7. The measured pairwise residual over the camera programs is
+exactly zero, since the translation program copies the rotation block
+unchanged.
+
+The residual is measured over every unordered pair, not against the first
+frame. Orientations at 0, +9e-5 and -9e-5 degrees are each within 9e-5 of the
+first while the worst actual pair is 1.8e-4, and the pair is what becomes a
+camera pair downstream.
 
 ### 2026-08-26: PROTOCOL 3.9's gated statistic is the mean per-pair absolute difference
 
@@ -119,6 +132,27 @@ path's pooled output is a weighted mean over a cell and the per-point path's is
 a single sample. A gate reading only the raw column would certify a centered
 table it never looked at, and the centered metric is the one the VGGT reading
 rests on.
+
+### 2026-08-26: rotation_angle_deg is computed from the skew term, not the trace alone
+
+Not a config change, and it moves reported numbers, so it is recorded here.
+
+The angle was acos of (trace - 1) / 2. That is correct mathematics and poor
+arithmetic near identity, where the cosine is 1 minus something of order theta
+squared: float64 rounding of the trace puts a floor of about 8.5e-7 degrees on
+what the formula can resolve. zero_rotation_tol_deg is 1.0e-6, so the boundary
+of the zero-rotation bin sat below the noise of the quantity being binned, and
+the bin was a statement about arithmetic rather than about the camera.
+
+It is now atan2 of the skew magnitude against the trace term. The two agree
+mathematically. The skew term is linear in theta near zero, so small angles
+resolve to full precision, and atan2 stays stable near 180 degrees where the
+cosine is flat again. Measured relative error is at most 2.4e-16 from 1e-9
+degrees to 180.
+
+Consequence: rotation_deg changes by at most a part in 1e15 for the angles the
+programs actually produce, and changes materially only for angles at or below
+the old noise floor, which is exactly the population the zero bin is about.
 
 ---
 

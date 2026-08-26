@@ -71,15 +71,22 @@ check)
     run_lot python -m pytest tests/ -q
     ;;
 evaluate)
+    # An existing directory is either this run's, interrupted, or an older run's.
+    # The two need opposite treatment and only the evaluator can tell them apart:
+    # it compares each parquet's stored run record against this run's config and
+    # refuses a mismatch, so --resume continues an interruption and stops on a
+    # mixed directory. Refusing here on existence alone made the documented
+    # wrapper unable to resume the run it was invoking with --resume.
     if [ -d "$EVAL_DIR" ]; then
-        echo "$EVAL_DIR exists. The schema changed, so the previous run cannot be" >&2
-        echo "mixed with this one. Move it aside first, for example:" >&2
-        echo "  mv $RUN_DIR ${RUN_DIR}_precorrection" >&2
-        exit 1
+        echo "$EVAL_DIR exists. Finished scenes will be skipped and their run"
+        echo "records checked against this run. If these results predate the"
+        echo "repair, move them aside instead:"
+        echo "  mv $RUN_DIR ${RUN_DIR}_precorrection"
+        echo
     fi
     run_lot python -m lot.evaluate --config "$CONFIG" --resume
     echo
-    echo "Per-scene run metadata is beside each parquet as <scene>.meta.json."
+    echo "Per-scene run metadata is inside each parquet and beside it as <scene>.meta.json."
     ;;
 counts)
     run_lot python -m lot.figures --eval-dir "$EVAL_DIR" --counts-only

@@ -103,6 +103,8 @@ _READ_NAMES = {
     "random": RANDOM_PATCH,
 }
 
+RUN_METADATA_KEY = b"lot_run_metadata"
+
 EVAL_VERSION = 3
 # 3: the validation repair. Sample identity is a full-width digest, so every
 #    hash-derived null draws differently; Random-Patch returns an index rather
@@ -175,7 +177,7 @@ def agreement_metrics(
 
 def dataset_mean_vector(
     cache_root: Path, encoder: str, scenes: Sequence[str]
-) -> tuple[Tensor, str]:
+) -> Tensor:
     """One global D-vector per encoder, over all frames and all positions.
 
     PROTOCOL 3.6 freezes Mean-Feature as exactly this object, and PROTOCOL 3.7
@@ -352,6 +354,7 @@ class PairGeometry:
     universe_ids: np.ndarray
     per_point_mask: np.ndarray      # [Hp * Wp] bool, cells scored per-point
     per_point_cells: np.ndarray     # [N] universe cell of each per-point sample
+    neighbor_option_ok: np.ndarray  # [cells, 4] offsets both paths admit
     splat_mask: np.ndarray          # [Hp * Wp] bool, cells scored splat-and-pool
     random_patch: np.ndarray        # [Hp * Wp] int, hashed source patch per cell
     coverage_mean: float
@@ -425,6 +428,20 @@ def pair_geometry(
     baseline = float(torch.linalg.vector_norm(T_target_from_context[:3, 3]))
     parallax = pair_parallax(baseline, depth_target, masks.covisible)
 
+    # The plan comes first because the sampler needs it. Neighbor-Patch's
+    # direction is hashed from the sample_id among the offsets both paths admit,
+    # and the splat path's half of that rule is a property of the plan.
+    plan = transport_plan(
+        depth_context,
+        K_context,
+        K_target,
+        T_target_from_context,
+        tuple(depth_target.shape),
+        patch_size,
+    )
+    context_grid = patch_grid_shape(tuple(depth_context.shape), patch_size)
+    neighbor_option_ok = splat_neighbor_option_ok(plan, context_grid)
+
     samples = sample_correspondences(
         depth_target,
         K_target,
@@ -439,14 +456,7 @@ def pair_geometry(
         patch_size=patch_size,
         mode=sample_mode,
         depth_consistency_tol=config.covisible_relative_depth_tol,
-    )
-    plan = transport_plan(
-        depth_context,
-        K_context,
-        K_target,
-        T_target_from_context,
-        tuple(depth_target.shape),
-        patch_size,
+        cell_option_ok=neighbor_option_ok,
     )
     grid = patch_grid_shape(tuple(depth_target.shape), patch_size)
     patches_h, patches_w = grid
@@ -480,6 +490,7 @@ def pair_geometry(
         per_point_mask=per_point_mask,
         per_point_cells=per_point_cells,
         splat_mask=splat_mask,
+        neighbor_option_ok=neighbor_option_ok,
         random_patch=derived_draw(ids, RANDOM_PATCH_SALT, size),
         coverage_mean=float(coverage.mean()) if coverage.numel() else float("nan"),
     )
@@ -548,6 +559,28 @@ def _shifted_source(features: Tensor, offset: tuple[int, int]) -> tuple[Tensor, 
     return shifted.reshape(channels, -1), valid.reshape(-1)
 
 
+def splat_neighbor_option_ok(plan: Any, grid: tuple[int, int]) -> np.ndarray:
+    """Which Neighbor-Patch offsets leave a cell's whole transport support in bounds.
+
+    [cells, 4] bool, row-major over the target patch grid, ordered as
+    NEIGHBOR_OFFSETS. A cell is admissible for an offset when no weight of its
+    support falls off the context grid once shifted.
+
+    Computed from the plan alone, so the per-point sampler can intersect it with
+    its own rule before it hashes a direction, and the splat path can apply it
+    without recomputing. One rule, one place.
+    """
+    weights = plan.weights
+    cells_total = weights.shape[0]
+    dummy = torch.zeros((1, grid[0], grid[1]), dtype=weights.dtype, device=weights.device)
+    option_ok = np.zeros((cells_total, len(NEIGHBOR_OFFSETS)), dtype=bool)
+    for index, offset in enumerate(NEIGHBOR_OFFSETS):
+        _, valid = _shifted_source(dummy, offset)
+        leaked = (weights * (~valid).to(weights.dtype)[None, :]).sum(dim=1)
+        option_ok[:, index] = (leaked <= 0).cpu().numpy()
+    return option_ok
+
+
 def splat_neighbor_prediction(
     geometry: PairGeometry, features_context: Tensor
 ) -> tuple[Tensor, np.ndarray, np.ndarray]:
@@ -558,11 +591,16 @@ def splat_neighbor_prediction(
     correspondence is the plan, so the same weights are applied to sources
     displaced by one patch in the record's own direction.
 
-    The direction is chosen by the same rule the per-point sampler uses, from
-    the same sample_id, among the offsets that leave the cell's whole support in
-    bounds. Hashing among all four instead and dropping the ones that leak would
-    give a border record one direction here and another there, which would make
-    the variant incomparable across paths while looking correct in isolation.
+    The direction is chosen from the same sample_id as the per-point path, among
+    the same admissible set. That set is the intersection of the two paths'
+    rules, computed once per pair in build_pair_geometry, because the rules ask
+    different questions: this path shifts a cell's whole transport support and
+    asks whether any of it leaves the grid, while the per-point path reads one
+    location and asks whether that location stays inside the sampling box. Under
+    translation the answers differ for cells whose support touches the border
+    while their center does not, and the hash then ranks a different number of
+    options and lands on a different direction, which makes the variant two
+    different nulls wearing one name.
 
     Every cell keeps its record. PROTOCOL 3.6's omission clause covers only the
     case where no offset is in bounds at all, which cannot arise on a patch grid
@@ -578,17 +616,11 @@ def splat_neighbor_prediction(
     """
     weights = geometry.plan.weights
     channels = features_context.shape[0]
-    cells_total = weights.shape[0]
     features = features_context.to(device=weights.device, dtype=torch.float32)
 
-    shifted_maps = []
-    option_ok = np.zeros((cells_total, len(NEIGHBOR_OFFSETS)), dtype=bool)
-    for index, offset in enumerate(NEIGHBOR_OFFSETS):
-        shifted, valid = _shifted_source(features, offset)
-        shifted_maps.append(shifted)
-        leaked = (weights * (~valid).to(weights.dtype)[None, :]).sum(dim=1)
-        option_ok[:, index] = (leaked <= 0).cpu().numpy()
-
+    shifted_maps = [_shifted_source(features, offset)[0] for offset in NEIGHBOR_OFFSETS]
+    cells_total = weights.shape[0]
+    option_ok = geometry.neighbor_option_ok
     defined = option_ok.any(axis=1)
     stranded = int((~defined).sum())
     if stranded:
@@ -941,6 +973,25 @@ def evaluate_scene(
         "run_scenes": sorted(cfg.scenes),
         "git_commit": git_commit(),
         "seed": cfg.seed,
+        # The whole normative config, by content, not the handful of values that
+        # happened to be interesting. Naming a path binds nothing, and listing
+        # fields binds only the ones someone remembered: covisible tolerance,
+        # min_covisible_fraction, points_per_pair and the manifest bounds all
+        # change what was measured and none of them were recorded. Two runs at
+        # one commit with different uncommitted configs were one run.
+        "analysis_config_digest": analysis.digest(),
+        "analysis_config_values": analysis.as_dict(),
+        # And the exact caches this scene was evaluated from, so a scene outside
+        # the mean vector's training split is bound too.
+        "cache_provenance": {
+            encoder: {
+                "features_digest": load_cache_meta(cfg.cache_root, encoder, scene)["features_digest"],
+                "weights_fingerprint": load_cache_meta(cfg.cache_root, encoder, scene)[
+                    "weights_fingerprint"
+                ],
+            }
+            for encoder in cfg.encoders
+        },
         "max_pairs_per_stratum": analysis.max_pairs_per_stratum,
         # Why realized bin populations differ from the design targets. Strata are
         # formed on a whole-frame parallax proxy, because PROTOCOL 3.2's
@@ -988,6 +1039,24 @@ def git_commit() -> str:
         return "unknown"
 
 
+def read_run_metadata(path: Path) -> dict[str, Any] | None:
+    """A parquet's run record, from inside it, or from the sidecar beside it.
+
+    Returns None when neither carries one, which is how a file from before the
+    record existed is told apart from one that belongs to this run.
+    """
+    import pyarrow.parquet as pq
+
+    path = Path(path)
+    raw = (pq.read_schema(path).metadata or {}).get(RUN_METADATA_KEY)
+    if raw is not None:
+        return json.loads(raw.decode("utf-8"))
+    sidecar = path.with_suffix(".meta.json")
+    if sidecar.exists():
+        return json.loads(sidecar.read_text(encoding="utf-8"))
+    return None
+
+
 def write_rows(path: Path, rows: Sequence[dict[str, Any]], metadata: dict[str, Any]) -> None:
     """Write evaluation rows to parquet beside their run metadata. Never overwrites."""
     import pyarrow as pa
@@ -1002,7 +1071,17 @@ def write_rows(path: Path, rows: Sequence[dict[str, Any]], metadata: dict[str, A
         raise ValueError("no rows to write")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".partial")
-    pq.write_table(pa.Table.from_pylist(list(rows)), tmp)
+    # The run record goes inside the parquet as well as beside it. CLAUDE.md
+    # requires every figure be regenerable from outputs/eval/*.parquet alone, so
+    # provenance the analysis refuses to run without cannot live only in a
+    # companion file: losing the sidecars would make intact results
+    # unanalysable, and the parquet would no longer be self-describing. The
+    # sidecar stays because it is readable without pyarrow.
+    table = pa.Table.from_pylist(list(rows))
+    table = table.replace_schema_metadata(
+        {**(table.schema.metadata or {}), RUN_METADATA_KEY: json.dumps(metadata).encode("utf-8")}
+    )
+    pq.write_table(table, tmp)
     tmp.replace(path)
     path.with_suffix(".meta.json").write_text(
         json.dumps(metadata, indent=1), encoding="utf-8"
@@ -1075,13 +1154,12 @@ def main(argv: list[str] | None = None) -> None:
             # version, a different seed, or a directory reused across runs, and
             # skipping it on the strength of its filename silently adopts it
             # into this run's population.
-            meta_path = path.with_suffix(".meta.json")
-            if not meta_path.exists():
+            stored = read_run_metadata(path)
+            if stored is None:
                 raise SystemExit(
-                    f"{path} exists with no {meta_path.name}. It cannot be shown "
+                    f"{path} exists and carries no run record. It cannot be shown "
                     "to belong to this run; delete it or move the directory aside"
                 )
-            stored = json.loads(meta_path.read_text(encoding="utf-8"))
             differing = {
                 field: (stored.get(field), value)
                 for field, value in (
@@ -1090,6 +1168,7 @@ def main(argv: list[str] | None = None) -> None:
                     ("seed", cfg.seed),
                     ("max_pairs_per_stratum", analysis.max_pairs_per_stratum),
                     ("run_scenes", sorted(cfg.scenes)),
+                    ("analysis_config_digest", analysis.digest()),
                 )
                 if stored.get(field) != value
             }

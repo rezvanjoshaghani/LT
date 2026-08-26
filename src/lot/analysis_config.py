@@ -64,6 +64,28 @@ class AnalysisConfig:
     frame_min_clearance_m: float
     frame_near_depth_floor_m: float
 
+    def as_dict(self) -> dict[str, Any]:
+        """Every normative value, as plain data for a run record."""
+        out: dict[str, Any] = {}
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            out[field.name] = list(value) if isinstance(value, tuple) else value
+        return out
+
+    def digest(self) -> str:
+        """Content hash of the whole config.
+
+        A run records this rather than the config's path. A path binds nothing:
+        two runs at one commit, with different uncommitted edits to the same
+        file, would agree on it. The digest changes when any normative value
+        changes, which is what an amendment is.
+        """
+        import hashlib
+        import json
+
+        payload = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
     def __post_init__(self) -> None:
         # A rotation frame's position is a simulator read-back, so it carries
         # noise up to rotation_position_bound_m. That noise becomes a parallax
@@ -79,6 +101,19 @@ class AnalysisConfig:
                 f"gives a parallax of {worst:g}, above zero_parallax_tol "
                 f"{self.zero_parallax_tol:g}: an in-place rotation pair at the "
                 "bound would be binned as if it had a baseline"
+            )
+        # The mirror of the above, on the other regime's other axis. A
+        # translation pair may differ in orientation by up to the manifest
+        # bound, and if that exceeds the zero-rotation tolerance the pair
+        # leaves the zero-rotation bin that PROTOCOL 3.3 puts the whole
+        # translation regime in. The two constants describe the same physical
+        # slack seen from two sides, so neither can be set alone.
+        if self.translation_rotation_bound_deg > self.zero_rotation_tol_deg:
+            raise ValueError(
+                f"translation_rotation_bound_deg {self.translation_rotation_bound_deg:g} "
+                f"exceeds zero_rotation_tol_deg {self.zero_rotation_tol_deg:g}: a "
+                "translation pair at the manifest bound would pass validation and "
+                "then be binned outside the zero-rotation bin its regime defines"
             )
 
     def rotation_edges(self) -> tuple[float, ...]:

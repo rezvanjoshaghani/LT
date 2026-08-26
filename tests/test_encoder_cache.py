@@ -479,3 +479,25 @@ def test_vggt_batching_does_not_mix_frames():
     together = encoder.encode(frames).features
     apart = torch.cat([encoder.encode(frames[i : i + 1]).features for i in (0, 1)])
     assert torch.allclose(together, apart, atol=1e-3)
+
+
+def test_depth_content_is_protected_not_only_its_shape(tmp_path):
+    """Shape and frame presence do not protect content.
+
+    Every value in a depth archive can change while the keys and shapes stay
+    right. That is inert for Experiment Zero, whose geometry is ground truth,
+    and it is a Phase 4 blocker: VGGT depth and its confidence become scientific
+    inputs there, and the validator claimed digest mode covered every array.
+    """
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    encoder = StubEncoder(stub_spec(provides_depth=True), "cpu")
+    cache_scene_features(manifest, root, encoder, cache_root, export_depth=True)
+    validate_feature_cache(cache_root, "stub_depth", manifest, check_digest=True)
+
+    depth_path = cache_dir(cache_root, "stub_depth", manifest.scene) / "depth.npz"
+    with np.load(depth_path) as archive:
+        tampered = {name: np.full_like(archive[name], 9.0) for name in archive.files}
+    np.savez(depth_path, **tampered)
+    with pytest.raises(ValueError, match="depth digest"):
+        validate_feature_cache(cache_root, "stub_depth", manifest, check_digest=True)

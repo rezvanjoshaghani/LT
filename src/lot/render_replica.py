@@ -630,6 +630,9 @@ def rotation_position_residuals(manifest: Manifest) -> dict[int, float]:
 def translation_rotation_residuals(manifest: Manifest) -> dict[int, float]:
     """Largest pairwise rotation, in degrees, among each viewpoint's translation frames.
 
+    Pairwise, over every unordered pair, because the pair is what becomes a
+    camera pair downstream.
+
     The mirror of rotation_position_residuals. PROTOCOL 3.3 makes translation
     the sole source of the primary parallax curve precisely because it holds
     rotation at exactly zero, so a translation frame whose orientation drifted
@@ -647,9 +650,19 @@ def translation_rotation_residuals(manifest: Manifest) -> dict[int, float]:
         orientations.setdefault(viewpoint, []).append(frame.T_world_from_camera[:3, :3])
     residuals: dict[int, float] = {}
     for viewpoint, values in orientations.items():
-        reference = values[0].to(torch.float64)
+        # Every pair, not every frame against the first. Orientations at 0,
+        # +9e-5 and -9e-5 degrees are each within 9e-5 of the first, and the
+        # worst actual pair is 1.8e-4: measuring against a reference passes a
+        # bound the population violates, and it is the pair that becomes a
+        # camera pair, not the frame.
+        doubles = [R.to(torch.float64) for R in values]
         residuals[viewpoint] = max(
-            rotation_angle_deg(reference.mT @ R.to(torch.float64)) for R in values
+            (
+                rotation_angle_deg(a.mT @ b)
+                for i, a in enumerate(doubles)
+                for b in doubles[i + 1 :]
+            ),
+            default=0.0,
         )
     return residuals
 

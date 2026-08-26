@@ -99,6 +99,20 @@ class CorrespondenceSamples(NamedTuple):
     neighbor_omitted: int        # records dropped for having no in-bounds offset
 
 
+def _target_cell_index(
+    uv_target: Tensor, hw_px: tuple[int, int], patch_size: int
+) -> np.ndarray:
+    """Row-major patch-grid cell of each target coordinate.
+
+    The same mapping evaluate.py uses to place a per-point sample in the
+    universe, written here so the two cannot drift apart.
+    """
+    patches_w = hw_px[1] // patch_size
+    cols = torch.round((uv_target[:, 0] + 0.5) / patch_size - 0.5).long()
+    rows = torch.round((uv_target[:, 1] + 0.5) / patch_size - 0.5).long()
+    return (rows * patches_w + cols).cpu().numpy()
+
+
 def _patch_center_px(index: int, patch_size: int) -> float:
     """Pixel coordinate of the center of one patch, along one axis.
 
@@ -150,6 +164,7 @@ def sample_correspondences(
     patch_size: int = PATCH_SIZE,
     mode: str = "patch_center",
     depth_consistency_tol: float | None = None,
+    cell_option_ok: np.ndarray | None = None,
 ) -> CorrespondenceSamples:
     """Sample co-visible target locations with ground-truth warps and null locations.
 
@@ -167,6 +182,11 @@ def sample_correspondences(
         lie on one surface. "pixel" samples integer target pixel centers.
     depth_consistency_tol: relative depth spread allowed across those four
         pixels, used by "patch_center" only.
+    cell_option_ok: [cells, 4] bool, the splat path's admissible Neighbor-Patch
+        offsets per target cell, row-major over the patch grid. When given, an
+        offset must be admissible under both paths' rules, so the direction
+        hashed from a sample_id is the same on both. Passing None applies this
+        path's rule alone and is for unit tests of this function in isolation.
     """
     if depth_consistency_tol is None:
         depth_consistency_tol = default_relative_depth_tol()
@@ -246,6 +266,22 @@ def sample_correspondences(
     ) * patch_size
     options = uv_warp[:, None, :] + offsets[None, :, :]
     option_ok = _in_box(options, box_context)
+    if cell_option_ok is not None:
+        # Both paths must admit the offset, or the shared hash picks differently.
+        #
+        # The two rules are not the same question. This path reads one location,
+        # so it asks whether that location stays inside the context sampling box.
+        # The splat path shifts a cell's whole transport support and re-pools, so
+        # it asks whether any of that support leaves the grid. Under translation
+        # the answers differ for cells whose support touches the border while
+        # their center does not, and the hash then ranks a different number of
+        # options and lands on a different direction. The variant is then not one
+        # null measured two ways, which is the only thing it is for.
+        #
+        # Intersecting is the conservative direction: an offset either path
+        # refuses is refused for both.
+        cells = _target_cell_index(uv_cand, (height, width), patch_size)
+        option_ok = option_ok & torch.from_numpy(cell_option_ok[cells]).to(option_ok.device)
     has_neighbor = option_ok.any(dim=1)
     neighbor_omitted = int((~has_neighbor).sum())
 

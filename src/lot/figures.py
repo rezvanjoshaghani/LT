@@ -34,6 +34,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import shutil
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -43,6 +45,7 @@ from .analysis_config import DEFAULT_CONFIG_PATH, AnalysisConfig, load_analysis_
 from .datasets import bin_order, parallax_bin, rotation_bin
 from .evaluate import (
     EVAL_VERSION,
+    RUN_METADATA_KEY,
     MEAN_FEATURE,
     NEIGHBOR_PATCH,
     NO_WARP_COPY,
@@ -101,18 +104,28 @@ def read_eval_dir(eval_dir: Path) -> list[dict[str, Any]]:
     if not files:
         raise FileNotFoundError(f"no parquet files in {eval_dir}")
 
+    # Provenance comes from inside the parquet, so CLAUDE.md's rule that every
+    # figure be regenerable from outputs/eval/*.parquet alone still holds. The
+    # sidecar is a convenience for reading a run record without pyarrow, and is
+    # used only for a parquet written before the record moved inside.
+    tables = {path.stem: pq.read_table(path) for path in files}
     sidecars: dict[str, dict[str, Any]] = {}
-    for path in files:
-        meta_path = path.with_suffix(".meta.json")
+    for stem, table in tables.items():
+        raw = (table.schema.metadata or {}).get(RUN_METADATA_KEY)
+        if raw is not None:
+            sidecars[stem] = json.loads(raw.decode("utf-8"))
+            continue
+        meta_path = eval_dir / f"{stem}.meta.json"
         if not meta_path.exists():
             raise FileNotFoundError(
-                f"{path} has no {meta_path.name}. Its provenance is unknown, so "
-                "it cannot be shown to belong with the others"
+                f"{eval_dir / (stem + '.parquet')} carries no run record and has "
+                f"no {meta_path.name} beside it. Its provenance is unknown, so it "
+                "cannot be shown to belong with the others"
             )
-        sidecars[path.stem] = json.loads(meta_path.read_text(encoding="utf-8"))
+        sidecars[stem] = json.loads(meta_path.read_text(encoding="utf-8"))
 
     for field in ("eval_version", "encoders", "seed", "max_pairs_per_stratum",
-                  "git_commit", "run_scenes"):
+                  "git_commit", "run_scenes", "analysis_config_digest"):
         found = {json.dumps(meta.get(field), sort_keys=True) for meta in sidecars.values()}
         if len(found) > 1:
             raise ValueError(
@@ -141,27 +154,49 @@ def read_eval_dir(eval_dir: Path) -> list[dict[str, Any]]:
     if str(any_meta.get("git_commit", "")).endswith("-dirty"):
         print(
             f"warning: results were produced at {any_meta['git_commit']}, from a "
-            "worktree with uncommitted changes"
+            "worktree with uncommitted changes. The analysis config is bound by "
+            f"content ({any_meta.get('analysis_config_digest')}), so an edit to it "
+            "cannot hide here, but source edits are not covered"
+        )
+    # Every scene must have been evaluated from the same weights. The digests
+    # differ per scene, since they are per-scene caches; the fingerprints must
+    # not, or the run mixes checkpoints.
+    fingerprints = {
+        (scene, encoder, entry.get("weights_fingerprint"))
+        for scene, meta in sidecars.items()
+        for encoder, entry in (meta.get("cache_provenance") or {}).items()
+    }
+    by_encoder: dict[str, set] = {}
+    for _, encoder, fingerprint in fingerprints:
+        by_encoder.setdefault(encoder, set()).add(fingerprint)
+    mixed = {encoder: sorted(v) for encoder, v in by_encoder.items() if len(v) > 1}
+    if mixed:
+        raise ValueError(
+            f"scenes were evaluated from different encoder weights: {mixed}. "
+            "One encoder is one frozen representation, and a cross-scene "
+            "aggregate over two checkpoints is a mixture"
         )
 
     rows: list[dict[str, Any]] = []
-    for path in files:
-        rows.extend(pq.read_table(path).to_pylist())
+    for stem in sorted(tables):
+        rows.extend(tables[stem].to_pylist())
     return rows
 
 
-def neighbor_omitted_total(eval_dir: Path) -> int:
-    """Neighbor-Patch samples omitted across the run, from the sidecars.
+def neighbor_omitted_total(rows: Sequence[dict[str, Any]]) -> int:
+    """Neighbor-Patch samples omitted across the run, from the rows.
 
-    Evaluation accumulates this once per pair, which is the grain it happens
-    at. The per-row column carries the same pair-level number duplicated into
-    every encoder and path row, so summing rows over-counts by their product.
+    The quantity is per pair, and the column repeats it into every encoder,
+    path, and variant row of that pair, so summing the column over-counts by
+    their product. Deduplicating by pair recovers it, and it comes from the
+    parquet rather than a sidecar so the analysis stays regenerable from the
+    parquet alone.
     """
-    total = 0
-    for meta_path in sorted(Path(eval_dir).glob("*.meta.json")):
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        total += int(meta.get("neighbor_patch_omitted_records", 0))
-    return total
+    per_pair: dict[tuple, int] = {}
+    for row in rows:
+        key = (row["scene"], row["context_frame_id"], row["target_frame_id"])
+        per_pair[key] = int(row.get("neighbor_omitted", 0))
+    return sum(per_pair.values())
 
 
 def _finite(value: Any) -> bool:
@@ -258,12 +293,44 @@ def paired_records(
             "row was read last"
         )
 
+    # PROTOCOL 3.7 gives every variant of a path the same records, so a
+    # comparison carries all five or the evaluation did not do what it says.
+    # Skipping the incomplete ones removed the population without counting it:
+    # a method that failed on the hardest pairs, or a truncated parquet, would
+    # take those pairs out of every aggregate and leave a table that reads as if
+    # they had never been sampled.
+    incomplete = [key for key, variants in grouped.items() if set(variants) != set(VARIANT_ORDER)]
+    if incomplete:
+        missing = sorted(set(VARIANT_ORDER) - set(grouped[incomplete[0]]))
+        raise ValueError(
+            f"{len(incomplete)} comparisons do not carry all {len(VARIANT_ORDER)} "
+            f"variants, first {incomplete[0]} missing {missing}. PROTOCOL 3.7 "
+            "scores every variant on the path's common valid set, so a partial "
+            "comparison means the evaluation is incomplete, not that the "
+            "analysis should proceed on what survived"
+        )
+
+    # Nonfinite is permitted for exactly one cell of the table. Mean-Feature has
+    # no centered value by construction: the vector subtracted is the prediction
+    # itself, so the centered prediction is the zero vector and its cosine is
+    # undefined. Everywhere else a nonfinite is a failed method.
+    nonfinite = [
+        (key, variant)
+        for key, variants in grouped.items()
+        for variant, row in variants.items()
+        if not _finite(row[metric]) and not (metric == CENTERED and variant == MEAN_FEATURE)
+    ]
+    if nonfinite:
+        raise ValueError(
+            f"{len(nonfinite)} nonfinite {metric} values outside centered "
+            f"Mean-Feature, first {nonfinite[0]}. PROTOCOL 3.7 permits a "
+            "nonfinite there and nowhere else"
+        )
+
     records: list[dict[str, Any]] = []
     mismatches = 0
     for variants in grouped.values():
-        floor = variants.get(NO_WARP_COPY)
-        if floor is None or not _finite(floor[metric]):
-            continue
+        floor = variants[NO_WARP_COPY]
         for variant, row in variants.items():
             if not _finite(row[metric]):
                 continue
@@ -585,8 +652,15 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
     per_metric: dict[str, list[float]] = {name: [] for name in INTERSECT_METRICS}
     coverage: list[int] = []
     complete = 0
+    incomplete = 0
     for paths in by_key.values():
         if set(paths) != set(PATH_ORDER):
+            # A pair one path could not score is not a pair the gate can compare,
+            # but it is exactly the pair whose coverage differs most, so it is
+            # counted and its coverage is reported rather than disappearing from
+            # both the gate and the diagnostic beside it.
+            incomplete += 1
+            coverage.extend(int(row["coverage_difference"]) for row in paths.values())
             continue
         complete += 1
         for name, column in INTERSECT_METRICS.items():
@@ -602,6 +676,7 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
     tolerance = config.path_agreement_tolerance
     result: dict[str, Any] = {
         "comparisons": complete,
+        "single_path_pairs": incomplete,
         "duplicate_rows": duplicates,
         "tolerance": tolerance,
         "within_tolerance": complete > 0 and duplicates == 0,
@@ -1154,18 +1229,29 @@ def format_counts(table: Sequence[dict[str, Any]], config: AnalysisConfig) -> st
     return chr(10).join(lines)
 
 
-def write_table(path: Path, table: Sequence[dict[str, Any]]) -> None:
-    """Write the summary table as parquet. Refuses to overwrite."""
+def write_table(path: Path, table: Sequence[dict[str, Any]], replace: bool = False) -> None:
+    """Write a table as parquet, atomically. Refuses to overwrite unless asked.
+
+    replace is for the counts view alone, and it is not a loosening of the
+    no-overwrite rule so much as a consequence of what that view is for. The
+    runbook has the user read counts, edit the support thresholds, and read them
+    again, so a write-once counts file would keep the
+    supported_at_current_threshold column from the configuration that has just
+    been replaced and contradict the verdict printed beside it. The counts
+    themselves are a function of the parquet alone. Results are never replaced.
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     path = Path(path)
-    if path.exists():
+    if path.exists() and not replace:
         raise FileExistsError(f"{path} exists; delete it to regenerate.")
     if not table:
         raise ValueError("no table rows to write")
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(list(table)), path)
+    tmp = path.with_name(path.name + f".{os.getpid()}.partial")
+    pq.write_table(pa.Table.from_pylist(list(table)), tmp)
+    os.replace(tmp, path)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1215,10 +1301,7 @@ def main(argv: list[str] | None = None) -> None:
         # themselves are a function of the parquet alone; only the threshold
         # verdict moves, and re-deriving it is the point.
         counts_path = Path(out_dir) / "tables" / "support_counts.parquet"
-        counts_path.parent.mkdir(parents=True, exist_ok=True)
-        if counts_path.exists():
-            counts_path.unlink()
-        write_table(counts_path, table)
+        write_table(counts_path, table, replace=True)
         print(f"{chr(10)}counts -> {counts_path}")
         return
 
@@ -1277,12 +1360,23 @@ def main(argv: list[str] | None = None) -> None:
     # no relation to that duplication: rows are wide in metric and long in
     # encoder and path. With two encoders and two paths it reported twice the
     # true count.
-    omissions = {NEIGHBOR_PATCH: neighbor_omitted_total(args.eval_dir)}
+    omissions = {NEIGHBOR_PATCH: neighbor_omitted_total(rows)}
     table_path = Path(out_dir) / "tables" / "experiment_zero.parquet"
-    write_table(table_path, summary_table(records, config))
-    print(f"table  -> {table_path}")
+    if table_path.exists():
+        raise SystemExit(
+            f"{table_path} exists; outputs are never overwritten. Delete it, or "
+            "the run directory, to rebuild"
+        )
 
-    figures = Path(out_dir) / "figures"
+    # Everything is built into a staging directory and moved into place only
+    # once all of it succeeded. Writing the table first and the figures after
+    # left a directory holding a table and no figures when a figure failed, and
+    # the retry then stopped because the table was already there: a state that
+    # was neither complete nor re-runnable.
+    staging = Path(out_dir) / ".partial"
+    if staging.exists():
+        shutil.rmtree(staging)
+    figures = staging / "figures"
     plan = [
         (
             "figure_a_null_ladder.png",
@@ -1317,14 +1411,26 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError as error:
             failures.append(f"{name}: {error}")
         else:
-            print(f"figure -> {target}")
+            pass
     if failures:
         # PROTOCOL 3.10 requires four figures. One that cannot be built is a
         # fact about the run that has to surface, not a line in a log above a
         # successful exit.
+        shutil.rmtree(staging, ignore_errors=True)
         raise SystemExit(
             "required figures could not be produced: " + "; ".join(failures)
         )
+
+    write_table(staging / "tables" / "experiment_zero.parquet", summary_table(records, config))
+    table_path.parent.mkdir(parents=True, exist_ok=True)
+    (staging / "tables" / "experiment_zero.parquet").replace(table_path)
+    print(f"table  -> {table_path}")
+    final_figures = Path(out_dir) / "figures"
+    final_figures.mkdir(parents=True, exist_ok=True)
+    for built in sorted(figures.glob("*.png")):
+        built.replace(final_figures / built.name)
+        print(f"figure -> {final_figures / built.name}")
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 if __name__ == "__main__":

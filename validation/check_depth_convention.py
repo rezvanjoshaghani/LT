@@ -78,12 +78,36 @@ for label, tilt in (("fronto-parallel", (0.0, 0.0)), ("tilted 6 deg", (0.10, 0.0
 # The thresholds the verdict turns on are function defaults in source.
 import inspect  # noqa: E402
 
+# This recorded a failure when the thresholds were literals in source and the
+# config file did not exist. It measures now: the signature defaults must be
+# None, meaning the value is resolved from the committed config at call time,
+# and that file must carry the keys.
 sig = inspect.signature(classify_depth_convention)
-defaults = {k: v.default for k, v in sig.parameters.items() if v.default is not inspect._empty}
-record("2.6a-cfg", "decision thresholds come from a committed config", False,
-       f"classify_depth_convention thresholds are function defaults in source: {defaults}. "
-       f"PROTOCOL preamble requires the depth-convention decision threshold to live in "
-       f"configs/analysis.yaml, which does not exist.")
+threshold_names = ("slope_threshold", "flat_tol", "margin", "center_crop")
+defaults = {
+    k: v.default for k, v in sig.parameters.items()
+    if k in threshold_names and v.default is not inspect._empty
+}
+deferred = [k for k, v in defaults.items() if v is None]
+
+from lot.analysis_config import DEFAULT_CONFIG_PATH, load_analysis_config  # noqa: E402
+
+config_exists = Path(DEFAULT_CONFIG_PATH).is_file()
+config_keys = []
+if config_exists:
+    cfg_values = load_analysis_config().as_dict()
+    config_keys = [
+        k for k in (
+            "depth_convention_slope_threshold", "depth_convention_flat_tol",
+            "depth_convention_margin", "depth_convention_center_crop",
+        )
+        if k in cfg_values
+    ]
+record("2.6a-cfg", "decision thresholds come from a committed config",
+       config_exists and len(config_keys) == 4 and len(deferred) == len(defaults),
+       f"{DEFAULT_CONFIG_PATH.name} exists: {config_exists}; it carries "
+       f"{len(config_keys)} of 4 depth-convention keys; {len(deferred)} of "
+       f"{len(defaults)} signature thresholds defer to it ({defaults}).")
 
 # ---------------------------------------------------------------------------
 # (b) PROTOCOL 4.1's secant regression, implemented independently

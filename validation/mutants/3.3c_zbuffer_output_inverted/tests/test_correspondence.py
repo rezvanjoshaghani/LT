@@ -1,15 +1,28 @@
-"""PLAN Phase 0, test 5: exact ground-truth pairs and correctly constructed nulls."""
+"""PLAN Phase 0 test 5 and PROTOCOL 3.2/3.6: sample identity and the frozen nulls."""
 
+import numpy as np
+import pytest
 import torch
 
-from lot.correspondence import gather_value_pairs, sample_correspondences
+from lot.correspondence import (
+    NEIGHBOR_OFFSETS,
+    gather_value_pairs,
+    sample_correspondences,
+)
 from lot.encoders import pixel_to_patch_coords
+from lot.sample_identity import (
+    NEIGHBOR_PATCH_SALT,
+    RANDOM_PATCH_SALT,
+    derived_draw,
+    sample_ids,
+)
 from lot.visibility import visibility_masks
 from scenes import GRID, IMAGE_SIZE, PATCH, build_two_plane_scene
 
 CTX_HW = (IMAGE_SIZE, IMAGE_SIZE)
 BOX_LO = 0.5 * PATCH - 0.5
 BOX_HI = IMAGE_SIZE - 0.5 * PATCH - 0.5
+IDENTITY = ("room_0", "ctx", "tgt")
 
 
 def _scene_and_masks():
@@ -24,8 +37,7 @@ def _scene_and_masks():
     return scene, vm
 
 
-def _sample(scene, vm, num_samples, mode, seed=0):
-    generator = torch.Generator().manual_seed(seed)
+def _sample(scene, vm, num_samples, mode="patch_center", identity=IDENTITY):
     return sample_correspondences(
         scene.depth_target,
         scene.K,
@@ -34,19 +46,160 @@ def _sample(scene, vm, num_samples, mode, seed=0):
         vm.covisible,
         num_samples,
         CTX_HW,
+        *identity,
         patch_size=PATCH,
         mode=mode,
-        generator=generator,
     )
 
 
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.2: sample identity
+# ---------------------------------------------------------------------------
+
+def test_sample_id_depends_only_on_the_four_named_inputs():
+    """scene, context frame, target frame, and the target-side coordinates."""
+    uv = torch.tensor([[6.5, 6.5], [20.5, 34.5]], dtype=torch.float64)
+    base = sample_ids("room_0", "c", "t", uv)
+    assert np.array_equal(base, sample_ids("room_0", "c", "t", uv))
+    # A different value in any one of the four changes the id.
+    assert not np.array_equal(base, sample_ids("room_1", "c", "t", uv))
+    assert not np.array_equal(base, sample_ids("room_0", "c2", "t", uv))
+    assert not np.array_equal(base, sample_ids("room_0", "c", "t2", uv))
+    assert base[0] != base[1]
+
+
+def test_sample_id_is_order_and_batch_independent():
+    """The id travels with the correspondence, not with its position in a batch."""
+    uv = torch.tensor([[6.5, 6.5], [20.5, 6.5], [6.5, 20.5]], dtype=torch.float64)
+    full = sample_ids("room_0", "c", "t", uv)
+    permuted = sample_ids("room_0", "c", "t", uv[[2, 0, 1]])
+    assert permuted.tolist() == [full[2], full[0], full[1]]
+    single = sample_ids("room_0", "c", "t", uv[1:2])
+    assert single[0] == full[1]
+
+
+def test_sample_id_rejects_coordinates_off_the_half_pixel_grid():
+    """Ids are defined on that grid so float noise cannot move a record."""
+    with pytest.raises(ValueError, match="half a pixel"):
+        sample_ids("room_0", "c", "t", torch.tensor([[6.3, 6.5]], dtype=torch.float64))
+
+
+def test_every_sample_carries_an_id():
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 64)
+    assert len(samples.sample_id) == samples.uv_target.shape[0]
+    assert len(set(samples.sample_id.tolist())) == len(samples.sample_id)
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.6: the frozen nulls
+# ---------------------------------------------------------------------------
+
+def test_nulls_are_hash_deterministic_not_order_dependent():
+    """PROTOCOL 3.6: the same record receives the same null regardless of batching."""
+    scene, vm = _scene_and_masks()
+    many = _sample(scene, vm, 10_000)
+    few = _sample(scene, vm, 32)
+    shared = {int(i) for i in many.sample_id} & {int(i) for i in few.sample_id}
+    assert shared, "the two draws must overlap for this to test anything"
+    many_index = {int(i): k for k, i in enumerate(many.sample_id)}
+    few_index = {int(i): k for k, i in enumerate(few.sample_id)}
+    for identifier in shared:
+        a, b = many_index[identifier], few_index[identifier]
+        assert torch.equal(many.uv_context_neighbor[a], few.uv_context_neighbor[b])
+        assert torch.equal(many.random_patch_index[a], few.random_patch_index[b])
+
+
+def test_neighbor_offset_is_one_whole_patch_on_an_axis():
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 400)
+    offsets = (samples.uv_context_neighbor - samples.uv_context_warp).tolist()
+    allowed = {(float(dx * PATCH), float(dy * PATCH)) for dx, dy in NEIGHBOR_OFFSETS}
+    assert set(map(tuple, offsets)) <= allowed
+
+
+def test_neighbor_direction_is_unbiased_across_directions():
+    """A single fixed direction would confound localization with image geometry."""
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 10_000)
+    offsets = (samples.uv_context_neighbor - samples.uv_context_warp).tolist()
+    used = {tuple(o) for o in offsets}
+    assert len(used) == len(NEIGHBOR_OFFSETS)
+
+
+def test_neighbor_direction_comes_from_the_sample_id():
+    """Where all four offsets are in bounds the hash selects among them directly.
+
+    At a border only some offsets are in bounds, and the hash then indexes the
+    surviving ones, which is what makes the null defined everywhere.
+    """
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 400)
+    expected = derived_draw(samples.sample_id, NEIGHBOR_PATCH_SALT, 4)
+    offsets = (samples.uv_context_neighbor - samples.uv_context_warp) / PATCH
+    warp = samples.uv_context_warp
+    interior = (
+        (warp[:, 0] - PATCH >= BOX_LO)
+        & (warp[:, 0] + PATCH <= BOX_HI)
+        & (warp[:, 1] - PATCH >= BOX_LO)
+        & (warp[:, 1] + PATCH <= BOX_HI)
+    )
+    assert int(interior.sum()) > 0
+    for row in torch.nonzero(interior).flatten().tolist():
+        choice = int(expected[row])
+        assert tuple(offsets[row].tolist()) == tuple(float(v) for v in NEIGHBOR_OFFSETS[choice])
+
+
+def test_random_patch_is_an_integer_patch_index_from_the_hash():
+    """PROTOCOL 3.6 asks for a patch, not a blend of up to four."""
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 128)
+    expected = derived_draw(samples.sample_id, RANDOM_PATCH_SALT, GRID * GRID)
+    rows = samples.random_patch_index[:, 0].tolist()
+    cols = samples.random_patch_index[:, 1].tolist()
+    assert [r * GRID + c for r, c in zip(rows, cols)] == expected.tolist()
+    assert all(0 <= r < GRID and 0 <= c < GRID for r, c in zip(rows, cols))
+
+
+def test_random_patch_reads_the_patch_itself():
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 32)
+    features = torch.rand((6, GRID, GRID))
+    values = gather_value_pairs(features, features, samples)
+    for row in range(len(samples.sample_id)):
+        r, c = samples.random_patch_index[row].tolist()
+        assert torch.equal(values["random"][row], features[:, r, c])
+
+
+def test_every_null_reads_the_context_map_and_differs_only_in_where():
+    """PROTOCOL 3.6: image, encoder, and scene held fixed; only the location moves."""
+    scene, vm = _scene_and_masks()
+    samples = _sample(scene, vm, 200)
+    context = torch.full((4, GRID, GRID), 1.0)
+    target = torch.full((4, GRID, GRID), 2.0)
+    pairs = gather_value_pairs(context, target, samples)
+    assert torch.allclose(pairs["target"], torch.full_like(pairs["target"], 2.0))
+    for null in ("warp", "no_warp", "neighbor", "random"):
+        assert torch.allclose(pairs[null], torch.full_like(pairs[null], 1.0)), null
+
+
+def test_mean_feature_is_not_built_by_the_sampler():
+    """PROTOCOL 3.6 defines it over the training split, which a sampler cannot see."""
+    scene, vm = _scene_and_masks()
+    pairs = gather_value_pairs(
+        scene.features_context, scene.expected_features, _sample(scene, vm, 16)
+    )
+    assert "mean" not in pairs
+
+
+# ---------------------------------------------------------------------------
+# Correspondence correctness, unchanged from Phase 0
+# ---------------------------------------------------------------------------
+
 def test_warp_locations_are_the_analytic_correspondence():
     scene, vm = _scene_and_masks()
-    samples = _sample(scene, vm, 800, "pixel")
-    assert samples.uv_target.shape == (800, 2)
+    samples = _sample(scene, vm, 800, mode="pixel")
     disparity = scene.disparity_for_target_columns(samples.uv_target[:, 0])
-    # The unproject-then-project round trip does not cancel bitwise in float64,
-    # so continuous coordinates are compared with a 1e-9 pixel tolerance.
     assert torch.allclose(
         samples.uv_context_warp[:, 0], samples.uv_target[:, 0] + disparity, atol=1e-9, rtol=0
     )
@@ -57,7 +210,7 @@ def test_warp_locations_are_the_analytic_correspondence():
 
 def test_sampler_returns_only_covisible_locations():
     scene, vm = _scene_and_masks()
-    samples = _sample(scene, vm, 800, "pixel")
+    samples = _sample(scene, vm, 800, mode="pixel")
     u = samples.uv_target[:, 0].long()
     v = samples.uv_target[:, 1].long()
     assert vm.covisible[v, u].all()
@@ -66,50 +219,20 @@ def test_sampler_returns_only_covisible_locations():
 
 def test_no_warp_copies_the_target_location():
     scene, vm = _scene_and_masks()
-    samples = _sample(scene, vm, 300, "pixel")
+    samples = _sample(scene, vm, 300, mode="pixel")
     assert torch.equal(samples.uv_context_no_warp, samples.uv_target)
-
-
-def test_neighbor_is_one_patch_from_the_warp_and_in_bounds():
-    scene, vm = _scene_and_masks()
-    samples = _sample(scene, vm, 300, "pixel")
-    diff = (samples.uv_context_neighbor - samples.uv_context_warp).abs()
-    sorted_diff, _ = torch.sort(diff, dim=1)
-    expected = torch.tensor([0.0, float(PATCH)], dtype=diff.dtype).expand_as(sorted_diff)
-    assert torch.allclose(sorted_diff, expected, atol=1e-9, rtol=0)
-    assert (samples.uv_context_neighbor >= BOX_LO).all()
-    assert (samples.uv_context_neighbor <= BOX_HI).all()
-
-
-def test_random_locations_are_bounded_and_seeded():
-    scene, vm = _scene_and_masks()
-    first = _sample(scene, vm, 300, "pixel", seed=7)
-    again = _sample(scene, vm, 300, "pixel", seed=7)
-    other = _sample(scene, vm, 300, "pixel", seed=8)
-    assert (first.uv_context_random >= BOX_LO).all()
-    assert (first.uv_context_random <= BOX_HI).all()
-    for a, b in zip(first, again):
-        assert torch.equal(a, b)
-    assert not torch.equal(first.uv_context_random, other.uv_context_random)
 
 
 def test_patch_center_mode_covers_exactly_the_covisible_patches():
     scene, vm = _scene_and_masks()
-    samples = _sample(scene, vm, 10_000, "patch_center")
-    # 12 co-visible patch columns times 16 rows.
+    samples = _sample(scene, vm, 10_000)
     assert samples.uv_target.shape == (192, 2)
     patch_cols = pixel_to_patch_coords(samples.uv_target[:, 0], PATCH).round().long()
     assert set(patch_cols.tolist()) == {0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13}
 
 
 def test_patch_center_rejects_centers_that_straddle_a_depth_edge():
-    """Interpolating across a depth edge lifts the center to a point in mid air.
-
-    Patch column 3 has its center at pixel 48.5, so it reads pixels 48 and 49.
-    With a surface step between them the interpolated depth is on neither
-    surface, and the warp it produces would be reported as ground truth while
-    matching nothing. The sampler must drop that patch and keep its neighbors.
-    """
+    """Interpolating across a depth edge lifts the center to a point in mid air."""
     scene = build_two_plane_scene()
     depth = torch.full((IMAGE_SIZE, IMAGE_SIZE), 4.0, dtype=torch.float64)
     depth[:, 49:] = 2.0
@@ -121,22 +244,16 @@ def test_patch_center_rejects_centers_that_straddle_a_depth_edge():
         torch.ones((IMAGE_SIZE, IMAGE_SIZE), dtype=torch.bool),
         10_000,
         CTX_HW,
+        *IDENTITY,
         patch_size=PATCH,
-        mode="patch_center",
-        generator=torch.Generator().manual_seed(0),
     )
     cols = set(pixel_to_patch_coords(samples.uv_target[:, 0], PATCH).round().long().tolist())
     assert 3 not in cols
     assert {2, 4}.issubset(cols)
 
 
-def test_candidates_without_an_in_box_neighbor_are_dropped():
-    """Images under three patches wide can leave a warp with no in-box neighbor.
-
-    The neighbor null offsets by one patch along one axis. On a two-patch image
-    every in-box location has all four offsets out of the box, so there is no
-    neighbor to choose and the candidate cannot yield a complete sample.
-    """
+def test_records_without_an_in_bounds_neighbor_are_omitted_and_counted():
+    """PROTOCOL 3.6: the omission is counted and documented, not silently absorbed."""
     side = 2 * PATCH
     scene = build_two_plane_scene()
     samples = sample_correspondences(
@@ -147,59 +264,24 @@ def test_candidates_without_an_in_box_neighbor_are_dropped():
         torch.ones((side, side), dtype=torch.bool),
         16,
         (side, side),
+        *IDENTITY,
         patch_size=PATCH,
-        generator=torch.Generator().manual_seed(0),
+        mode="pixel",
     )
-    assert all(field.shape[0] == 0 for field in samples)
+    # On a two-patch image every integer pixel inside the sampling box is more
+    # than one patch from the far edge and less than one from the near one, so
+    # no record has an in-bounds offset at all.
+    assert samples.uv_target.shape[0] == 0
+    assert samples.neighbor_omitted > 0
 
 
 def test_value_pairs_on_the_analytic_scene():
     scene, vm = _scene_and_masks()
-    samples = _sample(scene, vm, 10_000, "patch_center")
+    samples = _sample(scene, vm, 10_000)
     pairs = gather_value_pairs(scene.features_context, scene.expected_features, samples)
-
-    # Ground-truth warp reproduces the target values exactly.
     assert torch.equal(pairs["warp"], pairs["target"])
-
-    # The no-warp copy reads the context code at the same patch location.
     q = pixel_to_patch_coords(samples.uv_target, PATCH).round().long()
     expected_no_warp = scene.features_context[:, q[:, 1], q[:, 0]].T
     assert torch.equal(pairs["no_warp"].to(torch.float32), expected_no_warp)
     assert not torch.equal(pairs["no_warp"], pairs["warp"])
-
-    # The neighbor reads the context code one patch from the warp location.
-    qn = pixel_to_patch_coords(samples.uv_context_neighbor, PATCH).round().long()
-    expected_neighbor = scene.features_context[:, qn[:, 1], qn[:, 0]].T
-    assert torch.equal(pairs["neighbor"].to(torch.float32), expected_neighbor)
-
-    # The mean null is the mean context feature vector on every row.
-    expected_mean = scene.features_context.mean(dim=(1, 2))
-    assert torch.allclose(pairs["mean"], expected_mean.expand_as(pairs["mean"]).to(pairs["mean"].dtype))
-
-    shapes = {v.shape for v in pairs.values()}
-    assert shapes == {(192, 3)}
-
-
-def test_every_null_reads_the_context_map_and_differs_only_in_where():
-    """Scopes the Phase 3 reading of VGGT as position indexed.
-
-    no_warp, neighbor, and random are all reads of the same context feature
-    map, so the contrast between them isolates location and nothing else: not
-    the image, not the encoder, not the scene. random in particular is drawn
-    inside the context image rather than from elsewhere in the dataset, which
-    is what makes "a random place in the other view of this room" the right
-    comparison for "the same place" and "one patch off".
-    """
-    scene, vm = _scene_and_masks()
-    samples = _sample(scene, vm, 200, "pixel")
-    context = torch.full((4, GRID, GRID), 1.0)
-    target = torch.full((4, GRID, GRID), 2.0)
-    pairs = gather_value_pairs(context, target, samples)
-    # Bilinear weights do not sum to exactly one in floating point, and the
-    # point here is which map was read, not the last bit of the read.
-    assert torch.allclose(pairs["target"], torch.full_like(pairs["target"], 2.0))
-    for null in ("warp", "no_warp", "neighbor", "random"):
-        assert torch.allclose(pairs[null], torch.full_like(pairs[null], 1.0)), null
-    # And the random location really is inside the context image.
-    assert (samples.uv_context_random >= 0).all()
-    assert (samples.uv_context_random <= IMAGE_SIZE - 1).all()
+    assert {v.shape for v in pairs.values()} == {(192, 3)}

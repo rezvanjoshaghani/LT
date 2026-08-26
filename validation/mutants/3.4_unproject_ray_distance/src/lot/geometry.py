@@ -213,8 +213,23 @@ def rotation_angle_deg(R: Tensor) -> float:
     Convention free: this is the magnitude of the rotation, whatever axis it is
     about. Used to stratify the in-place rotation regime, where every pair has
     zero baseline and the viewpoint change is entirely angular.
+
+    Computed as atan2 of the skew magnitude against the trace term rather than
+    as acos of the trace term alone. The two agree mathematically and not
+    numerically. Near identity the cosine is 1 minus something of order theta
+    squared, so float64 rounding of the trace puts a floor of about 8.5e-7
+    degrees on what acos can resolve. That floor sits above zero_rotation_tol_deg,
+    which would make the zero-rotation bin a statement about arithmetic noise
+    rather than about the camera. The skew term is linear in theta near zero, so
+    atan2 resolves small angles to full precision, and it stays stable near 180
+    degrees where the cosine is again flat.
     """
     if R.shape != (3, 3):
         raise ValueError(f"R must be 3x3, got {tuple(R.shape)}")
-    cosine = (float(torch.diagonal(R.to(torch.float64)).sum()) - 1.0) / 2.0
-    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+    # For a rotation by theta about a unit axis, R - R^T is 2 sin(theta) times
+    # the axis cross-product matrix, whose Frobenius norm is sqrt(2). So the
+    # norm is 2 sqrt(2) sin(theta), and the trace is 1 + 2 cos(theta).
+    M = R.to(torch.float64)
+    sine = float(torch.linalg.matrix_norm(M - M.mT)) / (2.0 * math.sqrt(2.0))
+    cosine = (float(torch.diagonal(M).sum()) - 1.0) / 2.0
+    return math.degrees(math.atan2(sine, cosine))

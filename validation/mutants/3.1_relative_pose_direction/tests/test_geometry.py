@@ -1,9 +1,13 @@
 """PLAN Phase 0, test 1: projection round trips and transform composition."""
 
+import math
+
 import pytest
 import torch
 
 from lot import geometry
+from lot.analysis_config import load_analysis_config
+from lot.geometry import rotation_angle_deg
 from scenes import build_rotation_scene, intrinsics, random_se3
 
 
@@ -147,3 +151,46 @@ def test_rotation_homography_matches_projection_and_ignores_depth():
     H = geometry.rotation_homography(scene.K, scene.K, scene.R_target_from_context)
     uv_h = geometry.apply_homography(H, uv)
     assert torch.allclose(uv_a, uv_h, atol=1e-9)
+
+
+def test_rotation_angle_resolves_below_the_zero_rotation_tolerance():
+    """The zero-rotation bin must be a statement about the camera, not arithmetic.
+
+    acos of the trace term cannot resolve an angle below about 8.5e-7 degrees,
+    because near identity the cosine is 1 minus something of order theta
+    squared and float64 rounding of the trace swamps it. zero_rotation_tol_deg
+    is 1e-6, so that formulation puts the bin boundary at the noise of the
+    quantity being binned, and every angle under the floor reads as the floor.
+
+    The skew term is linear in theta near zero, so atan2 of it against the trace
+    term resolves small angles exactly. This is the property no other test
+    covers, and without it the two formulations are interchangeable.
+    """
+    config = load_analysis_config()
+    for degrees in (1e-9, 1e-8, 1e-7, 5e-7):
+        angle = math.radians(degrees)
+        R = torch.tensor(
+            [
+                [math.cos(angle), 0.0, math.sin(angle)],
+                [0.0, 1.0, 0.0],
+                [-math.sin(angle), 0.0, math.cos(angle)],
+            ],
+            dtype=torch.float64,
+        )
+        measured = rotation_angle_deg(R)
+        assert measured == pytest.approx(degrees, rel=1e-9)
+        # And each is genuinely inside the zero bin, which is the point.
+        assert measured < config.zero_rotation_tol_deg
+
+    # Stability at the other flat end of the cosine, where acos is also poor.
+    for degrees in (179.0, 179.999):
+        angle = math.radians(degrees)
+        R = torch.tensor(
+            [
+                [math.cos(angle), 0.0, math.sin(angle)],
+                [0.0, 1.0, 0.0],
+                [-math.sin(angle), 0.0, math.cos(angle)],
+            ],
+            dtype=torch.float64,
+        )
+        assert rotation_angle_deg(R) == pytest.approx(degrees, rel=1e-12)

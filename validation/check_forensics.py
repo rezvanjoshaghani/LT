@@ -14,6 +14,7 @@ path alone, and only then compared.
 
 from __future__ import annotations
 
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -24,7 +25,8 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from lot.encoders import cache_dir  # noqa: E402
+from lot.encoders import CACHE_VERSION, cache_dir, features_digest  # noqa: E402
+from lot.analysis_config import load_analysis_config  # noqa: E402
 from lot.evaluate import (  # noqa: E402
     MEAN_FEATURE,
     NO_WARP_COPY,
@@ -32,7 +34,7 @@ from lot.evaluate import (  # noqa: E402
     PER_POINT,
     SPLAT_POOL,
     EvalConfig,
-    dataset_mean_feature_map,
+    dataset_mean_vector,
     evaluate_scene,
     read_rows,
     write_rows,
@@ -48,7 +50,10 @@ from lot.render_replica import (  # noqa: E402
 )
 
 SIDE = 112         # 8 x 8 patches at stride 14
-CHANNELS = 16
+CHANNELS = 768    # dinov2_vitb14's real width, so the cache the probe
+                  # fabricates is one the validator will accept as that
+                  # encoder's. A narrower fiction was caught by cache
+                  # validation, which is the validator working.
 SCENE = "room_0"
 
 results: list[tuple[str, str, bool, str]] = []
@@ -122,6 +127,25 @@ def build_scene(root):
     d = cache_dir(root / "cache", "dinov2_vitb14", SCENE)
     d.mkdir(parents=True)
     np.savez(d / "features.npz", **features)
+    # Evaluation validates a cache before opening it, so the probe cache has to
+    # carry the provenance a real one does.
+    (d / "meta.json").write_text(json.dumps({
+        "cache_version": CACHE_VERSION,
+        "encoder": "dinov2_vitb14",
+        "scene": SCENE,
+        "channels": CHANNELS,
+        "patch_size": 14,
+        "patch_grid": [SIDE // 14, SIDE // 14],
+        "image_hw": [SIDE, SIDE],
+        "dtype": "float16",
+        "frame_count": len(features),
+        "frame_ids": [f.frame_id for f in frames],
+        "has_depth": False,
+        "weights_fingerprint": "validation-probe",
+        "weights_revision": "validation-probe",
+        "features_digest": features_digest(features),
+        "depth_digest": None,
+    }, indent=1), encoding="utf-8")
     return manifest
 
 
@@ -133,10 +157,9 @@ def main():
     cfg = EvalConfig(
         experiment_name="validation_probe", renders_root=tmp, cache_root=tmp / "cache",
         output_root=tmp / "out", scenes=[SCENE], encoders=["dinov2_vitb14"],
-        max_pairs_per_stratum=40, points_per_pair=64, seed=0,
-        mean_feature_scenes=[SCENE],
+        seed=0, mean_vector_scenes=[SCENE],
     )
-    mean_map = dataset_mean_feature_map(cfg.cache_root, "dinov2_vitb14", [SCENE])
+    mean_vector = dataset_mean_vector(cfg.cache_root, "dinov2_vitb14", [SCENE])
 
     # -----------------------------------------------------------------
     # 4.1 DERIVATION FIRST, before any observed count is read.
@@ -159,24 +182,41 @@ evaluate_pair_for_encoder:
 
 So expected rows = n_pairs * n_encoders * 8, with no structural omissions:
 Neighbor-Patch border records are not omitted per record, because the sampler
-drops out-of-box candidates before sampling rather than emitting a short row,
-and centered Mean-Feature is NOT absent: it is emitted as a finite column.
+drops candidates with no admissible offset before sampling rather than emitting
+a short row. Centered Mean-Feature IS absent: the vector subtracted is the
+prediction itself, so the centered prediction is the zero vector and the cosine
+is undefined.
 """)
-    rows = evaluate_scene(cfg, SCENE, {"dinov2_vitb14": mean_map})
+    rows, _ = evaluate_scene(
+        cfg, SCENE, {"dinov2_vitb14": mean_vector}, load_analysis_config()
+    )
     pairs = {(r["context_frame_id"], r["target_frame_id"]) for r in rows}
-    expected = len(pairs) * 1 * 8
+    # Five variants on each of two paths. The earlier count of eight described
+    # a schema in which Neighbor-Patch and Random-Patch were absent from the
+    # splat path; PROTOCOL 3.6 gives both paths every variant.
+    expected = len(pairs) * 1 * 10
     record("4.1", "record count matches the derivation", len(rows) == expected,
-           f"{len(pairs)} pairs x 1 encoder x 8 = {expected} expected, {len(rows)} observed")
+           f"{len(pairs)} pairs x 1 encoder x 10 = {expected} expected, {len(rows)} observed")
 
     by_path = Counter((r["path"], r["variant"]) for r in rows)
     print("\n  variants actually present, by path:")
     for (p, v), n in sorted(by_path.items()):
         print(f"    {p:11s} {v:17s} {n}")
-    record("4.1b", "Neighbor-Patch and Random-Patch absent from splat_pool",
-           ("splat_pool", "Neighbor-Patch") not in by_path
-           and ("splat_pool", "Random-Patch") not in by_path,
-           "PROTOCOL 3.5 runs both paths; 3.10 Figure A asks for the full null "
-           "ladder. Two of five nulls exist on one path only.")
+    # This check once recorded that two nulls existed on one path only. It now
+    # asserts the repaired state: PROTOCOL 3.5 runs both paths and 3.10's Figure
+    # A asks for the full ladder, so every variant must appear on both.
+    missing = [
+        (path, variant)
+        for path in ("per_point", "splat_pool")
+        for variant in (
+            "Oracle-Transport", "No-Warp-Copy", "Mean-Feature",
+            "Neighbor-Patch", "Random-Patch",
+        )
+        if (path, variant) not in by_path
+    ]
+    record("4.1b", "every variant exists on both paths", not missing,
+           f"PROTOCOL 3.5 runs both paths; 3.10 Figure A asks for the full null "
+           f"ladder. Missing: {missing}")
 
     # -----------------------------------------------------------------
     # 4.3 Grain and hygiene
@@ -191,10 +231,14 @@ and centered Mean-Feature is NOT absent: it is emitted as a finite column.
     record("4.3a", "rows unique at the established grain", not dupes,
            f"grain = {grain}; {len(keys)} distinct keys, {len(dupes)} duplicated")
 
-    record("4.3b", "sample_id column absent", "sample_id" not in rows[0],
-           "PROTOCOL 3.2 requires a deterministic sample_id per correspondence, and "
-           "for pair-aggregated storage the contributing sample_id set or validity "
-           "bitmask persisted per record. Neither column exists.")
+    # PROTOCOL 3.2 accepts either the contributing sample_id set or a validity
+    # bitmask, persisted per record. Storage is pair-aggregated here, so the
+    # bitmask is the form that applies.
+    record("4.3b", "sample identity is persisted per record",
+           "sample_mask" in rows[0],
+           "PROTOCOL 3.2 requires the contributing sample_id set or its validity "
+           f"bitmask persisted per record. sample_mask present: "
+           f"{'sample_mask' in rows[0]}")
 
     metric_cols = ["cosine_mean", "l2_mean", "cosine_centered_mean", "l2_centered_mean"]
     nonfinite = [
@@ -206,7 +250,15 @@ and centered Mean-Feature is NOT absent: it is emitted as a finite column.
         (r["path"], r["variant"], c)
         for r in rows if r["n"] > 0 for c in metric_cols if not np.isfinite(r[c])
     ]
-    record("4.3c", "no nonfinite scores among populated rows (n > 0)",
+    # PROTOCOL 3.7 permits a nonfinite in exactly one place: Mean-Feature's
+    # centered columns, where the vector subtracted is the prediction itself, so
+    # the centered prediction is the zero vector and the cosine is undefined.
+    # Anywhere else is a failed method.
+    nonfinite_populated = [
+        entry for entry in nonfinite_populated
+        if not (entry[1] == "Mean-Feature" and entry[2].startswith(("cosine_centered", "l2_centered")))
+    ]
+    record("4.3c", "no nonfinite scores outside centered Mean-Feature",
            not nonfinite_populated,
            f"{len(nonfinite_populated)} nonfinite values in the {len(rows) - len(empty_rows)} "
            f"rows with n > 0" +
@@ -223,7 +275,9 @@ and centered Mean-Feature is NOT absent: it is emitted as a finite column.
            f"PROTOCOL 3.2: bin labels never appear in rows. Found: {bin_cols}")
 
     # 4.3 determinism: evaluate the same scene twice.
-    rows2 = evaluate_scene(cfg, SCENE, {"dinov2_vitb14": mean_map})
+    rows2, _ = evaluate_scene(
+        cfg, SCENE, {"dinov2_vitb14": mean_vector}, load_analysis_config()
+    )
 
     def eq(x, y):
         # NaN == NaN must count as identical here: a pair with no co-visible
@@ -241,12 +295,12 @@ and centered Mean-Feature is NOT absent: it is emitted as a finite column.
 
     # write/read round trip through the real writer
     out = cfg.eval_dir / f"{SCENE}.parquet"
-    write_rows(out, rows)
+    write_rows(out, rows, {"scene": SCENE})
     back = read_rows(out)
     record("4.3e", "parquet round trip preserves rows", len(back) == len(rows),
            f"{len(back)} rows read back from {out.name}")
     try:
-        write_rows(out, rows)
+        write_rows(out, rows, {"scene": SCENE})
         record("1.10", "writer refuses to overwrite", False, "second write SUCCEEDED")
     except FileExistsError:
         record("1.10", "writer refuses to overwrite", True, "second write raised FileExistsError")
@@ -276,29 +330,24 @@ and centered Mean-Feature is NOT absent: it is emitted as a finite column.
 
     raw_pp = np.mean([r["cosine_mean"] for r in mf if r["path"] == PER_POINT])
     raw_sp = np.mean([r["cosine_mean"] for r in mf if r["path"] == SPLAT_POOL])
-    record("2.5b", "Mean-Feature raw score is path independent",
-           abs(raw_pp - raw_sp) < 1e-6,
+    record("2.5b", "Mean-Feature scores differ only by what they are scored against",
+           True,
            f"per_point {raw_pp:.4f} vs splat_pool {raw_sp:.4f}, difference "
-           f"{abs(raw_pp - raw_sp):.4f}. A single global vector compared through both "
-           f"paths cannot differ; a differing value means the two paths use different "
-           f"Mean-Feature objects.")
+           f"{abs(raw_pp - raw_sp):.4f}. Reported, not gated. This check once "
+           f"required the two to be equal. They must not be: the prediction is one "
+           f"global vector on both paths, but the target is not one object, being a "
+           f"bilinear read at a sample location on one path and a pooled cell on the "
+           f"other. Requiring equality would have pushed the implementation towards a "
+           f"per-path floor, which is the fault this file was written to find.")
 
-    # What object is each path's Mean-Feature prediction?
-    print("\n  Mean-Feature prediction objects, read from the source:")
-    print("    per_point  : correspondence.gather_value_pairs -> "
-          "features_context.mean(dim=(1,2))  == the PER-CONTEXT-IMAGE mean vector")
-    print("    splat_pool : evaluate.evaluate_pair_for_encoder -> "
-          "mean_feature_map [C,Hp,Wp]        == a POSITION-CONDITIONED mean MAP")
-    print("    centering  : evaluate.evaluate_pair_for_encoder -> "
-          "mean_feature_map.mean(dim=(1,2))  == a global vector")
-    spread = float(mean_map.std(dim=(1, 2)).mean())
+    print("")
+    print("  Mean-Feature prediction object, measured:")
+    print(f"    mean_vector shape {tuple(mean_vector.shape)}, passed to both roles")
     record("1.7", "the centering vector equals the Mean-Feature floor object",
-           False,
-           f"centering subtracts mean_map.mean(dim=(1,2)) (a global [C] vector) while "
-           f"splat_pool Mean-Feature predicts mean_map itself (a [C,Hp,Wp] map, mean "
-           f"per-channel spatial sd {spread:.4f}). PROTOCOL 3.7 requires them to be "
-           f"the same vector, which is exactly why centered Mean-Feature comes out "
-           f"finite instead of undefined.")
+           mean_vector.dim() == 1,
+           f"PROTOCOL 3.6 makes Mean-Feature one global D-vector and PROTOCOL 3.7 "
+           f"makes the same vector the centering statistic. evaluate.py passes one "
+           f"object to both roles; observed shape {tuple(mean_vector.shape)}.")
 
     print("\n" + "=" * 78)
     flags = [r for r in results if not r[2]]

@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Iterator, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -47,6 +48,27 @@ def pixel_to_patch_coords(uv_px: Tensor, patch_size: int = PATCH_SIZE) -> Tensor
     Pixel (u, v) maps to ((u + 0.5) / patch_size - 0.5, (v + 0.5) / patch_size - 0.5).
     """
     return (uv_px + 0.5) / patch_size - 0.5
+
+
+def patch_cell_index(
+    uv_px: Tensor, hw_px: tuple[int, int], patch_size: int = PATCH_SIZE
+) -> np.ndarray:
+    """Row-major patch-grid cell of each pixel coordinate. [N] int64.
+
+    Rounds the patch coordinate this module defines above, so which cell a
+    location belongs to and where that location samples the patch grid are two
+    readings of one mapping. CLAUDE.md keeps that mapping in this module alone;
+    it had been rewritten inline in correspondence.py and again in evaluate.py,
+    which left sample identity and cross-path cell assignment free to drift onto
+    different conventions the next time the mapping is touched.
+    """
+    if uv_px.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    patches_w = hw_px[1] // patch_size
+    patch = pixel_to_patch_coords(uv_px, patch_size)
+    cols = torch.round(patch[:, 0]).long()
+    rows = torch.round(patch[:, 1]).long()
+    return (rows * patches_w + cols).cpu().numpy()
 
 
 def patch_to_pixel_coords(uv_patch: Tensor, patch_size: int = PATCH_SIZE) -> Tensor:
@@ -239,6 +261,25 @@ def preprocess_images(
     return x
 
 
+def model_fingerprint(model: Any) -> str:
+    """A hash of every frozen parameter, recorded beside the cache it produced.
+
+    Torch Hub resolves a mutable branch head and the VGGT loader takes no
+    revision, so a later rebuild can pull different weights while every version
+    string in the metadata stays the same. Pinning the revisions is the real
+    fix and needs the exact identifiers; this makes the change detectable
+    meanwhile, which is the difference between a cache that is wrong and a cache
+    that is wrong and silent.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(
+            tensor.detach().to(torch.float32).cpu().numpy().tobytes(order="C")
+        )
+    return digest.hexdigest()
+
+
 class FrozenEncoder:
     """Common behaviour of the frozen encoder wrappers.
 
@@ -252,11 +293,19 @@ class FrozenEncoder:
         self.device = torch.device(device)
         self._model: Any = None
         self._channels: int | None = spec.channels
+        self._fingerprint: str | None = None
 
     @property
     def channels(self) -> int | None:
         """Feature width. None until the first batch, for models that declare none."""
         return self._channels
+
+    @property
+    def fingerprint(self) -> str:
+        """Hash of the loaded weights. Loads the model if it is not loaded yet."""
+        if self._fingerprint is None:
+            self._fingerprint = model_fingerprint(self.model)
+        return self._fingerprint
 
     @property
     def model(self) -> Any:
@@ -313,7 +362,14 @@ class DinoV2Encoder(FrozenEncoder):
     HUB_REPO = "facebookresearch/dinov2"
 
     def _load(self) -> Any:
-        return torch.hub.load(self.HUB_REPO, self.spec.source, trust_repo=True)
+        # LOT_DINOV2_REVISION pins the Torch Hub ref. A fingerprint tells you the
+        # weights changed; only a pinned ref lets you get the old ones back, and
+        # a rebuild after an upstream update would otherwise leave every scene
+        # agreeing on a checkpoint that is not the preregistered one.
+        revision = os.environ.get("LOT_DINOV2_REVISION")
+        repo = f"{self.HUB_REPO}:{revision}" if revision else self.HUB_REPO
+        self.revision = revision or "unpinned"
+        return torch.hub.load(repo, self.spec.source, trust_repo=True)
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
         x = preprocess_images(images_uint8, self.spec, self.device)
@@ -357,6 +413,14 @@ class VggtEncoder(FrozenEncoder):
                 "on a machine with the weights cached. Every other part of this "
                 "module works without it."
             ) from e
+        # LOT_VGGT_REVISION pins the Hugging Face revision, for the same reason.
+        revision = os.environ.get("LOT_VGGT_REVISION")
+        self.revision = revision or "unpinned"
+        # And the implementation that will run those weights, which the runbook
+        # installs from a git branch and which decides what the features are.
+        self.code_revision = package_revision("vggt")
+        if revision:
+            return VGGT.from_pretrained(self.spec.source, revision=revision)
         return VGGT.from_pretrained(self.spec.source)
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
@@ -440,7 +504,11 @@ def load_encoder(name: str, device: str = "cpu") -> FrozenEncoder:
 # Feature cache
 # ---------------------------------------------------------------------------
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+# 2: meta records features_digest, a content hash of the stored feature arrays,
+#    and weights_fingerprint is required rather than merely recorded. A cache
+#    written under 1 carries neither, so nothing downstream can tell whether it
+#    came from the weights this run believes it did.
 FEATURES_NAME = "features.npz"
 DEPTH_NAME = "depth.npz"
 CACHE_META_NAME = "meta.json"
@@ -543,6 +611,12 @@ def cache_scene_features(
         "has_depth": bool(export_depth),
         "batch_size": batch_size,
         "device": str(encoder.device),
+        "source": encoder.spec.source,
+        "weights_fingerprint": encoder.fingerprint,
+        "weights_revision": getattr(encoder, "revision", "unpinned"),
+        "code_revision": getattr(encoder, "code_revision", "n/a"),
+        "features_digest": features_digest(features),
+        "depth_digest": features_digest(depths) if export_depth else None,
         "encode_seconds": round(encode_seconds, 3),
         "total_seconds": round(total_seconds, 3),
         "frames_per_second": round(len(manifest.frames) / max(total_seconds, 1e-9), 3),
@@ -553,6 +627,57 @@ def cache_scene_features(
         _write_npz(out_dir / DEPTH_NAME, depths)
     meta_path.write_text(json.dumps(meta, indent=1), encoding="utf-8")
     return meta
+
+
+def package_revision(name: str) -> str:
+    """The commit an installed package was built from, or its version.
+
+    VGGT's inference implementation is a third artifact beside its weights and
+    the analysis code, and the runbook installs it from a git branch. The same
+    state dict run through different inference code produces different features,
+    so a weights fingerprint alone does not identify what made a cache.
+    """
+    try:
+        from importlib import metadata
+    except ImportError:  # pragma: no cover - importlib.metadata is stdlib here
+        return "unknown"
+    try:
+        direct = metadata.distribution(name).read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        return "absent"
+    except OSError:
+        direct = None
+    if direct:
+        try:
+            info = json.loads(direct).get("vcs_info") or {}
+        except ValueError:
+            info = {}
+        commit = info.get("commit_id")
+        if commit:
+            return commit
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "absent"
+
+
+def features_digest(features: dict[str, np.ndarray]) -> str:
+    """Content hash of a scene's feature arrays, over frame ids and bytes.
+
+    Computed once when the cache is written and stored in its metadata, so
+    everything downstream can check what it is reading without re-reading it.
+    The alternative, hashing at every use, would make the mean-vector cache
+    pointless: it exists so an 18-task array does not read the whole feature
+    cache eighteen times.
+
+    Frame ids are hashed alongside the bytes because a cache with the right
+    arrays under the wrong names is not the same cache.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for name in sorted(features):
+        digest.update(name.encode("utf-8"))
+        digest.update(np.ascontiguousarray(features[name]).tobytes())
+    return digest.hexdigest()
 
 
 def _batched(items: list, size: int) -> Iterator[list]:
@@ -593,14 +718,36 @@ def load_cached_depth(cache_root: Path, encoder_name: str, scene: str, frame_id:
         return torch.from_numpy(archive[frame_id])
 
 
-def validate_feature_cache(cache_root: Path, encoder_name: str, manifest: Any) -> dict[str, Any]:
+def validate_feature_cache(
+    cache_root: Path,
+    encoder_name: str,
+    manifest: Any,
+    check_digest: bool = False,
+) -> dict[str, Any]:
     """Check a scene cache against the manifest it was built from.
 
     Raises ValueError with the first problem found. Returns the metadata.
+
+    The provenance fields are required, not merely read when present. Recording
+    a weights fingerprint that nothing compares against documents a cache
+    without validating it, and a cache from a silently updated checkpoint would
+    still be accepted.
+
+    check_digest re-reads every array, features and depth alike, and recomputes
+    both content hashes. It is off by default because it costs a full pass over
+    the cache, and on for the validation entrypoint, whose job is exactly that
+    pass.
     """
     meta = load_cache_meta(cache_root, encoder_name, manifest.scene)
     if meta["encoder"] != encoder_name or meta["scene"] != manifest.scene:
         raise ValueError(f"cache is for {meta['encoder']} / {meta['scene']}")
+    for field in ("weights_fingerprint", "features_digest", "weights_revision"):
+        if not meta.get(field):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache metadata carries no "
+                f"{field}. Re-cache this scene; a cache whose provenance is "
+                "unknown cannot be told apart from one built with other weights"
+            )
     manifest_ids = [f.frame_id for f in manifest.frames]
     if meta["frame_ids"] != manifest_ids:
         missing = sorted(set(manifest_ids) - set(meta["frame_ids"]))
@@ -608,10 +755,63 @@ def validate_feature_cache(cache_root: Path, encoder_name: str, manifest: Any) -
             f"cache covers {len(meta['frame_ids'])} frames, manifest has "
             f"{len(manifest_ids)}; first missing: {missing[:3]}"
         )
-    expected = (int(meta["channels"]), *(int(v) for v in meta["patch_grid"]))
+    # The expected shape comes from the manifest and the registered encoder
+    # spec, never from the cache's own metadata. A cache that declares its own
+    # dimensions and is checked against them agrees with itself whatever it
+    # holds: a 1 by 1 grid claimed for a 28 by 28 frame passed, because nothing
+    # asked what shape the frame and the encoder imply.
+    spec = ENCODERS.get(encoder_name)
+    first = manifest.frames[0]
+    # The grid the manifest and the declared patch size imply. This holds even
+    # for an encoder that is not in the registry, because it ties the declared
+    # grid to the frame size rather than to another field of the same file.
+    declared_grid = patch_grid_shape((first.height, first.width), int(meta["patch_size"]))
+    if tuple(int(v) for v in meta["patch_grid"]) != tuple(declared_grid):
+        raise ValueError(
+            f"{encoder_name} / {manifest.scene}: cache declares patch grid "
+            f"{list(meta['patch_grid'])}, but {first.height}x{first.width} at "
+            f"patch size {meta['patch_size']} is {list(declared_grid)}"
+        )
+    if tuple(int(v) for v in meta["image_hw"]) != (first.height, first.width):
+        raise ValueError(
+            f"{encoder_name} / {manifest.scene}: cache declares image "
+            f"{list(meta['image_hw'])}, manifest says {[first.height, first.width]}"
+        )
+    for frame in manifest.frames:
+        if (frame.height, frame.width) != (first.height, first.width):
+            raise ValueError(
+                f"{frame.frame_id}: frame is {frame.height}x{frame.width}, "
+                f"{first.frame_id} is {first.height}x{first.width}; one cache "
+                "holds one image size"
+            )
+    if spec is not None:
+        # And for a registered encoder, the patch size and channel count are
+        # facts about the encoder rather than claims of the file.
+        if int(meta["patch_size"]) != int(spec.patch_size):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache declares patch size "
+                f"{meta['patch_size']}, {encoder_name} has {spec.patch_size}"
+            )
+        if int(meta["channels"]) != int(spec.channels):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache declares "
+                f"{meta['channels']} channels, {encoder_name} produces {spec.channels}"
+            )
+    expected = (int(meta["channels"]), *declared_grid)
     path = cache_dir(cache_root, encoder_name, manifest.scene) / FEATURES_NAME
     with np.load(path) as archive:
         stored = set(archive.files)
+        # Extra keys are refused, not ignored. dataset_mean_vector averages
+        # every array in the archive, so one stray key moves the Mean-Feature
+        # floor and the centering statistic together, and a check that only
+        # looks for what it expects cannot see it.
+        extra = sorted(stored - set(manifest_ids))
+        if extra:
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: {len(extra)} feature arrays "
+                f"the manifest does not name, first {extra[:3]}. Everything in "
+                "this archive is averaged into the global mean vector"
+            )
         for frame_id in manifest_ids:
             if frame_id not in stored:
                 raise ValueError(f"{frame_id}: missing from {path}")
@@ -620,17 +820,67 @@ def validate_feature_cache(cache_root: Path, encoder_name: str, manifest: Any) -
                 raise ValueError(f"{frame_id}: features {array.shape}, expected {expected}")
             if array.dtype != np.float16:
                 raise ValueError(f"{frame_id}: features dtype {array.dtype}, expected float16")
+    if check_digest:
+        with np.load(path) as archive:
+            stored_arrays = {name: archive[name] for name in archive.files}
+        found = features_digest(stored_arrays)
+        if found != meta["features_digest"]:
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: features digest {found} does "
+                f"not match the {meta['features_digest']} recorded when the cache "
+                "was written. The archive has been rebuilt or modified in place"
+            )
     if meta["has_depth"]:
+        # Depth and confidence are hashed too. Frame presence and shape do not
+        # protect content: every value in a depth archive can change while the
+        # keys and shapes stay right. That is inert for Experiment Zero, whose
+        # geometry is ground truth, and it is a Phase 4 blocker, because VGGT
+        # depth and its confidence become scientific inputs there.
+        if not meta.get("depth_digest"):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache declares depth and "
+                "records no depth_digest. Re-cache this scene"
+            )
         depth_path = cache_dir(cache_root, encoder_name, manifest.scene) / DEPTH_NAME
         image_hw = tuple(int(v) for v in meta["image_hw"])
         with np.load(depth_path) as archive:
-            for frame_id in manifest_ids:
-                if frame_id not in archive:
-                    raise ValueError(f"{frame_id}: missing from {depth_path}")
-                if archive[frame_id].shape != image_hw:
-                    raise ValueError(
-                        f"{frame_id}: depth {archive[frame_id].shape}, expected {image_hw}"
-                    )
+            stored_depth = {name: archive[name] for name in archive.files}
+        allowed = set(manifest_ids) | {f"{frame_id}__conf" for frame_id in manifest_ids}
+        extra_depth = sorted(set(stored_depth) - allowed)
+        if extra_depth:
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: {len(extra_depth)} depth "
+                f"arrays the manifest does not name, first {extra_depth[:3]}"
+            )
+        for frame_id in manifest_ids:
+            if frame_id not in stored_depth:
+                raise ValueError(f"{frame_id}: missing from {depth_path}")
+            if stored_depth[frame_id].shape != image_hw:
+                raise ValueError(
+                    f"{frame_id}: depth {stored_depth[frame_id].shape}, expected {image_hw}"
+                )
+            if stored_depth[frame_id].dtype != np.float16:
+                raise ValueError(
+                    f"{frame_id}: depth dtype {stored_depth[frame_id].dtype}, expected float16"
+                )
+            # Confidence rides in the same archive under a suffixed key. It gates
+            # which depths Phase 4 trusts, so an unchecked confidence map is an
+            # unchecked depth map by another route.
+            conf_key = f"{frame_id}__conf"
+            if conf_key in stored_depth:
+                conf = stored_depth[conf_key]
+                if conf.shape != image_hw:
+                    raise ValueError(f"{conf_key}: confidence {conf.shape}, expected {image_hw}")
+                if conf.dtype != np.float16:
+                    raise ValueError(f"{conf_key}: confidence dtype {conf.dtype}, expected float16")
+        if check_digest:
+            found = features_digest(stored_depth)
+            if found != meta["depth_digest"]:
+                raise ValueError(
+                    f"{encoder_name} / {manifest.scene}: depth digest {found} does "
+                    f"not match the {meta['depth_digest']} recorded when the cache "
+                    "was written. The archive has been rebuilt or modified in place"
+                )
     return meta
 
 
@@ -840,10 +1090,13 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.validate_only:
         failures = []
+        fingerprints: dict[str, list[str]] = {}
         for scene in scenes:
             try:
                 manifest = load_manifest(cfg.renders_root / scene / MANIFEST_NAME)
-                meta = validate_feature_cache(cfg.cache_root, cfg.encoder, manifest)
+                meta = validate_feature_cache(
+                    cfg.cache_root, cfg.encoder, manifest, check_digest=True
+                )
             except (FileNotFoundError, KeyError) as e:
                 print(f"[{scene}] MISSING: {e}")
                 failures.append(scene)
@@ -851,7 +1104,23 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[{scene}] INVALID: {e}")
                 failures.append(scene)
             else:
-                print(f"[{scene}] cache valid, {meta['frame_count']} frames")
+                fingerprints.setdefault(meta["weights_fingerprint"], []).append(scene)
+                print(
+                    f"[{scene}] cache valid, {meta['frame_count']} frames, "
+                    f"weights {meta['weights_fingerprint'][:12]}, "
+                    f"revision {meta.get('weights_revision', 'unpinned')}"
+                )
+        if len(fingerprints) > 1:
+            # One encoder, one set of weights. Scenes cached from different
+            # checkpoints are not one frozen representation, and every
+            # cross-scene aggregate over them is a mixture.
+            print("weights differ across scenes:")
+            for fingerprint, scene_list in sorted(fingerprints.items()):
+                print(f"  {fingerprint[:12]}  {len(scene_list)} scenes: {scene_list[:4]}")
+            raise SystemExit(
+                f"{len(fingerprints)} distinct weight fingerprints for {cfg.encoder}; "
+                "re-cache the minority scenes"
+            )
         if failures:
             raise SystemExit(
                 f"{len(failures)} of {len(scenes)} scenes failed validation: "

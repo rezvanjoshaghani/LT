@@ -1,11 +1,21 @@
 """Validator-defined test for VALIDATION 3.5, the arccos overshoot condition.
 
 VALIDATION 3.5 states the trigger explicitly: an exact identity is useless
-because (trace(R) - 1) / 2 is exactly 1 and arccos is defined there. The clamp
-exists for floating-point overshoot, so the trigger is constructed: take a
+because (trace(R) - 1) / 2 is exactly 1 and arccos is defined there. The
+condition needs floating-point overshoot, so the trigger is constructed: take a
 near-identity rotation and scale the matrix by (1 + 1e-13), which makes the
-arccos argument compute slightly above 1. With the clamp the result is finite
-and near zero degrees. Without it, math.acos raises or returns NaN.
+arccos argument compute slightly above 1. A clamped arccos returns a finite
+value near zero degrees; an unclamped one raises or returns NaN.
+
+The implementation no longer uses arccos. It is atan2 of the skew magnitude
+against the trace term, which has no bounded domain to leave, so these tests now
+assert that the overshoot condition simply cannot arise rather than that it is
+caught. That is a stronger property and the same requirement: VALIDATION 3.5
+asks that a matrix whose trace overshoots still yield a finite, correct angle.
+
+The condition is worth keeping as a validator-defined test precisely because it
+is independent of how the angle is computed. If the implementation ever returns
+to a bounded-domain formulation, this fails again without being rewritten.
 """
 
 import math

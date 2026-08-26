@@ -1,5 +1,6 @@
 """PLAN Phase 0, tests 2, 3, 4: exact two-plane transport, pure rotation, coverage."""
 
+import pytest
 import torch
 
 from lot.transport import transport
@@ -10,6 +11,7 @@ from scenes import (
     SLAB_TGT_COLS,
     Z_FRONT,
     build_rotation_scene,
+    build_signed_two_plane_scene,
     build_single_plane_scene,
     build_two_plane_scene,
     patch_codes,
@@ -234,3 +236,106 @@ def test_pure_rotation_transport_is_depth_independent():
     result_b = transport(features, depth_b, scene.K, scene.K, scene.T_target_from_context, OUT_HW)
     assert torch.equal(result_a.features, result_b.features)
     assert torch.equal(result_a.coverage, result_b.coverage)
+
+
+def _policy_splat(features, depth, K, T_tgt_from_ctx, out_hw, patch, policy):
+    """Pooled features under a stated occlusion policy.
+
+    policy "nearest" keeps the smallest target depth at each contested pixel,
+    which is what a z-buffer does. policy "last" keeps whichever contributor
+    arrives last in raster order, which is what a z-buffer with its comparison
+    removed does. The two are compared to show the scene can tell them apart.
+    """
+    from lot.geometry import pixel_grid, project, transform_points, unproject
+
+    height, width = depth.shape
+    out_height, out_width = out_hw
+    channels = features.shape[0]
+    uv = pixel_grid(height, width, dtype=depth.dtype)
+    points = transform_points(T_tgt_from_ctx, unproject(uv, depth, K))
+    uv_tgt, z_tgt = project(points, K)
+
+    winner: dict[tuple[int, int], tuple[float, int, int, int]] = {}
+    order = 0
+    for v in range(height):
+        for u in range(width):
+            order += 1
+            z = float(z_tgt[v, u])
+            if not (z > 0 and float(depth[v, u]) > 0):
+                continue
+            iu = int(torch.floor(uv_tgt[v, u, 0] + 0.5))
+            iv = int(torch.floor(uv_tgt[v, u, 1] + 0.5))
+            if not (0 <= iu < out_width and 0 <= iv < out_height):
+                continue
+            key = (iv, iu)
+            candidate = (z, order, v // patch, u // patch)
+            if key not in winner:
+                winner[key] = candidate
+            elif policy == "nearest":
+                if candidate[0] < winner[key][0]:
+                    winner[key] = candidate
+            elif policy == "last":
+                if candidate[1] > winner[key][1]:
+                    winner[key] = candidate
+            else:
+                raise ValueError(policy)
+
+    feat_px = torch.zeros((channels, out_height, out_width), dtype=torch.float32)
+    hit_px = torch.zeros((out_height, out_width), dtype=torch.bool)
+    for (iv, iu), (_, _, r, c) in winner.items():
+        feat_px[:, iv, iu] = features[:, r, c].to(torch.float32)
+        hit_px[iv, iu] = True
+
+    grid_h, grid_w = out_height // patch, out_width // patch
+    out = torch.zeros((channels, grid_h, grid_w), dtype=torch.float32)
+    for pr in range(grid_h):
+        for pc in range(grid_w):
+            block = hit_px[pr * patch:(pr + 1) * patch, pc * patch:(pc + 1) * patch]
+            n = int(block.sum())
+            if n:
+                values = feat_px[:, pr * patch:(pr + 1) * patch, pc * patch:(pc + 1) * patch]
+                out[:, pr, pc] = values.sum(dim=(1, 2)) / n
+    return out
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_occlusion_resolves_by_depth_not_by_write_order(sign):
+    """The z-buffer must keep the nearest surface, not the last one written.
+
+    Under a positive-x baseline the contributing source for a contested target
+    pixel sits at target-x plus the disparity, so the near surface, having the
+    larger disparity, always contributes from a later column and therefore
+    writes last. Nearest-depth and last-write-wins then coincide on every
+    contested pixel and the scene cannot tell them apart, which is why the
+    earlier test could not detect a z-buffer with its comparison removed.
+    Flipping the baseline puts the far surface's contributor last and separates
+    the policies. Both signs are exercised so the degeneracy cannot return
+    quietly through a later convention change.
+    """
+    scene = build_signed_two_plane_scene(sign)
+    result = transport(
+        scene.features_context,
+        scene.depth_context,
+        scene.K,
+        scene.K,
+        scene.T_target_from_context,
+        OUT_HW,
+    )
+    nearest = _policy_splat(
+        scene.features_context, scene.depth_context, scene.K,
+        scene.T_target_from_context, OUT_HW, PATCH, "nearest",
+    )
+    last = _policy_splat(
+        scene.features_context, scene.depth_context, scene.K,
+        scene.T_target_from_context, OUT_HW, PATCH, "last",
+    )
+    # The implementation resolves by depth, on pooled features, both signs.
+    assert torch.allclose(result.features, nearest, atol=1e-4)
+    if sign == -1:
+        # The far surface writes last here, so the policies genuinely differ and
+        # the assertion above has something to catch.
+        assert not torch.allclose(nearest, last, atol=1e-4)
+        assert not torch.allclose(result.features, last, atol=1e-4)
+    else:
+        # Documented degeneracy: this orientation cannot discriminate.
+        assert torch.allclose(nearest, last, atol=1e-4)

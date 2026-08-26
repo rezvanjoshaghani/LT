@@ -104,8 +104,16 @@ micromamba run -n lot-encode pip install torch --index-url https://download.pyto
 VGGT is a separate install and is only needed for the `vggt_1b` config:
 
 ```bash
-micromamba run -n lot-encode pip install "vggt @ git+https://github.com/facebookresearch/vggt"
+micromamba run -n lot-encode pip install "vggt @ git+https://github.com/facebookresearch/vggt@<commit>"
 ```
+
+Install VGGT's implementation at a commit, not a branch.
+`scripts/pin_encoder_revisions.py` resolves the commit and prints this line
+filled in. The implementation is a third artifact beside the weights and this
+repository: the same state dict run through different inference code produces
+different features, so a weights fingerprint alone does not identify what made
+a cache. The commit that was installed is recorded in every cache as
+`code_revision`.
 
 Weights download once. `cache_features.sbatch` points `TORCH_HOME` and
 `HF_HOME` at `cache/` in the repository, so compute nodes without internet

@@ -76,7 +76,7 @@ RAW = "cosine_mean"
 CENTERED = "cosine_centered_mean"
 
 
-def read_eval_dir(eval_dir: Path) -> list[dict[str, Any]]:
+def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[dict[str, Any]]:
     """Read every per-scene parquet in a directory, checking they are one run.
 
     Globbing a directory and concatenating whatever is there treats the file
@@ -124,9 +124,25 @@ def read_eval_dir(eval_dir: Path) -> list[dict[str, Any]]:
             )
         sidecars[stem] = json.loads(meta_path.read_text(encoding="utf-8"))
 
-    for field in ("eval_version", "encoders", "seed", "max_pairs_per_stratum",
-                  "git_commit", "run_scenes", "analysis_config_digest"):
+    required = (
+        "eval_version", "encoders", "seed", "max_pairs_per_stratum",
+        "git_commit", "run_scenes", "analysis_config_digest", "cache_provenance",
+    )
+    for field in required:
+        # Present, then equal. Comparing only what happens to be there makes a
+        # field that no file carries agree with itself: every value is null, the
+        # set has one element, and a directory written before the field existed
+        # passes the check that was added to catch it.
+        absent = sorted(scene for scene, meta in sidecars.items() if meta.get(field) is None)
+        if absent:
+            raise ValueError(
+                f"{eval_dir}: {len(absent)} run records carry no {field}, first "
+                f"{absent[0]}. They predate this analysis and cannot be shown to "
+                "describe the same measurement"
+            )
         found = {json.dumps(meta.get(field), sort_keys=True) for meta in sidecars.values()}
+        if field == "cache_provenance":
+            continue  # per-scene by construction; the weights are checked below
         if len(found) > 1:
             raise ValueError(
                 f"{eval_dir} mixes runs: {field} takes {len(found)} values "
@@ -176,6 +192,54 @@ def read_eval_dir(eval_dir: Path) -> list[dict[str, Any]]:
             "One encoder is one frozen representation, and a cross-scene "
             "aggregate over two checkpoints is a mixture"
         )
+    unpinned = sorted(
+        {
+            encoder
+            for meta in sidecars.values()
+            for encoder, entry in (meta.get("cache_provenance") or {}).items()
+            if entry.get("weights_revision", "unpinned") == "unpinned"
+        }
+    )
+    if unpinned:
+        print(
+            f"warning: {', '.join(unpinned)} were cached from an unpinned "
+            "checkpoint. The fingerprint would notice a change, but the "
+            "checkpoint these results used is not retrievable. See "
+            "scripts/pin_encoder_revisions.py"
+        )
+
+    # The config that reads a run must be the config that produced it, in every
+    # value that decided what the rows contain. Loading an arbitrary config and
+    # applying it bound nothing: a different co-visibility tolerance, sampling
+    # cap, or manifest bound would produce a different report from the same
+    # parquet with no complaint, and none of those are recoverable from the rows.
+    #
+    # Reporting values are deliberately not bound. PROTOCOL 3.4 has the support
+    # thresholds set from realized counts after the run, so requiring the whole
+    # config to match would forbid the documented workflow. What that edit
+    # changes is recorded instead, and the report carries both digests.
+    if config is not None:
+        expected = any_meta.get("analysis_measurement_digest")
+        if expected is None:
+            raise ValueError(
+                f"{eval_dir}: run records carry no analysis_measurement_digest, "
+                "so the config that produced them cannot be identified"
+            )
+        if expected != config.measurement_digest():
+            raise ValueError(
+                f"{eval_dir} was evaluated under measurement config {expected}, "
+                f"this analysis carries {config.measurement_digest()}. Those "
+                "values decide what the rows contain, not how they are read; "
+                "re-run the evaluation or analyse with the config it used"
+            )
+        if any_meta.get("analysis_reporting_digest") != config.reporting_digest():
+            print(
+                "note: reporting config differs from the run's "
+                f"({any_meta.get('analysis_reporting_digest')} -> "
+                f"{config.reporting_digest()}). Bin edges, support thresholds, "
+                "bootstrap settings or gate tolerances have been edited since "
+                "the evaluation, which PROTOCOL 3.4 permits from counts alone."
+            )
 
     rows: list[dict[str, Any]] = []
     for stem in sorted(tables):
@@ -1271,7 +1335,7 @@ def main(argv: list[str] | None = None) -> None:
     config = load_analysis_config(args.analysis_config)
     out_dir = args.out_dir or Path(args.eval_dir).parent
 
-    rows = assign_bins(read_eval_dir(args.eval_dir), config)
+    rows = assign_bins(read_eval_dir(args.eval_dir, config), config)
     records: list[dict[str, Any]] = []
     mismatches = 0
     for metric in (RAW, CENTERED):
@@ -1373,7 +1437,11 @@ def main(argv: list[str] | None = None) -> None:
     # left a directory holding a table and no figures when a figure failed, and
     # the retry then stopped because the table was already there: a state that
     # was neither complete nor re-runnable.
-    staging = Path(out_dir) / ".partial"
+    #
+    # The staging directory is per-process, not a fixed shared name. A fixed one
+    # is deleted on entry, so a second invocation would remove the first's
+    # half-built figures out from under it.
+    staging = Path(out_dir) / f".partial.{os.getpid()}"
     if staging.exists():
         shutil.rmtree(staging)
     figures = staging / "figures"
@@ -1422,14 +1490,34 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     write_table(staging / "tables" / "experiment_zero.parquet", summary_table(records, config))
+
+    # Publication order: refuse first, then move the figures, then the table.
+    #
+    # Every destination is checked before anything moves, so a name that already
+    # exists stops the run while the output directory is still untouched rather
+    # than after half the figures have been replaced. Outputs are never
+    # overwritten, and a figure is an output.
+    #
+    # The table goes last because it is what a retry trips over. If a move fails
+    # partway, the absent table lets the next run proceed; the reverse order
+    # left a table standing over a partial figure set and no way to rebuild it.
+    final_figures = Path(out_dir) / "figures"
+    built = sorted(figures.glob("*.png"))
+    clashes = [final_figures / p.name for p in built if (final_figures / p.name).exists()]
+    if clashes:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            "these figures already exist and are never overwritten: "
+            + ", ".join(str(p) for p in clashes)
+            + ". Delete them, or the run directory, to rebuild"
+        )
+    final_figures.mkdir(parents=True, exist_ok=True)
+    for source in built:
+        source.replace(final_figures / source.name)
+        print(f"figure -> {final_figures / source.name}")
     table_path.parent.mkdir(parents=True, exist_ok=True)
     (staging / "tables" / "experiment_zero.parquet").replace(table_path)
     print(f"table  -> {table_path}")
-    final_figures = Path(out_dir) / "figures"
-    final_figures.mkdir(parents=True, exist_ok=True)
-    for built in sorted(figures.glob("*.png")):
-        built.replace(final_figures / built.name)
-        print(f"figure -> {final_figures / built.name}")
     shutil.rmtree(staging, ignore_errors=True)
 
 

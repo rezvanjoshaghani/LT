@@ -31,7 +31,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Iterator, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -48,6 +48,27 @@ def pixel_to_patch_coords(uv_px: Tensor, patch_size: int = PATCH_SIZE) -> Tensor
     Pixel (u, v) maps to ((u + 0.5) / patch_size - 0.5, (v + 0.5) / patch_size - 0.5).
     """
     return (uv_px + 0.5) / patch_size - 0.5
+
+
+def patch_cell_index(
+    uv_px: Tensor, hw_px: tuple[int, int], patch_size: int = PATCH_SIZE
+) -> np.ndarray:
+    """Row-major patch-grid cell of each pixel coordinate. [N] int64.
+
+    Rounds the patch coordinate this module defines above, so which cell a
+    location belongs to and where that location samples the patch grid are two
+    readings of one mapping. CLAUDE.md keeps that mapping in this module alone;
+    it had been rewritten inline in correspondence.py and again in evaluate.py,
+    which left sample identity and cross-path cell assignment free to drift onto
+    different conventions the next time the mapping is touched.
+    """
+    if uv_px.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    patches_w = hw_px[1] // patch_size
+    patch = pixel_to_patch_coords(uv_px, patch_size)
+    cols = torch.round(patch[:, 0]).long()
+    rows = torch.round(patch[:, 1]).long()
+    return (rows * patches_w + cols).cpu().numpy()
 
 
 def patch_to_pixel_coords(uv_patch: Tensor, patch_size: int = PATCH_SIZE) -> Tensor:
@@ -395,6 +416,9 @@ class VggtEncoder(FrozenEncoder):
         # LOT_VGGT_REVISION pins the Hugging Face revision, for the same reason.
         revision = os.environ.get("LOT_VGGT_REVISION")
         self.revision = revision or "unpinned"
+        # And the implementation that will run those weights, which the runbook
+        # installs from a git branch and which decides what the features are.
+        self.code_revision = package_revision("vggt")
         if revision:
             return VGGT.from_pretrained(self.spec.source, revision=revision)
         return VGGT.from_pretrained(self.spec.source)
@@ -590,6 +614,7 @@ def cache_scene_features(
         "source": encoder.spec.source,
         "weights_fingerprint": encoder.fingerprint,
         "weights_revision": getattr(encoder, "revision", "unpinned"),
+        "code_revision": getattr(encoder, "code_revision", "n/a"),
         "features_digest": features_digest(features),
         "depth_digest": features_digest(depths) if export_depth else None,
         "encode_seconds": round(encode_seconds, 3),
@@ -602,6 +627,38 @@ def cache_scene_features(
         _write_npz(out_dir / DEPTH_NAME, depths)
     meta_path.write_text(json.dumps(meta, indent=1), encoding="utf-8")
     return meta
+
+
+def package_revision(name: str) -> str:
+    """The commit an installed package was built from, or its version.
+
+    VGGT's inference implementation is a third artifact beside its weights and
+    the analysis code, and the runbook installs it from a git branch. The same
+    state dict run through different inference code produces different features,
+    so a weights fingerprint alone does not identify what made a cache.
+    """
+    try:
+        from importlib import metadata
+    except ImportError:  # pragma: no cover - importlib.metadata is stdlib here
+        return "unknown"
+    try:
+        direct = metadata.distribution(name).read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        return "absent"
+    except OSError:
+        direct = None
+    if direct:
+        try:
+            info = json.loads(direct).get("vcs_info") or {}
+        except ValueError:
+            info = {}
+        commit = info.get("commit_id")
+        if commit:
+            return commit
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "absent"
 
 
 def features_digest(features: dict[str, np.ndarray]) -> str:
@@ -684,7 +741,7 @@ def validate_feature_cache(
     meta = load_cache_meta(cache_root, encoder_name, manifest.scene)
     if meta["encoder"] != encoder_name or meta["scene"] != manifest.scene:
         raise ValueError(f"cache is for {meta['encoder']} / {meta['scene']}")
-    for field in ("weights_fingerprint", "features_digest"):
+    for field in ("weights_fingerprint", "features_digest", "weights_revision"):
         if not meta.get(field):
             raise ValueError(
                 f"{encoder_name} / {manifest.scene}: cache metadata carries no "
@@ -698,10 +755,66 @@ def validate_feature_cache(
             f"cache covers {len(meta['frame_ids'])} frames, manifest has "
             f"{len(manifest_ids)}; first missing: {missing[:3]}"
         )
-    expected = (int(meta["channels"]), *(int(v) for v in meta["patch_grid"]))
+    # The expected shape comes from the manifest and the registered encoder
+    # spec, never from the cache's own metadata. A cache that declares its own
+    # dimensions and is checked against them agrees with itself whatever it
+    # holds: a 1 by 1 grid claimed for a 28 by 28 frame passed, because nothing
+    # asked what shape the frame and the encoder imply.
+    spec = ENCODERS.get(encoder_name)
+    first = manifest.frames[0]
+    # The grid the manifest and the declared patch size imply. This holds even
+    # for an encoder that is not in the registry, because it ties the declared
+    # grid to the frame size rather than to another field of the same file.
+    declared_grid = patch_grid_shape((first.height, first.width), int(meta["patch_size"]))
+    if tuple(int(v) for v in meta["patch_grid"]) != tuple(declared_grid):
+        raise ValueError(
+            f"{encoder_name} / {manifest.scene}: cache declares patch grid "
+            f"{list(meta['patch_grid'])}, but {first.height}x{first.width} at "
+            f"patch size {meta['patch_size']} is {list(declared_grid)}"
+        )
+    if tuple(int(v) for v in meta["image_hw"]) != (first.height, first.width):
+        raise ValueError(
+            f"{encoder_name} / {manifest.scene}: cache declares image "
+            f"{list(meta['image_hw'])}, manifest says {[first.height, first.width]}"
+        )
+    for frame in manifest.frames:
+        if (frame.height, frame.width) != (first.height, first.width):
+            raise ValueError(
+                f"{frame.frame_id}: frame is {frame.height}x{frame.width}, "
+                f"{first.frame_id} is {first.height}x{first.width}; one cache "
+                "holds one image size"
+            )
+    if spec is not None:
+        # And for a registered encoder, the patch size and channel count are
+        # facts about the encoder rather than claims of the file.
+        if int(meta["patch_size"]) != int(spec.patch_size):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache declares patch size "
+                f"{meta['patch_size']}, {encoder_name} has {spec.patch_size}"
+            )
+        # VGGT's width is not known before the model runs, so its spec declares
+        # None and there is nothing to compare against. Guarding on that rather
+        # than coercing it: int(None) would have raised on the real cache.
+        if spec.channels is not None and int(meta["channels"]) != int(spec.channels):
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: cache declares "
+                f"{meta['channels']} channels, {encoder_name} produces {spec.channels}"
+            )
+    expected = (int(meta["channels"]), *declared_grid)
     path = cache_dir(cache_root, encoder_name, manifest.scene) / FEATURES_NAME
     with np.load(path) as archive:
         stored = set(archive.files)
+        # Extra keys are refused, not ignored. dataset_mean_vector averages
+        # every array in the archive, so one stray key moves the Mean-Feature
+        # floor and the centering statistic together, and a check that only
+        # looks for what it expects cannot see it.
+        extra = sorted(stored - set(manifest_ids))
+        if extra:
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: {len(extra)} feature arrays "
+                f"the manifest does not name, first {extra[:3]}. Everything in "
+                "this archive is averaged into the global mean vector"
+            )
         for frame_id in manifest_ids:
             if frame_id not in stored:
                 raise ValueError(f"{frame_id}: missing from {path}")
@@ -735,6 +848,13 @@ def validate_feature_cache(
         image_hw = tuple(int(v) for v in meta["image_hw"])
         with np.load(depth_path) as archive:
             stored_depth = {name: archive[name] for name in archive.files}
+        allowed = set(manifest_ids) | {f"{frame_id}__conf" for frame_id in manifest_ids}
+        extra_depth = sorted(set(stored_depth) - allowed)
+        if extra_depth:
+            raise ValueError(
+                f"{encoder_name} / {manifest.scene}: {len(extra_depth)} depth "
+                f"arrays the manifest does not name, first {extra_depth[:3]}"
+            )
         for frame_id in manifest_ids:
             if frame_id not in stored_depth:
                 raise ValueError(f"{frame_id}: missing from {depth_path}")

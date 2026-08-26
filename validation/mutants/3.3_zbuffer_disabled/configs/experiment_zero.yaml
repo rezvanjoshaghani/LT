@@ -33,10 +33,8 @@ scenes:
   - room_0
   - room_1
   - room_2
-# Strata are (scene, regime, parallax bin). Camera programs produce far more
-# small-parallax pairs than large ones, so an unstratified sample would report
-# mostly the easy end.
-max_pairs_per_stratum: 40
-points_per_pair: 512
-min_covisible_fraction: 0.5
+# max_pairs_per_stratum, points_per_pair, and min_covisible_fraction are not
+# here. PROTOCOL's preamble makes them config-resident in configs/analysis.yaml,
+# which is part of the protocol; a run config may not shadow them.
 seed: 0
+analysis_config: configs/analysis.yaml

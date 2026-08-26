@@ -279,9 +279,9 @@ def _plane_residual_spread(z: Tensor, x: Tensor, y: Tensor) -> float:
 def classify_depth_convention(
     depth: Tensor,
     K: Tensor,
-    center_crop: float = 0.5,
-    flat_tol: float = 0.01,
-    margin: float = 3.0,
+    center_crop: float | None = None,
+    flat_tol: float | None = None,
+    margin: float | None = None,
     max_samples: int = 20000,
 ) -> dict[str, Any]:
     """Decide whether a depth map of a planar surface is planar z or euclidean.
@@ -303,6 +303,10 @@ def classify_depth_convention(
     'euclidean_ray', or 'ambiguous'), spread_planar, spread_euclidean,
     median_m, valid_fraction.
     """
+    config = _analysis()
+    center_crop = config.depth_convention_center_crop if center_crop is None else center_crop
+    flat_tol = config.depth_convention_flat_tol if flat_tol is None else flat_tol
+    margin = config.depth_convention_margin if margin is None else margin
     if depth.dim() != 2:
         raise ValueError(f"depth must be [H, W], got {tuple(depth.shape)}")
     if not 0 < center_crop <= 1:
@@ -593,17 +597,132 @@ def load_manifest(path: Path) -> Manifest:
     return Manifest(scene=payload["scene"], metadata=payload["metadata"], frames=frames)
 
 
-def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) -> None:
+def rotation_position_residuals(manifest: Manifest) -> dict[int, float]:
+    """Largest camera-position spread within each viewpoint's rotation frames.
+
+    PROTOCOL 3.3: in-place rotation has translation exactly zero by
+    construction, and that is asserted from the manifest rather than trusted.
+    The manifest stores the pose read back from the simulator, not the pose that
+    was planned, so the assertion is against a bound rather than against exact
+    equality. It matters twice: a pair whose read-back spread exceeds the
+    zero-parallax tolerance silently leaves the zero bin, and PROTOCOL 4.5 makes
+    exact zero translation a hard invariant for the Phase 4 gate.
+
+    Reported per viewpoint rather than as one scene aggregate, because a single
+    bad viewpoint hidden inside a scene maximum is exactly what an aggregate
+    conceals.
+    """
+    positions: dict[int, list[Tensor]] = {}
+    for frame in manifest.frames:
+        if frame.regime != "rotation":
+            continue
+        viewpoint = int(frame.params.get("viewpoint", -1))
+        positions.setdefault(viewpoint, []).append(frame.T_world_from_camera[:3, 3])
+    residuals: dict[int, float] = {}
+    for viewpoint, values in positions.items():
+        stacked = torch.stack([v.to(torch.float64) for v in values])
+        residuals[viewpoint] = float(
+            (stacked - stacked.mean(dim=0, keepdim=True)).norm(dim=1).max()
+        )
+    return residuals
+
+
+def translation_rotation_residuals(manifest: Manifest) -> dict[int, float]:
+    """Largest pairwise rotation, in degrees, among each viewpoint's translation frames.
+
+    Pairwise, over every unordered pair, because the pair is what becomes a
+    camera pair downstream.
+
+    The mirror of rotation_position_residuals. PROTOCOL 3.3 makes translation
+    the sole source of the primary parallax curve precisely because it holds
+    rotation at exactly zero, so a translation frame whose orientation drifted
+    would put an unlabelled rotation into the marginal that exists to exclude
+    it. Nothing downstream could see it: rows carry rotation_deg per pair, but
+    the regime tag is what routes a pair onto the curve.
+    """
+    from .geometry import rotation_angle_deg
+
+    orientations: dict[int, list[Tensor]] = {}
+    for frame in manifest.frames:
+        if frame.regime != "translation":
+            continue
+        viewpoint = int(frame.params.get("viewpoint", -1))
+        orientations.setdefault(viewpoint, []).append(frame.T_world_from_camera[:3, :3])
+    residuals: dict[int, float] = {}
+    for viewpoint, values in orientations.items():
+        # Every pair, not every frame against the first. Orientations at 0,
+        # +9e-5 and -9e-5 degrees are each within 9e-5 of the first, and the
+        # worst actual pair is 1.8e-4: measuring against a reference passes a
+        # bound the population violates, and it is the pair that becomes a
+        # camera pair, not the frame.
+        doubles = [R.to(torch.float64) for R in values]
+        residuals[viewpoint] = max(
+            (
+                rotation_angle_deg(a.mT @ b)
+                for i, a in enumerate(doubles)
+                for b in doubles[i + 1 :]
+            ),
+            default=0.0,
+        )
+    return residuals
+
+
+def validate_manifest(
+    manifest: Manifest,
+    root: Path,
+    check_files: bool = True,
+    rotation_position_bound_m: float | None = None,
+    translation_rotation_bound_deg: float | None = None,
+) -> dict[str, Any]:
     """Validate a manifest. Raises ValueError with the first problem found.
 
     Checks: frames exist, frame ids unique, regimes allowed, intrinsics and
-    poses well formed with orthonormal rotations, depth convention resolved
-    in metadata with planar z-depth on disk, and, when check_files is True,
-    every referenced file exists and the depth arrays have the declared
+    poses well formed with orthonormal rotations, in-place rotation frames
+    sharing a camera position within the read-back bound, depth convention
+    resolved in metadata with planar z-depth on disk, and, when check_files is
+    True, every referenced file exists and the depth arrays have the declared
     shape and float32 dtype.
+
+    Both bounds come from the normative analysis config. Passing None skips only
+    that assertion, for callers validating a manifest before the config exists.
+    Returns the per-viewpoint rotation-program position residuals.
     """
     if not manifest.frames:
         raise ValueError("manifest has no frames")
+    residuals = rotation_position_residuals(manifest)
+    rotation_residuals = translation_rotation_residuals(manifest)
+    if translation_rotation_bound_deg is not None:
+        offenders = {
+            viewpoint: value
+            for viewpoint, value in rotation_residuals.items()
+            if value > translation_rotation_bound_deg
+        }
+        if offenders:
+            worst = max(offenders, key=offenders.get)
+            raise ValueError(
+                f"translation frames do not share one orientation: viewpoint "
+                f"{worst} spreads {offenders[worst]:.3e} deg, bound "
+                f"{translation_rotation_bound_deg:.3e} deg, across "
+                f"{len(offenders)} viewpoints. PROTOCOL 3.3 makes translation "
+                "the sole source of the primary parallax curve because it holds "
+                "rotation at exactly zero"
+            )
+    if rotation_position_bound_m is not None:
+        offenders = {
+            viewpoint: value
+            for viewpoint, value in residuals.items()
+            if value > rotation_position_bound_m
+        }
+        if offenders:
+            worst = max(offenders, key=offenders.get)
+            raise ValueError(
+                f"in-place rotation frames do not share a camera position: "
+                f"viewpoint {worst} spreads {offenders[worst]:.3e} m, bound "
+                f"{rotation_position_bound_m:.3e} m, across {len(offenders)} "
+                "viewpoints. PROTOCOL 3.3 asserts this regime's translation is "
+                "exactly zero, and a pair above the zero-parallax tolerance "
+                "silently leaves the zero bin"
+            )
     seen: set[str] = set()
     dc = manifest.metadata.get("depth_convention")
     if not isinstance(dc, dict):
@@ -646,6 +765,7 @@ def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) 
                 raise ValueError(f"{f.frame_id}: depth shape {shape}")
             if dtype != np.float32:
                 raise ValueError(f"{f.frame_id}: depth dtype {dtype}")
+    return {"rotation_position_residuals_m": residuals}
 
 
 # ---------------------------------------------------------------------------
@@ -655,18 +775,17 @@ def validate_manifest(manifest: Manifest, root: Path, check_files: bool = True) 
 FRAME_STATS_VERSION = 2
 FRAME_STATS_NAME = "frame_stats.json"
 
-# Defaults for the usability test below. They are deliberately permissive: the
-# job is to drop frames that are not views of the scene, not to judge views.
-MIN_USABLE_VALID_FRACTION = 0.5
-MIN_USABLE_CLEARANCE_M = 0.15
+def _analysis():
+    """The normative config, resolved lazily so importing needs no file read."""
+    from .analysis_config import load_analysis_config
 
-# A depth below this is a rendering artifact, not a surface. Used wherever a
-# depth map is asked whether a pixel saw anything.
-NEAR_DEPTH_FLOOR_M = 0.05
+    return load_analysis_config()
+
+
 
 
 def frame_depth_stats(
-    depth: np.ndarray, center_crop: float = 0.5, near_m: float = NEAR_DEPTH_FLOOR_M
+    depth: np.ndarray, center_crop: float | None = None, near_m: float | None = None
 ) -> dict[str, float]:
     """Depth quality statistics for one rendered frame, in meters.
 
@@ -679,6 +798,9 @@ def frame_depth_stats(
     pixel cannot decide whether a frame is usable. Statistics that no valid
     pixel supports come back as nan.
     """
+    config = _analysis()
+    center_crop = config.depth_convention_center_crop if center_crop is None else center_crop
+    near_m = config.frame_near_depth_floor_m if near_m is None else near_m
     d = np.asarray(depth, dtype=np.float64)
     if d.ndim != 2:
         raise ValueError(f"depth must be [H, W], got {d.shape}")
@@ -720,8 +842,8 @@ def _stat(stats: dict[str, Any], key: str) -> float:
 
 def frame_is_usable(
     stats: dict[str, float],
-    min_valid_fraction: float = MIN_USABLE_VALID_FRACTION,
-    min_clearance_m: float = MIN_USABLE_CLEARANCE_M,
+    min_valid_fraction: float | None = None,
+    min_clearance_m: float | None = None,
 ) -> bool:
     """Whether one frame is a view of the scene at all.
 
@@ -743,6 +865,11 @@ def frame_is_usable(
     matters most, and distant views carry the near-homography regime. Median
     depth belongs in the stratification, not in the gate.
     """
+    config = _analysis()
+    if min_valid_fraction is None:
+        min_valid_fraction = config.frame_min_valid_fraction
+    if min_clearance_m is None:
+        min_clearance_m = config.frame_min_clearance_m
     clearance = _stat(stats, "center_p01_m")
     if not math.isfinite(clearance):
         return False
@@ -1013,7 +1140,7 @@ def _navmesh_matches_geometry(sim, eye_height_m: float, n_points: int = 3) -> bo
             [0.0, eye_height_m, 0.0], dtype=torch.float64
         )
         _, depth_raw, _ = render_at_pose(sim, look_at_cv(eye, eye + down, up_ref))
-        valid = np.isfinite(depth_raw) & (depth_raw > 0.05)
+        valid = np.isfinite(depth_raw) & (depth_raw > _analysis().frame_near_depth_floor_m)
         fractions.append(float(valid.mean()))
     return float(np.median(np.asarray(fractions))) >= 0.5
 
@@ -1229,7 +1356,13 @@ def sample_viewpoints(
     enough clearance in the central crop, and enough distance from already
     accepted viewpoints. Returns viewpoint dicts with the base pose and the
     median depth used to size translation and orbit programs.
+
+    The near-depth floor comes from the normative analysis config, the same
+    value depth_stats uses. Held as a literal here it would have meant that
+    changing the normative number moved which frames were kept but not which
+    viewpoints were chosen in the first place.
     """
+    near_m = _analysis().frame_near_depth_floor_m
     accepted: list[dict[str, Any]] = []
     positions: list[np.ndarray] = []
     attempts = 0
@@ -1249,7 +1382,7 @@ def sample_viewpoints(
         T_base = look_at_cv(eye, eye + direction, _UP_WORLD)
         _, depth_raw, _ = render_at_pose(sim, T_base)
         depth = to_planar(depth_raw)
-        valid = np.isfinite(depth) & (depth > 0.05)
+        valid = np.isfinite(depth) & (depth > near_m)
         valid_fraction = float(valid.mean())
         if valid_fraction < cfg.min_valid_fraction:
             continue
@@ -1259,7 +1392,7 @@ def sample_viewpoints(
         h, w = depth.shape
         ch, cw = h // 4, w // 4
         center = depth[ch : h - ch, cw : w - cw]
-        center_valid = center[np.isfinite(center) & (center > 0.05)]
+        center_valid = center[np.isfinite(center) & (center > near_m)]
         if center_valid.size == 0 or float(center_valid.min()) < cfg.min_clearance_m:
             continue
         accepted.append(
@@ -1392,7 +1525,13 @@ def render_scene(cfg: RenderConfig, scene: str) -> Path:
     }
     manifest = Manifest(scene=scene, metadata=metadata, frames=records)
     write_manifest(manifest_path, manifest)
-    validate_manifest(load_manifest(manifest_path), out_dir, check_files=True)
+    validate_manifest(
+        load_manifest(manifest_path),
+        out_dir,
+        check_files=True,
+        rotation_position_bound_m=_analysis().rotation_position_bound_m,
+        translation_rotation_bound_deg=_analysis().translation_rotation_bound_deg,
+    )
     write_scene_qc(out_dir, manifest, cfg.qc_frames_per_regime)
     print(f"[{scene}] {len(records)} frames {per_regime}; manifest {manifest_path}")
     return manifest_path
@@ -1470,7 +1609,11 @@ def main(argv: list[str] | None = None) -> None:
             out_dir = cfg.output_root / scene
             try:
                 validate_manifest(
-                    load_manifest(out_dir / MANIFEST_NAME), out_dir, check_files=True
+                    load_manifest(out_dir / MANIFEST_NAME),
+                    out_dir,
+                    check_files=True,
+                    rotation_position_bound_m=_analysis().rotation_position_bound_m,
+        translation_rotation_bound_deg=_analysis().translation_rotation_bound_deg,
                 )
             except FileNotFoundError:
                 print(f"[{scene}] MISSING: no manifest at {out_dir / MANIFEST_NAME}")
@@ -1520,7 +1663,13 @@ def main(argv: list[str] | None = None) -> None:
         if args.qc_only:
             out_dir = cfg.output_root / scene
             manifest = load_manifest(out_dir / MANIFEST_NAME)
-            validate_manifest(manifest, out_dir, check_files=True)
+            validate_manifest(
+                manifest,
+                out_dir,
+                check_files=True,
+                rotation_position_bound_m=_analysis().rotation_position_bound_m,
+        translation_rotation_bound_deg=_analysis().translation_rotation_bound_deg,
+            )
             write_scene_qc(out_dir, manifest, cfg.qc_frames_per_regime)
             print(f"[{scene}] QC sheets written under {out_dir / 'qc'}")
         else:

@@ -326,3 +326,45 @@ def build_rotation_scene(yaw_deg: float = 5.0) -> RotationScene:
         T_target_from_context=T_target_from_context,
         R_target_from_context=T_target_from_context[:3, :3],
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class SignedTwoPlaneScene:
+    """The two-plane occlusion scene with the baseline direction as a parameter.
+
+    Which surface wins a contested target pixel is decided by depth. Which one
+    is *written last* is decided by raster order, and raster order follows the
+    source column. Under a positive-x baseline the contributing source for a
+    target pixel sits at target-x plus the disparity, so the near surface, with
+    the larger disparity, always contributes from a later column and therefore
+    writes last. Nearest-depth and last-write-wins then agree on every contested
+    pixel and no test on this scene can tell them apart. Flipping the baseline
+    puts the far surface's contributor later and separates the two policies.
+    """
+
+    sign: int
+    K: Tensor
+    T_target_from_context: Tensor
+    depth_context: Tensor
+    features_context: Tensor
+
+
+def build_signed_two_plane_scene(sign: int = 1) -> SignedTwoPlaneScene:
+    """Front slab at Z_FRONT over context columns 70..125, back plane behind."""
+    if sign not in (1, -1):
+        raise ValueError("sign must be 1 or -1")
+    K = intrinsics()
+    T_world_from_context = make_pose()
+    T_world_from_target = make_pose(t=torch.tensor([sign * BASELINE, 0.0, 0.0]))
+    T_target_from_context = relative_pose(T_world_from_target, T_world_from_context)
+    cols = torch.arange(IMAGE_SIZE)
+    slab = (cols >= SLAB_CTX_COLS[0]) & (cols < SLAB_CTX_COLS[1])
+    depth_context = torch.full((IMAGE_SIZE, IMAGE_SIZE), Z_BACK, dtype=torch.float64)
+    depth_context[:, slab] = Z_FRONT
+    return SignedTwoPlaneScene(
+        sign=sign,
+        K=K,
+        T_target_from_context=T_target_from_context,
+        depth_context=depth_context,
+        features_context=patch_codes(),
+    )

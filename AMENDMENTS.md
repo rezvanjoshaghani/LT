@@ -154,6 +154,37 @@ Consequence: rotation_deg changes by at most a part in 1e15 for the angles the
 programs actually produce, and changes materially only for angles at or below
 the old noise floor, which is exactly the population the zero bin is about.
 
+### 2026-08-26: encoder revisions are recorded, and pinnable
+
+LOT_DINOV2_REVISION and LOT_VGGT_REVISION pin the checkpoints;
+scripts/pin_encoder_revisions.py resolves both and prints them. VGGT's
+inference implementation is a third artifact and is installed at a commit
+rather than a branch, since the same state dict run through different code
+produces different features. All three are recorded in every cache and travel
+into the evaluation run record.
+
+Concrete values are not written here yet. They are resolved on the cluster
+immediately before the caching jobs, and recording a value that has not been
+used would be a claim rather than a record. The entry is completed when the
+caches are rebuilt.
+
+### 2026-08-26: the analysis config has a measurement identity and a reporting identity
+
+A report was not bound to the config that produced the run it reads, so a
+different co-visibility tolerance, sampling cap, or manifest bound would have
+produced a different report from the same parquet without complaint.
+
+Requiring the whole config to match is wrong in the other direction, because
+PROTOCOL 3.4 has the support thresholds set from realized counts after the run.
+That edit is a reporting change by construction, and forbidding it would forbid
+the documented workflow.
+
+So the config carries two digests. The measurement digest covers the values that
+decide what the rows contain, and the analysis refuses a run whose measurement
+digest differs. The reporting digest covers bin edges, support thresholds,
+bootstrap settings and gate tolerances; a difference there is reported, not
+refused. Both are recorded per scene.
+
 ---
 
 ## Post-freeze

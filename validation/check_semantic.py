@@ -27,11 +27,12 @@ def m36_leak_target(d: Path) -> str:
     """3.6 Substitute the true target feature into Oracle-Transport's prediction."""
     patch(
         d / "src" / "lot" / "correspondence.py",
-        '    mean = features_context.to(out["warp"].dtype).mean(dim=(1, 2))',
-        '    # CONTROL 3.6: the prediction IS the target. Raw cosine must become\n'
-        '    # exactly 1, and centered cosine must too wherever it is defined.\n'
-        '    out["warp"] = out["target"].clone()\n'
-        '    mean = features_context.to(out["warp"].dtype).mean(dim=(1, 2))',
+        '        "warp": sample_features_bilinear('
+        'features_context, samples.uv_context_warp, patch_size),',
+        '        # CONTROL 3.6: the prediction IS the target. Raw cosine must\n'
+        '        # become exactly 1, and centered cosine too where defined.\n'
+        '        "warp": sample_features_bilinear('
+        'features_target, samples.uv_target, patch_size),',
     )
     return "Oracle-Transport per-point prediction replaced by the true target feature"
 
@@ -40,14 +41,16 @@ def m37_shuffle_correspondences(d: Path) -> str:
     """3.7 Permute the warp locations within a pair."""
     patch(
         d / "src" / "lot" / "correspondence.py",
-        "    return CorrespondenceSamples(\n        uv_target=uv_target,\n        uv_context_warp=uv_warp,",
+        "    return CorrespondenceSamples(\n        sample_id=ids,",
         "    # CONTROL 3.7: correspondence identity destroyed by permuting the warp\n"
         "    # locations within this pair. The set of read locations is unchanged;\n"
-        "    # only which target each is paired with changes.\n"
+        "    # only which target each is paired with changes. The permutation is\n"
+        "    # derived from the ids rather than drawn, because the sampler carries\n"
+        "    # no generator: selection here is a hash, not a shuffle.\n"
         "    if uv_warp.shape[0] > 1:\n"
-        "        perm = torch.randperm(uv_warp.shape[0], generator=generator).to(uv_warp.device)\n"
-        "        uv_warp = uv_warp[perm]\n"
-        "    return CorrespondenceSamples(\n        uv_target=uv_target,\n        uv_context_warp=uv_warp,",
+        "        _perm = np.argsort(derived_draw(ids, SELECTION_SALT, 1 << 62), kind='stable')\n"
+        "        uv_warp = uv_warp[torch.from_numpy(_perm.copy()).to(uv_warp.device)]\n"
+        "    return CorrespondenceSamples(\n        sample_id=ids,",
     )
     return "warp locations permuted within each pair"
 

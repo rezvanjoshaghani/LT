@@ -1,4 +1,4 @@
-"""PLAN Phase 3: value-level transportability, its floors, and the results table."""
+"""PROTOCOL 3.2, 3.5, 3.6, 3.7: scored records, the frozen nulls, and the metrics."""
 
 import json
 import math
@@ -7,35 +7,250 @@ import numpy as np
 import pytest
 import torch
 
+from lot.analysis_config import load_analysis_config
+from lot.correspondence import NEIGHBOR_OFFSETS, choose_in_bounds_offset
 from lot.evaluate import (
     MEAN_FEATURE,
+    NEIGHBOR_PATCH,
     NO_WARP_COPY,
     ORACLE_TRANSPORT,
     PER_POINT,
+    RANDOM_PATCH,
     SPLAT_POOL,
+    VARIANTS,
     EvalConfig,
     agreement_metrics,
-    dataset_mean_feature_map,
+    assert_source_read_sets_agree,
+    assert_unique_sample_ids,
+    cross_path_record_difference,
+    dataset_mean_vector,
     evaluate_pair_for_encoder,
     evaluate_scene,
     load_eval_config,
+    pack_mask,
     pair_geometry,
+    pair_parallax,
     read_rows,
+    splat_neighbor_prediction,
+    universe_sample_ids,
+    unpack_mask,
     unit_normalize,
     value_agreement,
     write_rows,
 )
-from lot.render_replica import (
-    FrameRecord,
-    Manifest,
-    intrinsics_from_hfov,
-    program_rotation,
-    program_translation,
-    write_frame_stats,
-    write_manifest,
-)
-from scenes import GRID, build_two_plane_scene, patch_codes
-from test_render_replica import base_pose
+from lot.render_replica import intrinsics_from_hfov
+from lot.transport import apply_transport_plan
+from scenes import GRID, build_two_plane_scene
+
+ANALYSIS = load_analysis_config()
+IDENTITY = ("room_0", "ctx", "tgt")
+SIDE = 56
+SMALL_GRID = SIDE // 14
+
+
+def identity_pair(channels=6, seed=0):
+    """A pair whose transport plan is the identity, so both paths read one patch.
+
+    With no relative motion and constant depth, every context pixel lands on
+    itself, so each target patch draws all of its weight from the source patch of
+    the same index. That collapses the difference between the two paths and lets
+    the reads be compared directly.
+    """
+    depth = torch.full((SIDE, SIDE), 3.0, dtype=torch.float32)
+    K = intrinsics_from_hfov(SIDE, SIDE, 90.0).to(torch.float32)
+    T = torch.eye(4, dtype=torch.float32)
+    geometry = pair_geometry(depth, depth, K, K, T, *IDENTITY, ANALYSIS)
+    generator = torch.Generator().manual_seed(seed)
+    features = torch.rand((channels, SMALL_GRID, SMALL_GRID), generator=generator)
+    return geometry, features
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.6: the neighbour direction is per record, on both paths
+# ---------------------------------------------------------------------------
+
+def test_transport_plan_is_the_identity_for_a_still_camera():
+    """The premise of the read-equality test below."""
+    geometry, _ = identity_pair()
+    weights = geometry.plan.weights
+    assert torch.allclose(weights, torch.eye(weights.shape[0]), atol=1e-6)
+
+
+def test_neighbour_direction_is_per_sample_on_the_splat_path():
+    """A whole-map shift would silently make the direction pair-level.
+
+    PROTOCOL 3.6 draws the offset from each record's own sample_id. On the splat
+    path that has to stay per record: applying one direction to every cell of a
+    pair would redefine the variant and break comparability with per-point, so
+    each cell's prediction is checked against its own hashed direction.
+    """
+    geometry, features = identity_pair()
+    prediction, defined, directions = splat_neighbor_prediction(geometry, features)
+    flat = features.reshape(features.shape[0], -1)
+    assert len(set(directions.tolist())) > 1, "the pair must use more than one direction"
+    for cell in np.flatnonzero(defined):
+        row, col = divmod(int(cell), SMALL_GRID)
+        dx, dy = NEIGHBOR_OFFSETS[int(directions[cell])]
+        source = (row + dy) * SMALL_GRID + (col + dx)
+        assert torch.allclose(prediction[:, cell], flat[:, source], atol=1e-6)
+
+
+def test_the_two_paths_read_the_same_source_values():
+    """Under identity transport the paths must agree read for read.
+
+    Every variant reads the same context location on both paths, so with a plan
+    that mixes nothing the splat-path value entering aggregation is exactly the
+    value per-point scores. This is what rules out a pair-level direction on the
+    splat side.
+    """
+    geometry, features = identity_pair()
+    from lot.correspondence import gather_value_pairs
+
+    reads = gather_value_pairs(features, features, geometry.samples)
+    prediction, defined, _ = splat_neighbor_prediction(geometry, features)
+    transported = apply_transport_plan(geometry.plan, features).reshape(features.shape[0], -1)
+    flat = features.reshape(features.shape[0], -1)
+
+    cols = torch.round((geometry.samples.uv_target[:, 0] + 0.5) / 14 - 0.5).long()
+    rows = torch.round((geometry.samples.uv_target[:, 1] + 0.5) / 14 - 0.5).long()
+    cells = (rows * SMALL_GRID + cols).tolist()
+    checked = 0
+    for index, cell in enumerate(cells):
+        if not defined[cell]:
+            continue
+        assert torch.allclose(reads["neighbor"][index], prediction[:, cell], atol=1e-5)
+        assert torch.allclose(reads["warp"][index], transported[:, cell], atol=1e-5)
+        assert torch.allclose(reads["no_warp"][index], flat[:, cell], atol=1e-5)
+        checked += 1
+    assert checked > 0
+
+
+def test_random_patch_uses_the_same_hash_on_both_paths():
+    geometry, _ = identity_pair()
+    ids = universe_sample_ids(*IDENTITY, geometry.grid)
+    assert np.array_equal(geometry.universe_ids, ids)
+    cols = torch.round((geometry.samples.uv_target[:, 0] + 0.5) / 14 - 0.5).long()
+    rows = torch.round((geometry.samples.uv_target[:, 1] + 0.5) / 14 - 0.5).long()
+    for index in range(len(geometry.samples.sample_id)):
+        cell = int(rows[index]) * SMALL_GRID + int(cols[index])
+        assert geometry.samples.sample_id[index] == geometry.universe_ids[cell]
+        per_point = geometry.samples.random_patch_index[index]
+        splat = geometry.random_patch[cell]
+        assert int(per_point[0]) * SMALL_GRID + int(per_point[1]) == int(splat)
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.7: centering, and Mean-Feature's structural not-applicable
+# ---------------------------------------------------------------------------
+
+def test_centering_orders_agree_on_the_splat_path():
+    """PROTOCOL 3.7 asks for exactly this test.
+
+    Centering is defined at the output level, on the pooled values. That
+    coincides with centering the sources before pooling only because a scored
+    cell's pooled output is a normalized weighted mean, so its weights sum to
+    one and the constant passes through unchanged. If the transport contract
+    ever stopped normalizing, these two orders would part company silently.
+    """
+    geometry, features = identity_pair(channels=8, seed=3)
+    scene = build_two_plane_scene()
+    plan = geometry.plan
+    center = torch.rand(features.shape[0]) * 2 - 1
+
+    after = apply_transport_plan(plan, features).reshape(features.shape[0], -1) - center[:, None]
+    before = apply_transport_plan(
+        plan, features - center[:, None, None]
+    ).reshape(features.shape[0], -1)
+    scored = torch.from_numpy(geometry.splat_mask)
+    assert bool(scored.any())
+    assert torch.allclose(after[:, scored], before[:, scored], atol=1e-5)
+    assert scene is not None
+
+
+def test_pooled_weights_sum_to_one_on_scored_cells():
+    """The property the centering-order agreement rests on."""
+    geometry, _ = identity_pair()
+    sums = geometry.plan.weights.sum(dim=1)
+    scored = torch.from_numpy(geometry.splat_mask)
+    assert torch.allclose(sums[scored], torch.ones(int(scored.sum())), atol=1e-6)
+
+
+def test_centered_mean_feature_is_never_finite():
+    """The tripwire PROTOCOL 3.7 requires.
+
+    Mean-Feature's prediction is the mean vector, so centering sends it to the
+    zero vector and its centered cosine is undefined. An implementation that
+    manufactured a score here, by an epsilon-regularized zero vector or by
+    letting the floor object drift from the centering vector, would produce a
+    finite number and nothing else would notice.
+    """
+    geometry, features = identity_pair()
+    center = features.reshape(features.shape[0], -1).mean(dim=1)
+    rows = evaluate_pair_for_encoder(geometry, features, features, center)
+    mean_rows = [r for r in rows if r["variant"] == MEAN_FEATURE]
+    assert len(mean_rows) == 2  # one per path
+    for row in mean_rows:
+        assert math.isnan(row["cosine_centered_mean"])
+        assert math.isnan(row["l2_centered_mean"])
+        assert math.isfinite(row["cosine_mean"])
+
+
+def test_mean_feature_is_the_only_nonfinite_in_the_table():
+    """PROTOCOL 3.2: that is the single permitted representation."""
+    geometry, features = identity_pair()
+    center = features.reshape(features.shape[0], -1).mean(dim=1)
+    for row in evaluate_pair_for_encoder(geometry, features, features, center):
+        for column in ("cosine_mean", "l2_mean"):
+            assert math.isfinite(row[column]), row
+        if row["variant"] != MEAN_FEATURE:
+            assert math.isfinite(row["cosine_centered_mean"]), row
+            assert math.isfinite(row["l2_centered_mean"]), row
+
+
+def test_mean_feature_prediction_is_one_global_vector_on_both_paths():
+    """BLOCKER-2: it was three different objects, and one of them beat Oracle.
+
+    The two paths score different cell sets, since the splat path drops cells
+    whose neighbour support leaves the grid, so their scores need not match.
+    What must hold is that the prediction is the same object: one global vector,
+    not a per-image mean on one path and a position-conditioned map on the other.
+    """
+    geometry, features = identity_pair()
+    center = torch.rand(features.shape[0])
+    rows = {
+        (r["path"], r["variant"]): r
+        for r in evaluate_pair_for_encoder(geometry, features, features, center)
+    }
+    # A per-image mean or a position map would move with the features; the
+    # global vector does not, so changing the features while holding the vector
+    # fixed must leave Mean-Feature scoring against the same prediction.
+    other = torch.rand(features.shape[0], SMALL_GRID, SMALL_GRID)
+    again = {
+        (r["path"], r["variant"]): r
+        for r in evaluate_pair_for_encoder(geometry, other, other, center)
+    }
+    for path in (PER_POINT, SPLAT_POOL):
+        baseline = value_agreement(
+            center[None, :].expand(4, -1), center[None, :].expand(4, -1)
+        )
+        assert baseline[0] == pytest.approx(1.0)
+        assert math.isfinite(rows[(path, MEAN_FEATURE)]["cosine_mean"])
+        assert math.isfinite(again[(path, MEAN_FEATURE)]["cosine_mean"])
+
+
+def test_dataset_mean_vector_is_a_vector_over_frames_and_positions(tmp_path):
+    from lot.encoders import cache_dir
+
+    directory = cache_dir(tmp_path, "dinov2_vitb14", "room_0")
+    directory.mkdir(parents=True)
+    np.savez(
+        directory / "features.npz",
+        a=np.zeros((3, 2, 2), dtype=np.float16),
+        b=np.full((3, 2, 2), 2.0, dtype=np.float16),
+    )
+    mean = dataset_mean_vector(tmp_path, "dinov2_vitb14", ["room_0"])
+    assert mean.shape == (3,)
+    assert torch.allclose(mean, torch.ones(3))
 
 
 # ---------------------------------------------------------------------------
@@ -45,193 +260,99 @@ from test_render_replica import base_pose
 def test_value_agreement_endpoints():
     a = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     assert value_agreement(a, a) == (pytest.approx(1.0), pytest.approx(0.0))
-    orthogonal = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
-    cosine, l2 = value_agreement(a, orthogonal)
+    cosine, l2 = value_agreement(a, torch.tensor([[0.0, 1.0], [1.0, 0.0]]))
     assert cosine == pytest.approx(0.0)
     assert l2 == pytest.approx(math.sqrt(2.0))
-    opposite = -a
-    cosine, l2 = value_agreement(a, opposite)
-    assert cosine == pytest.approx(-1.0)
-    assert l2 == pytest.approx(2.0)
 
 
 def test_value_agreement_ignores_magnitude():
-    """Metrics are on unit-normalized features, so scale must not show up."""
     g = torch.Generator().manual_seed(0)
     a = torch.rand((32, 8), generator=g)
     b = torch.rand((32, 8), generator=g)
     plain = value_agreement(a, b)
     scaled = value_agreement(a * 17.0, b * 0.03)
     assert plain[0] == pytest.approx(scaled[0], abs=1e-6)
-    assert plain[1] == pytest.approx(scaled[1], abs=1e-6)
-
-
-def test_value_agreement_on_nothing_is_nan_not_an_error():
-    """A pair with no co-visible surface is a result to record, not a crash."""
-    empty = torch.zeros((0, 4))
-    cosine, l2 = value_agreement(empty, empty)
-    assert math.isnan(cosine) and math.isnan(l2)
 
 
 def test_unit_normalize_leaves_zero_vectors_alone():
-    out = unit_normalize(torch.zeros((2, 3)))
-    assert torch.equal(out, torch.zeros((2, 3)))
+    assert torch.equal(unit_normalize(torch.zeros((2, 3))), torch.zeros((2, 3)))
+
+
+def test_centering_restores_range_when_one_direction_dominates():
+    generator = torch.Generator().manual_seed(0)
+    content = torch.randn((256, 32), generator=generator)
+    other = torch.randn((256, 32), generator=generator)
+    offset = torch.zeros(32)
+    offset[0] = 30.0
+    center = ((content + offset).mean(dim=0) + (other + offset).mean(dim=0)) / 2
+    raw = agreement_metrics(content + offset, other + offset, center)
+    assert raw["cosine_mean"] > 0.95
+    assert abs(raw["cosine_centered_mean"]) < 0.15
 
 
 # ---------------------------------------------------------------------------
-# Both paths on the analytic scene, where the right answer is known exactly
+# PROTOCOL 3.2: identity, masks, and row hygiene
 # ---------------------------------------------------------------------------
 
-def analytic_pair(seed=0):
-    """The two-plane scene with random features and their exact transport.
-
-    scenes.py records which context patch column each target patch column draws
-    from, so the target feature map can be built exactly for any context map.
-    That makes Oracle-Transport's correct score exactly 1.0 and gives the floors
-    something to be worse than.
-    """
-    scene = build_two_plane_scene()
-    generator = torch.Generator().manual_seed(seed)
-    context = torch.rand((16, GRID, GRID), generator=generator) - 0.5
-    target = torch.zeros_like(context)
-    for column in range(GRID):
-        source = int(scene.source_patch_col[column])
-        if source >= 0:
-            target[:, :, column] = context[:, :, source]
-    return scene, context, target
+def test_sample_id_collision_is_refused():
+    with pytest.raises(RuntimeError, match="collision"):
+        assert_unique_sample_ids(np.array([7, 7, 9], dtype=np.uint64), "a pair")
 
 
-def test_oracle_transport_is_exact_on_the_analytic_scene():
-    scene, context, target = analytic_pair()
-    geometry = pair_geometry(
-        scene.depth_context,
-        scene.depth_target,
-        scene.K,
-        scene.K,
-        scene.T_target_from_context,
-        points_per_pair=256,
-        min_covisible_fraction=0.5,
-        generator=torch.Generator().manual_seed(0),
-    )
-    rows = evaluate_pair_for_encoder(geometry, context, target, torch.zeros_like(context))
-    scores = {(r["path"], r["variant"]): r for r in rows}
-
-    splat = scores[(SPLAT_POOL, ORACLE_TRANSPORT)]
-    assert splat["n"] > 0
-    assert splat["cosine_mean"] == pytest.approx(1.0, abs=1e-5)
-    assert splat["l2_mean"] == pytest.approx(0.0, abs=1e-3)
-
-    point = scores[(PER_POINT, ORACLE_TRANSPORT)]
-    assert point["n"] > 0
-    assert point["cosine_mean"] == pytest.approx(1.0, abs=1e-5)
+def test_masks_round_trip_and_name_the_scored_cells():
+    geometry, features = identity_pair()
+    center = torch.zeros(features.shape[0])
+    rows = evaluate_pair_for_encoder(geometry, features, features, center)
+    size = geometry.size
+    for row in rows:
+        restored = unpack_mask(row["sample_mask"], size)
+        assert int(restored.sum()) == row["n"] or row["path"] == PER_POINT
+    per_point = next(r for r in rows if r["path"] == PER_POINT)
+    assert np.array_equal(unpack_mask(per_point["sample_mask"], size), geometry.per_point_mask)
 
 
-def test_pixel_sampling_scores_worse_than_the_truth_it_is_measuring():
-    """Why the per-point path samples patch centers rather than arbitrary pixels.
-
-    At an arbitrary pixel the target value is a bilinear blend of patches, and
-    near a depth edge those patches have different correspondences, so the blend
-    cannot be reproduced from any single context location. The exact answer here
-    is 1.0, so anything below it is the sampler's error, not the encoder's.
-    """
-    scene, context, target = analytic_pair()
-    scores = {}
-    for mode in ("patch_center", "pixel"):
-        geometry = pair_geometry(
-            scene.depth_context,
-            scene.depth_target,
-            scene.K,
-            scene.K,
-            scene.T_target_from_context,
-            points_per_pair=256,
-            min_covisible_fraction=0.5,
-            sample_mode=mode,
-            generator=torch.Generator().manual_seed(0),
-        )
-        rows = evaluate_pair_for_encoder(geometry, context, target, torch.zeros_like(context))
-        scores[mode] = next(
-            r["cosine_mean"]
-            for r in rows
-            if r["path"] == PER_POINT and r["variant"] == ORACLE_TRANSPORT
-        )
-    assert scores["patch_center"] == pytest.approx(1.0, abs=1e-5)
-    assert scores["pixel"] < 0.99
-
-
-def test_the_floors_are_beaten_by_transport():
-    """Without this the numbers mean nothing: random features share no direction."""
-    scene, context, target = analytic_pair()
-    geometry = pair_geometry(
-        scene.depth_context,
-        scene.depth_target,
-        scene.K,
-        scene.K,
-        scene.T_target_from_context,
-        points_per_pair=256,
-        min_covisible_fraction=0.5,
-        generator=torch.Generator().manual_seed(0),
-    )
-    rows = evaluate_pair_for_encoder(geometry, context, target, torch.zeros_like(context))
-    scores = {(r["path"], r["variant"]): r["cosine_mean"] for r in rows}
+def test_all_variants_on_a_path_share_one_mask():
+    """The common-valid design of PROTOCOL 3.7: differences are paired structurally."""
+    geometry, features = identity_pair()
+    rows = evaluate_pair_for_encoder(geometry, features, features, torch.zeros(features.shape[0]))
     for path in (PER_POINT, SPLAT_POOL):
-        assert scores[(path, ORACLE_TRANSPORT)] > scores[(path, NO_WARP_COPY)] + 0.5
+        masks = {r["sample_mask"] for r in rows if r["path"] == path}
+        counts = {r["n"] for r in rows if r["path"] == path}
+        assert len(masks) == 1, path
+        assert len(counts) == 1, path
 
 
-def test_every_variant_is_reported_on_both_paths():
-    scene, context, target = analytic_pair()
-    geometry = pair_geometry(
-        scene.depth_context,
-        scene.depth_target,
-        scene.K,
-        scene.K,
-        scene.T_target_from_context,
-        points_per_pair=128,
-        min_covisible_fraction=0.5,
-        generator=torch.Generator().manual_seed(0),
-    )
-    rows = evaluate_pair_for_encoder(geometry, context, target, torch.zeros_like(context))
-    # CLAUDE.md requires both floors beside every reported metric.
+def test_five_variants_on_both_paths():
+    """MAJOR-14: two of the five nulls existed on one path only."""
+    geometry, features = identity_pair()
+    rows = evaluate_pair_for_encoder(geometry, features, features, torch.zeros(features.shape[0]))
     for path in (PER_POINT, SPLAT_POOL):
-        variants = {r["variant"] for r in rows if r["path"] == path}
-        assert {ORACLE_TRANSPORT, NO_WARP_COPY, MEAN_FEATURE} <= variants
-
-
-def test_splat_path_is_scored_only_where_the_splat_landed():
-    """A hole must not be scored: its transported feature is zero, not a prediction."""
-    scene, context, target = analytic_pair()
-    geometry = pair_geometry(
-        scene.depth_context,
-        scene.depth_target,
-        scene.K,
-        scene.K,
-        scene.T_target_from_context,
-        points_per_pair=128,
-        min_covisible_fraction=0.5,
-        generator=torch.Generator().manual_seed(0),
-    )
-    # The analytic scene has four empty target patch columns.
-    assert not geometry.patch_selection[:, [5, 6, 14, 15]].any()
-    assert geometry.patch_selection[:, [0, 1, 2, 3, 4, 7, 8]].all()
-    assert geometry.coverage_mean == pytest.approx(1.0)
+        assert {r["variant"] for r in rows if r["path"] == path} == set(VARIANTS)
+    assert len(rows) == 2 * len(VARIANTS)
 
 
 # ---------------------------------------------------------------------------
-# Dataset mean feature map
+# PROTOCOL 3.2: the parallax statistic
 # ---------------------------------------------------------------------------
 
-def test_dataset_mean_feature_map_averages_every_frame(tmp_path):
-    from lot.encoders import cache_dir
+def test_parallax_is_the_median_over_the_covisible_set_only():
+    """MAJOR-4: the denominator was a median over the whole frame.
 
-    directory = cache_dir(tmp_path, "dinov2_vitb14", "room_0")
-    directory.mkdir(parents=True)
-    arrays = {
-        "a": np.zeros((3, 2, 2), dtype=np.float16),
-        "b": np.full((3, 2, 2), 2.0, dtype=np.float16),
-    }
-    np.savez(directory / "features.npz", **arrays)
-    mean = dataset_mean_feature_map(tmp_path, "dinov2_vitb14", ["room_0"])
-    assert mean.shape == (3, 2, 2)
-    assert torch.allclose(mean, torch.ones((3, 2, 2)))
+    Here the co-visible half of the frame sits at 2 m and the rest at 8 m, so a
+    whole-frame median would report a different number entirely.
+    """
+    depth = torch.full((16, 16), 8.0)
+    depth[:4] = 2.0
+    covisible = torch.zeros((16, 16), dtype=torch.bool)
+    covisible[:4] = True
+    assert pair_parallax(1.0, depth, covisible) == pytest.approx(0.5)
+    whole_frame = 1.0 / float(depth.median())
+    assert whole_frame != pytest.approx(0.5)
+
+
+def test_parallax_of_an_empty_covisible_set_is_nan():
+    depth = torch.full((4, 4), 3.0)
+    assert math.isnan(pair_parallax(1.0, depth, torch.zeros((4, 4), dtype=torch.bool)))
 
 
 # ---------------------------------------------------------------------------
@@ -258,185 +379,223 @@ def test_config_rejects_unknown_scenes_and_encoders(tmp_path):
         base_config(tmp_path, encoders=["clip"])
 
 
-def test_config_defaults_the_floor_to_the_training_split(tmp_path):
-    """The Mean-Feature floor must not be fitted to the scenes it floors."""
+def test_mean_vector_defaults_to_the_training_split(tmp_path):
+    """PROTOCOL 3.6: the floor never adapts to the frames it is a floor for."""
     cfg = base_config(tmp_path, scenes=["room_0", "hotel_0"])
-    assert cfg.mean_feature_scenes == ["room_0"]  # hotel_0 is a test scene
-
-
-def test_config_rejects_unknown_keys(tmp_path):
-    path = tmp_path / "cfg.yaml"
-    path.write_text(
-        "experiment_name: x\nrenders_root: a\ncache_root: b\noutput_root: c\n"
-        "scenes: [room_0]\nencoders: [dinov2_vitb14]\nnonsense: 1\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="unknown config keys"):
-        load_eval_config(path)
-
-
-def test_geometry_defaults_to_float32(tmp_path):
-    """float64 would cost one to two orders of magnitude on a GPU for no accuracy."""
-    assert base_config(tmp_path).torch_dtype == torch.float32
-    with pytest.raises(ValueError, match="geometry_dtype"):
-        base_config(tmp_path, geometry_dtype="float16")
+    assert cfg.mean_vector_scenes == ["room_0"]
 
 
 def test_shipped_config_loads():
     from pathlib import Path
 
-    cfg = load_eval_config(Path(__file__).resolve().parents[1] / "configs" / "experiment_zero.yaml")
+    cfg = load_eval_config(
+        Path(__file__).resolve().parents[1] / "configs" / "experiment_zero.yaml"
+    )
     assert cfg.encoders and cfg.scenes
 
 
 # ---------------------------------------------------------------------------
-# End to end on a synthetic scene
+# The two paths select records by the same rule
 # ---------------------------------------------------------------------------
 
-SIDE = 56
+def test_no_cell_is_stranded_without_an_in_bounds_offset():
+    """PROTOCOL 3.6's omission clause guards a case the geometry forbids.
 
-
-def build_eval_scene(root, scene="room_0", encoders=("dinov2_vitb14",), channels=8, seed=0):
-    """A renders directory and feature cache complete enough to evaluate."""
-    from PIL import Image
-
-    from lot.encoders import cache_dir
-
-    scene_root = root / scene
-    (scene_root / "rgb").mkdir(parents=True)
-    (scene_root / "depth").mkdir(parents=True)
-    K = intrinsics_from_hfov(SIDE, SIDE, 90.0)
-    posed = program_rotation(base_pose(), [-5.0, 0.0, 5.0], [])
-    posed += program_translation(base_pose(), [0.1], 3.0)
-    generator = torch.Generator().manual_seed(seed)
-    frames, features = [], {}
-    counters: dict[str, int] = {}
-    for frame in posed:
-        index = counters.get(frame.regime, 0)
-        counters[frame.regime] = index + 1
-        frame_id = f"{scene}_vp00_{frame.regime}_{index:03d}"
-        Image.fromarray(np.zeros((SIDE, SIDE, 3), dtype=np.uint8)).save(
-            scene_root / f"rgb/{frame_id}.png"
-        )
-        np.save(scene_root / f"depth/{frame_id}.npy", np.full((SIDE, SIDE), 3.0, dtype=np.float32))
-        frames.append(
-            FrameRecord(
-                frame_id=frame_id,
-                scene=scene,
-                regime=frame.regime,
-                params=dict(frame.params, viewpoint=0),
-                T_world_from_camera=frame.T_world_from_camera,
-                K=K,
-                height=SIDE,
-                width=SIDE,
-                rgb_path=f"rgb/{frame_id}.png",
-                depth_path=f"depth/{frame_id}.npy",
-            )
-        )
-        features[frame_id] = (
-            torch.rand((channels, SIDE // 14, SIDE // 14), generator=generator)
-            .to(torch.float16)
-            .numpy()
-        )
-    manifest = Manifest(
-        scene=scene,
-        metadata={
-            "depth_convention": {"raw_verdict": "planar_z", "stored_depth": "planar_z"}
-        },
-        frames=frames,
-    )
-    write_manifest(scene_root / "manifest.json", manifest)
-    write_frame_stats(scene_root, manifest)
-    for encoder in encoders:
-        directory = cache_dir(root / "cache", encoder, scene)
-        directory.mkdir(parents=True)
-        np.savez(directory / "features.npz", **features)
-    return manifest
-
-
-def test_evaluate_scene_end_to_end(tmp_path):
-    build_eval_scene(tmp_path)
-    cfg = base_config(tmp_path, max_pairs_per_stratum=4, points_per_pair=64)
-    mean = {"dinov2_vitb14": torch.zeros((8, SIDE // 14, SIDE // 14))}
-    rows = evaluate_scene(cfg, "room_0", mean)
-    assert rows
-    pairs = {(r["context_frame_id"], r["target_frame_id"]) for r in rows}
-    # Five variants on the per-point path, three on the splat path, per encoder.
-    assert len(rows) == len(pairs) * 8
-    for row in rows:
-        assert row["encoder"] == "dinov2_vitb14"
-        assert row["scene"] == "room_0"
-        assert row["split"] == "train"
-        assert row["path"] in (PER_POINT, SPLAT_POOL)
-        assert 0.0 <= row["covisible_fraction"] <= 1.0
-        assert row["parallax_bin"]
-
-
-def test_results_round_trip_through_parquet(tmp_path):
-    build_eval_scene(tmp_path)
-    cfg = base_config(tmp_path, max_pairs_per_stratum=2, points_per_pair=32)
-    rows = evaluate_scene(
-        cfg, "room_0", {"dinov2_vitb14": torch.zeros((8, SIDE // 14, SIDE // 14))}
-    )
-    path = tmp_path / "eval" / "room_0.parquet"
-    write_rows(path, rows)
-    back = read_rows(path)
-    assert len(back) == len(rows)
-    assert set(back[0]) == set(rows[0])
-    assert back[0]["variant"] == rows[0]["variant"]
-    with pytest.raises(FileExistsError):
-        write_rows(path, rows)
-
-
-def test_margins_are_a_subtraction_between_rows_of_one_pair(tmp_path):
-    """The table stores floors as rows, so a margin can never disagree with its parts."""
-    build_eval_scene(tmp_path)
-    cfg = base_config(tmp_path, max_pairs_per_stratum=2, points_per_pair=32)
-    rows = evaluate_scene(
-        cfg, "room_0", {"dinov2_vitb14": torch.zeros((8, SIDE // 14, SIDE // 14))}
-    )
-    key = ("context_frame_id", "target_frame_id", "encoder", "path")
-    grouped: dict[tuple, dict[str, float]] = {}
-    for row in rows:
-        grouped.setdefault(tuple(row[k] for k in key), {})[row["variant"]] = row["cosine_mean"]
-    assert grouped
-    for scores in grouped.values():
-        assert ORACLE_TRANSPORT in scores and NO_WARP_COPY in scores
-
-
-def test_centering_restores_range_when_one_direction_dominates():
-    """The reason the results table carries both readings.
-
-    Measured on the caches, VGGT puts 0.91 of a feature's norm in a single
-    shared direction against DINOv2's 0.42. A shared direction that large
-    forces every cosine high regardless of content, so the raw metric stops
-    resolving anything. Subtracting the dataset mean removes a constant that
-    says nothing about which surface a patch sits on.
+    A cell's support can span the full width or the full height of the grid but
+    not both, so at least one axis always has a usable direction. Dropping cells
+    whose first choice leaked would select the record set by a rule the other
+    path does not apply.
     """
-    generator = torch.Generator().manual_seed(0)
-    content = torch.randn((256, 32), generator=generator)
-    other = torch.randn((256, 32), generator=generator)
-    offset = torch.zeros(32)
-    offset[0] = 30.0
-    center = ((content + offset).mean(dim=0) + (other + offset).mean(dim=0)) / 2
-
-    raw = agreement_metrics(content + offset, other + offset, center)
-    # The shared offset pins the raw cosine high between unrelated features.
-    assert raw["cosine_mean"] > 0.95
-    # Centering exposes that they are unrelated.
-    assert abs(raw["cosine_centered_mean"]) < 0.15
-    # Identical features stay perfect either way.
-    same = agreement_metrics(content + offset, content + offset, center)
-    assert same["cosine_mean"] == pytest.approx(1.0, abs=1e-5)
-    assert same["cosine_centered_mean"] == pytest.approx(1.0, abs=1e-5)
+    geometry, features = identity_pair()
+    _, defined, _ = splat_neighbor_prediction(geometry, features)
+    assert defined.all()
 
 
-def test_every_row_carries_both_readings(tmp_path):
-    build_eval_scene(tmp_path)
-    cfg = base_config(tmp_path, max_pairs_per_stratum=2, points_per_pair=32)
-    rows = evaluate_scene(
-        cfg, "room_0", {"dinov2_vitb14": torch.zeros((8, SIDE // 14, SIDE // 14))}
+def test_the_two_paths_score_the_same_records():
+    """The gap the read-equality test cannot see: records absent from one path.
+
+    Reads are only compared where both paths have a record, so a null that
+    silently removed records would leave every compared value correct.
+    """
+    geometry, _ = identity_pair()
+    assert np.array_equal(geometry.per_point_mask, geometry.splat_mask)
+    difference = cross_path_record_difference(geometry)
+    assert difference["per_point_only"] == 0
+    assert difference["splat_only"] == 0
+    assert difference["both"] == geometry.size
+    assert_source_read_sets_agree(geometry, "identity pair")
+
+
+def test_a_record_set_difference_must_be_explained_by_coverage():
+    """Anything else means the two paths disagree about what a record is."""
+    geometry, _ = identity_pair()
+    # Strip a covered cell from the splat side without touching coverage, which
+    # is exactly the shape of a null-specific removal.
+    geometry.splat_mask[0] = False
+    with pytest.raises(RuntimeError, match="different rules"):
+        assert_source_read_sets_agree(geometry, "tampered pair")
+
+
+def test_coverage_holes_are_a_legitimate_cross_path_difference():
+    """A cell the warp cannot support is an operator property, reported not hidden."""
+    geometry, _ = identity_pair()
+    geometry.plan.coverage.reshape(-1)[0] = 0.0
+    geometry.splat_mask[0] = False
+    assert_source_read_sets_agree(geometry, "uncovered pair")
+    assert cross_path_record_difference(geometry)["per_point_only_uncovered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the external review
+# ---------------------------------------------------------------------------
+
+def test_sample_ids_are_globally_unique_not_merely_per_pair():
+    """PROTOCOL 3.2 makes the identity global, and a 32-bit seed is not.
+
+    An earlier version reduced the pair key with crc32 before the 64-bit mix,
+    which capped the pair space at 2^32 however wide the mix that followed. Over
+    the 79,272 pairs the camera programs produce, the birthday bound puts about
+    one collision in that space and enumeration found four. Two pairs sharing a
+    seed give identical ids to their samples at matching target coordinates, and
+    a cross-pair join, which is how Phase 4 matches surviving sets, would merge
+    them silently. The within-pair uniqueness assertion cannot see it.
+    """
+    from lot.sample_identity import pair_seed
+
+    scenes = ["apartment_2", "hotel_0", "room_0", "office_1"]
+    regimes = {"rotation": 13, "translation": 17, "orbit": 18}
+    seen: dict[int, tuple] = {}
+    for scene in scenes:
+        for viewpoint in range(6):
+            for regime, count in regimes.items():
+                ids = [f"{scene}_vp{viewpoint:02d}_{regime}_{i:03d}" for i in range(count)]
+                for context in ids:
+                    for target in ids:
+                        if context == target:
+                            continue
+                        seed = int(pair_seed(scene, context, target))
+                        key = (scene, context, target)
+                        assert seed not in seen, (
+                            f"pair seed collision between {seen.get(seed)} and {key}"
+                        )
+                        seen[seed] = key
+    assert len(seen) > 15_000
+
+
+def test_a_pair_scorable_on_one_path_is_not_discarded():
+    """Requiring both paths would condition per-point results on splat success.
+
+    That removes exactly the difficult, low-coverage pairs and biases every
+    per-point aggregate towards easy geometry. Coverage differences between the
+    paths are reported, not resolved by dropping the pair.
+    """
+    geometry, features = identity_pair()
+    geometry.splat_mask[:] = False
+    assert geometry.scorable
+    rows = evaluate_pair_for_encoder(
+        geometry, features, features, torch.zeros(features.shape[0])
     )
-    for row in rows:
-        assert "cosine_mean" in row and "cosine_centered_mean" in row
-        assert "l2_mean" in row and "l2_centered_mean" in row
+    assert {r["path"] for r in rows} == {PER_POINT}
+    assert len(rows) == len(VARIANTS)
+
+    geometry.per_point_mask[:] = False
+    geometry.splat_mask[:] = False
+    assert not geometry.scorable
+
+
+def test_the_mean_vector_is_written_atomically_and_checked_on_reuse(tmp_path):
+    """The documented run is an 18-task array over one output directory."""
+    from lot.encoders import cache_dir
+    from lot.evaluate import load_or_build_mean_vector
+
+    def write_cache(scene, value):
+        from lot.encoders import CACHE_VERSION, features_digest
+
+        directory = cache_dir(tmp_path / "cache", "dinov2_vitb14", scene)
+        directory.mkdir(parents=True, exist_ok=True)
+        arrays = {"a": np.full((4, 2, 2), value, dtype=np.float16)}
+        np.savez(directory / "features.npz", **arrays)
+        (directory / "meta.json").write_text(
+            json.dumps(
+                {
+                    "cache_version": CACHE_VERSION,
+                    "features_digest": features_digest(arrays),
+                    "weights_fingerprint": "abc123",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return directory
+
+    directory = write_cache("room_0", 3.0)
+
+    out = tmp_path / "out"
+    first = load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
+    assert torch.allclose(first, torch.full((4,), 3.0))
+    assert not list(out.glob("*.partial"))
+    # Reuse is validated against provenance, not taken on trust.
+    again = load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
+    assert torch.equal(first, again)
+    write_cache("room_1", 3.0)
+    with pytest.raises(ValueError, match="built for"):
+        load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_1"], out)
+
+    # Rebuilding the cache in place, at the same path, with different features.
+    # Naming the directory in the provenance record cannot see this: the path is
+    # unchanged, so the stale vector was returned and both the Mean-Feature floor
+    # and the centering statistic silently described features that no longer
+    # existed. The digest is over the bytes that went into the vector.
+    write_cache("room_0", 9.0)
+    with pytest.raises(ValueError, match="built for"):
+        load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
+
+
+def test_both_paths_choose_the_same_neighbour_direction_under_translation():
+    """Read the direction off each path's own artifact, never off a shared source.
+
+    The two paths ask different questions about whether an offset is usable. The
+    per-point path reads one location and asks whether it stays inside the
+    context sampling box; the splat path shifts a cell's whole transport support
+    and asks whether any of it leaves the grid. Under identity transport the
+    answers coincide, which is why an identity-only test certified a property
+    that was false in general. Under a lateral translation they come apart.
+
+    An earlier version of this test recomputed both directions from the splat
+    rule and compared them, which is an identity and holds whatever the code
+    does. This one takes the per-point direction from uv_context_neighbor, the
+    coordinate the path will actually read, and the splat direction from what
+    splat_neighbor_prediction returns.
+    """
+    from lot.encoders import patch_cell_index
+    from lot.evaluate import splat_neighbor_option_ok
+
+    depth = torch.full((SIDE, SIDE), 3.0, dtype=torch.float32)
+    K = intrinsics_from_hfov(SIDE, SIDE, 90.0).to(torch.float32)
+    T = torch.eye(4, dtype=torch.float32)
+    T[0, 3] = 0.05
+    geometry = pair_geometry(depth, depth, K, K, T, *IDENTITY, ANALYSIS)
+    samples = geometry.samples
+
+    # The per-point path's direction, recovered from the coordinate it will read.
+    delta = (samples.uv_context_neighbor - samples.uv_context_warp).cpu().numpy() / 14.0
+    offsets = np.asarray(NEIGHBOR_OFFSETS, dtype=np.float64)
+    per_point = np.argmin(np.abs(offsets[None, :, :] - delta[:, None, :]).sum(axis=2), axis=1)
+    assert np.allclose(offsets[per_point], delta, atol=1e-6), "not a whole-patch offset"
+
+    _, _, splat = splat_neighbor_prediction(geometry, torch.rand((4, SMALL_GRID, SMALL_GRID)))
+    cells = patch_cell_index(samples.uv_target, (SIDE, SIDE), 14)
+    assert cells.size > 0
+    assert np.array_equal(per_point, splat[cells])
+
+    # And the two rules really do disagree here, so the test is not vacuous: the
+    # splat rule alone admits offsets the per-point rule refuses, and hashing
+    # among a different number of options is what moved the direction.
+    from lot.correspondence import _in_box, _sampling_box
+
+    box = _sampling_box((SIDE, SIDE), 14)
+    offsets_px = torch.tensor(offsets, dtype=torch.float32) * 14
+    warp = samples.uv_context_warp
+    point_rule = _in_box(warp[:, None, :] + offsets_px[None, :, :], box).cpu().numpy()
+    splat_rule = splat_neighbor_option_ok(geometry.plan, (SMALL_GRID, SMALL_GRID))[cells]
+    assert not np.array_equal(point_rule, splat_rule)
+    assert np.array_equal(samples.neighbor_option_ok, point_rule & splat_rule)

@@ -148,7 +148,26 @@ at the top of the parallax range will be genuinely hard.
   poses load as float64. Measured cost is 40 percent on CPU and far more on a
   consumer GPU.
 
-## Phase 3: Experiment Zero, verdict (accepted 2026-08-21)
+## Phase 3: Experiment Zero, verdict (WITHDRAWN 2026-08-24)
+
+> **These numbers are withdrawn and are not a result.** An independent audit
+> (VALIDATION_REPORT.md, verdict FAIL, at commit c5e50f9) found four blockers
+> and fifteen majors in the code that produced them, and three subsequent
+> reviews of the repair found more. The definitions have since changed in ways
+> that move every figure below: Neighbor-Patch draws a different direction,
+> scoring is on each path's common valid set, sample identity is a full-width
+> digest so every hash-derived null differs, the reported estimand is the
+> unweighted pair mean rather than the comparison-weighted one, and the rotation
+> angle is measured differently near zero. The corrected run, Stream D, has not
+> been executed.
+>
+> The section is kept, unedited below this notice, because it is what the audit
+> was against and because withdrawing a claim silently is worse than leaving it
+> visible with its status attached. Nothing here may be cited, and the
+> qualitative reading is not carried forward either: whether DINOv2 transports
+> and VGGT does not is a question the corrected run reopens.
+
+### Withdrawn text, as it stood at acceptance (2026-08-21)
 
 DINOv2 ViT-B/14 is the encoder for all later phases. Its patch features behave
 like properties of the surface they sit on: transporting them with ground-truth

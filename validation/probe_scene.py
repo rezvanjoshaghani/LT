@@ -7,12 +7,17 @@ top-level lot import here would bind the wrong package.
 
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 import numpy as np
 
 SIDE = 112         # 8 x 8 patches at stride 14
-CHANNELS = 16
+CHANNELS = 768    # dinov2_vitb14's real width, so the cache the probe
+                  # fabricates is one the validator will accept as that
+                  # encoder's. A narrower fiction was caught by cache
+                  # validation, which is the validator working.
 SCENE = "room_0"
 
 
@@ -84,7 +89,7 @@ def surface_attached_features(frame, depth, channels, patch=14):
 def build_scene(root: Path, feature_mode: str = "smooth"):
     from PIL import Image
 
-    from lot.encoders import cache_dir
+    from lot.encoders import CACHE_VERSION, cache_dir, features_digest
     from lot.render_replica import (
         FrameRecord,
         Manifest,
@@ -137,18 +142,41 @@ def build_scene(root: Path, feature_mode: str = "smooth"):
     d = cache_dir(root / "cache", "dinov2_vitb14", SCENE)
     d.mkdir(parents=True)
     np.savez(d / "features.npz", **features)
+    # Evaluation validates a cache before opening it, so the probe cache has to
+    # carry the provenance a real one does.
+    (d / "meta.json").write_text(json.dumps({
+        "cache_version": CACHE_VERSION,
+        "encoder": "dinov2_vitb14",
+        "scene": SCENE,
+        "channels": CHANNELS,
+        "patch_size": 14,
+        "patch_grid": [SIDE // 14, SIDE // 14],
+        "image_hw": [SIDE, SIDE],
+        "dtype": "float16",
+        "frame_count": len(features),
+        "frame_ids": [f.frame_id for f in frames],
+        "has_depth": False,
+        "weights_fingerprint": "validation-probe",
+        "weights_revision": "validation-probe",
+        "features_digest": features_digest(features),
+        "depth_digest": None,
+    }, indent=1), encoding="utf-8")
     return manifest
 
 
 def evaluate_probe(root: Path):
     """Run lot.evaluate over the probe scene. Returns the rows."""
-    from lot.evaluate import EvalConfig, dataset_mean_feature_map, evaluate_scene
+    from lot.evaluate import EvalConfig, dataset_mean_vector, evaluate_scene
 
     cfg = EvalConfig(
         experiment_name="validation_probe", renders_root=root, cache_root=Path(root) / "cache",
         output_root=Path(root) / "out", scenes=[SCENE], encoders=["dinov2_vitb14"],
-        max_pairs_per_stratum=40, points_per_pair=64, seed=0,
-        mean_feature_scenes=[SCENE],
+        seed=0, mean_vector_scenes=[SCENE],
     )
-    mean_map = dataset_mean_feature_map(cfg.cache_root, "dinov2_vitb14", [SCENE])
-    return evaluate_scene(cfg, SCENE, {"dinov2_vitb14": mean_map})
+    mean_vector = dataset_mean_vector(cfg.cache_root, "dinov2_vitb14", [SCENE])
+    from lot.analysis_config import load_analysis_config
+
+    rows, _ = evaluate_scene(
+        cfg, SCENE, {"dinov2_vitb14": mean_vector}, load_analysis_config()
+    )
+    return rows

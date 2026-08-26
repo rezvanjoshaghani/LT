@@ -36,6 +36,7 @@ from pathlib import Path
 
 DINOV2_REPO = "https://github.com/facebookresearch/dinov2"
 VGGT_REPO = "facebook/VGGT-1B"
+VGGT_CODE_REPO = "https://github.com/facebookresearch/vggt"
 
 
 def torch_home() -> Path:
@@ -96,6 +97,29 @@ def vggt_revision() -> tuple[str, str]:
     return sha, "current revision of main, from the hub api"
 
 
+def vggt_code_ref() -> tuple[str, str]:
+    """The commit of VGGT's inference implementation.
+
+    A third artifact, beside the weights and this repository. The runbook
+    installs it from a branch, and the same state dict run through different
+    inference code produces different features, so a weights fingerprint alone
+    does not identify what made a cache.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", VGGT_CODE_REPO, "HEAD"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return "", f"git ls-remote failed: {error}"
+    if result.returncode != 0:
+        return "", f"git ls-remote failed: {result.stderr.strip()[:200]}"
+    line = result.stdout.splitlines()[0].strip() if result.stdout.strip() else ""
+    if not line:
+        return "", "git ls-remote returned nothing"
+    return line.split()[0], "current HEAD of the default branch"
+
+
 def main() -> int:
     print(f"TORCH_HOME  {torch_home()}")
     print(f"HF_HOME     {hf_home()}")
@@ -103,14 +127,16 @@ def main() -> int:
 
     dinov2, dinov2_how = dinov2_ref()
     vggt, vggt_how = vggt_revision()
+    vggt_code, vggt_code_how = vggt_code_ref()
 
     for label, sha, how in (
         ("DINOv2  (torch.hub facebookresearch/dinov2)", dinov2, dinov2_how),
-        (f"VGGT    (hugging face {VGGT_REPO})", vggt, vggt_how),
+        (f"VGGT weights  (hugging face {VGGT_REPO})", vggt, vggt_how),
+        ("VGGT code     (github facebookresearch/vggt)", vggt_code, vggt_code_how),
     ):
         print(f"{label}\n  {sha or 'UNRESOLVED'}\n  {how}\n")
 
-    if not (dinov2 and vggt):
+    if not (dinov2 and vggt and vggt_code):
         print("Could not resolve both revisions; nothing to pin.", file=sys.stderr)
         return 1
 
@@ -118,6 +144,14 @@ def main() -> int:
     print()
     print(f'export LOT_DINOV2_REVISION="{dinov2}"')
     print(f'export LOT_VGGT_REVISION="{vggt}"')
+    print()
+    print("And install VGGT's implementation at a commit rather than a branch:")
+    print()
+    print(
+        f'micromamba run -n lot-encode pip install \
+'
+        f'    "vggt @ git+{VGGT_CODE_REPO}@{vggt_code}"'
+    )
     print()
     print(
         "Then rebuild the caches. The fingerprint each cache records is only\n"

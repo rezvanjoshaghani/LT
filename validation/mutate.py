@@ -113,14 +113,22 @@ def m34_unproject_ray_distance(d: Path) -> str:
     return "geometry.unproject treats depth as ray distance"
 
 
-def m35_no_arccos_clamp(d: Path) -> str:
-    """3.5 Remove the arccos clamp."""
+def m35_unstable_rotation_angle(d: Path) -> str:
+    """3.5 Measure the rotation angle from the trace alone.
+
+    The clamped arccos this replaced was retired because it cannot resolve
+    angles below about 8.5e-7 degrees, which is above zero_rotation_tol_deg: the
+    boundary of the zero-rotation bin sat at the noise of the quantity being
+    binned. The mutation puts that formulation back. It is a real mutation
+    rather than a nonsense one, which is the point: a test suite that cannot
+    tell the two apart cannot see the zero bin at all.
+    """
     patch(
         d / "src" / "lot" / "geometry.py",
+        "    return math.degrees(math.atan2(sine, cosine))",
         "    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))",
-        "    return math.degrees(math.acos(cosine))",
     )
-    return "geometry.rotation_angle_deg arccos clamp removed"
+    return "geometry.rotation_angle_deg measured from the trace alone"
 
 
 def m33b_farthest_wins(d: Path) -> str:
@@ -170,7 +178,7 @@ MUTANTS_SPEC = [
     ("3.4_unproject_ray_distance", m34_unproject_ray_distance,
      ["tests/test_geometry.py", "tests/test_transport.py", "tests/test_correspondence.py",
       "tests/test_visibility.py", "tests/test_evaluate.py"]),
-    ("3.5_no_arccos_clamp", m35_no_arccos_clamp,
+    ("3.5_unstable_rotation_angle", m35_unstable_rotation_angle,
      ["tests/test_geometry.py", "tests/test_datasets.py"]),
 ]
 
@@ -202,12 +210,12 @@ def main() -> None:
 
     # 3.5 additionally gets a validator-defined test for the overshoot trigger,
     # because VALIDATION 3.5 states plainly that clean inputs cannot kill it.
-    d = MUTANTS / "3.5_no_arccos_clamp"
+    d = MUTANTS / "3.5_unstable_rotation_angle"
     shutil.copy(Path(__file__).parent / "validator_test_clamp.py",
                 d / "tests" / "test_validator_clamp.py")
     out = run(d, ["tests/test_validator_clamp.py"])
-    report.append({"mutant": "3.5_no_arccos_clamp (validator test)",
-                   "bug": "arccos clamp removed", "targets": ["tests/test_validator_clamp.py"],
+    report.append({"mutant": "3.5_unstable_rotation_angle (validator test)",
+                   "bug": "angle measured from the trace alone", "targets": ["tests/test_validator_clamp.py"],
                    **out})
 
     # And the same validator test against the unmutated package, which must pass.

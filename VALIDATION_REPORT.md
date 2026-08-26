@@ -7,6 +7,18 @@ VALIDATION.md. The validator did not write, fix, or modify anything under `src/`
 
 **Verdict: FAIL.** 4 blockers, 15 majors. Details in the sign-off section.
 
+> **Status at ff13285.** This report audits commit `c5e50f9` and is a historical
+> record of that commit, not of the current tree. The repair is on
+> `repair/validation-streams-abc`: the four blockers and the majors are
+> addressed, and three further reviews of the repair found and fixed additional
+> defects, several of them introduced by the repair itself. See AMENDMENTS.md
+> for every normative change made since.
+>
+> The repair is **not** an acceptance. Acceptance requires the corrected Phase 3
+> run (Stream D), which has not been executed, followed by a re-audit against
+> this document. Until then the Phase 3 numbers in FINDINGS.md stand withdrawn
+> and this repository has no accepted Phase 3 result.
+
 ---
 
 ## 0. Kickoff record and audit scope

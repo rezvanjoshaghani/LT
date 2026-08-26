@@ -45,7 +45,13 @@ from .geometry import (
     unproject,
 )
 
-DEFAULT_RELATIVE_DEPTH_TOL = 0.015
+# The tolerance itself lives in configs/analysis.yaml, which PROTOCOL's preamble
+# makes part of the protocol. Resolved lazily rather than copied here, so a
+# change to the normative value cannot leave a stale literal behind.
+def default_relative_depth_tol() -> float:
+    from .analysis_config import load_analysis_config
+
+    return load_analysis_config().covisible_relative_depth_tol
 
 # Invalid context depths are replaced by this large finite value before sampling.
 # A sample that reads an invalid entry fails the depth tolerance test, so pixels
@@ -68,15 +74,18 @@ def visibility_masks(
     K_target: Tensor,
     K_context: Tensor,
     T_target_from_context: Tensor,
-    rel_tol: float = DEFAULT_RELATIVE_DEPTH_TOL,
+    rel_tol: float | None = None,
 ) -> VisibilityMasks:
     """Compute per-pixel co-visible and disoccluded masks on the target grid.
 
     depth_target, depth_context: [H, W] ground-truth planar z-depth in meters.
     K_target, K_context: 3x3 intrinsics.
     T_target_from_context: the canonical relative transform from geometry.relative_pose.
-    rel_tol: relative depth tolerance for the co-visibility test.
+    rel_tol: relative depth tolerance for the co-visibility test. None reads the
+        normative value from the analysis config.
     """
+    if rel_tol is None:
+        rel_tol = default_relative_depth_tol()
     if depth_target.dim() != 2 or depth_context.dim() != 2:
         raise ValueError("depth maps must be [H, W]")
     T_context_from_target = invert_se3(T_target_from_context)

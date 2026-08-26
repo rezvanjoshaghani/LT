@@ -5,6 +5,7 @@ covered by test_habitat_render_smoke, which runs only where habitat_sim and
 the Replica dataset are available (the cluster).
 """
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -35,6 +36,7 @@ from lot.render_replica import (
     frame_is_usable,
     frame_stats_summary,
     load_frame_stats,
+    rotation_position_residuals,
     usable_frame_ids,
     write_frame_stats,
     intrinsics_from_hfov,
@@ -709,3 +711,145 @@ def test_usability_survives_the_json_round_trip(tmp_path):
     assert reloaded["frames"][manifest.frames[0].frame_id]["median_m"] is None
     assert len(usable_frame_ids(reloaded)) == len(manifest.frames) - 1
     assert frame_stats_summary(reloaded)["usable"] == len(manifest.frames) - 1
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.3: in-place rotation's zero translation, asserted from the manifest
+# ---------------------------------------------------------------------------
+
+def test_rotation_frames_sharing_a_position_pass(tmp_path):
+    root, manifest = fake_scene_dir(tmp_path)
+    residuals = rotation_position_residuals(manifest)
+    assert residuals and max(residuals.values()) < 1e-9
+    diagnostics = validate_manifest(
+        manifest, root, check_files=True, rotation_position_bound_m=1e-6
+    )
+    assert diagnostics["rotation_position_residuals_m"] == residuals
+
+
+def test_a_shifted_rotation_frame_is_rejected(tmp_path):
+    """The regime's defining property is checked, not trusted.
+
+    Manifest poses are read back from the simulator rather than the planned
+    poses, so a drift can appear without anything else noticing. It matters
+    twice: a rotation pair whose spread exceeds the zero-parallax tolerance
+    silently leaves the zero bin, and PROTOCOL 4.5 makes exactly-zero
+    translation a hard invariant for the Phase 4 gate.
+    """
+    root, manifest = fake_scene_dir(tmp_path)
+    shifted = list(manifest.frames)
+    moved = shifted[1].T_world_from_camera.clone()
+    moved[0, 3] += 1e-3
+    shifted[1] = dataclasses.replace(shifted[1], T_world_from_camera=moved)
+    broken = dataclasses.replace(manifest, frames=shifted)
+
+    residuals = rotation_position_residuals(broken)
+    assert max(residuals.values()) > 1e-4
+    with pytest.raises(ValueError, match="do not share a camera position"):
+        validate_manifest(broken, root, check_files=False, rotation_position_bound_m=1e-6)
+    # Without the bound the assertion is skipped, for callers with no config.
+    validate_manifest(broken, root, check_files=False, rotation_position_bound_m=None)
+
+
+def test_the_bound_comes_from_the_analysis_config():
+    from lot.analysis_config import load_analysis_config
+
+    assert load_analysis_config().rotation_position_bound_m > 0
+
+
+def test_translation_frames_must_share_one_orientation(tmp_path):
+    """The mirror of the rotation-program position check.
+
+    PROTOCOL 3.3 makes translation the sole source of the primary parallax
+    curve precisely because it holds rotation at exactly zero. A translation
+    frame whose orientation drifted puts an unlabelled rotation into the
+    marginal that exists to exclude it, and nothing downstream can see it: the
+    regime tag is what routes a pair onto the curve.
+    """
+    from lot.render_replica import translation_rotation_residuals, validate_manifest
+
+    frames = program_translation(base_pose(), [0.1, 0.2, 0.3], 3.0)
+    records = []
+    for index, frame in enumerate(frames):
+        records.append(
+            FrameRecord(
+                frame_id=f"room_0_vp00_translation_{index:03d}",
+                scene="room_0",
+                regime="translation",
+                params=dict(frame.params, viewpoint=0),
+                T_world_from_camera=frame.T_world_from_camera,
+                K=intrinsics_from_hfov(28, 28, 90.0),
+                height=28,
+                width=28,
+                rgb_path=f"rgb/{index}.png",
+                depth_path=f"depth/{index}.npy",
+            )
+        )
+    manifest = Manifest(
+        scene="room_0",
+        metadata={"depth_convention": {"raw_verdict": "planar_z", "stored_depth": "planar_z"}},
+        frames=records,
+    )
+    assert max(translation_rotation_residuals(manifest).values()) == 0.0
+    validate_manifest(
+        manifest, tmp_path, check_files=False, translation_rotation_bound_deg=1e-7
+    )
+
+    # Two degrees of yaw about the camera's own vertical axis, which is what a
+    # malformed pose or a lossy read-back would look like.
+    a = math.radians(2.0)
+    yaw = torch.eye(4, dtype=torch.float64)
+    yaw[:3, :3] = torch.tensor(
+        [[math.cos(a), 0.0, math.sin(a)], [0.0, 1.0, 0.0], [-math.sin(a), 0.0, math.cos(a)]],
+        dtype=torch.float64,
+    )
+    records[-1] = dataclasses.replace(
+        records[-1], T_world_from_camera=records[-1].T_world_from_camera @ yaw
+    )
+    drifted = dataclasses.replace(manifest, frames=records)
+    assert max(translation_rotation_residuals(drifted).values()) == pytest.approx(2.0, abs=1e-9)
+    with pytest.raises(ValueError, match="do not share one orientation"):
+        validate_manifest(
+            drifted, tmp_path, check_files=False, translation_rotation_bound_deg=1e-7
+        )
+
+
+def test_translation_residual_is_over_every_pair_not_against_the_first_frame():
+    """A reference frame hides a spread the population really has.
+
+    Orientations at 0, +9e-5 and -9e-5 degrees are each within 9e-5 of the
+    first, so a bound of 1e-4 passes. The worst actual pair is 1.8e-4 and fails
+    it, and the pair is what becomes a camera pair downstream.
+    """
+    from lot.render_replica import translation_rotation_residuals
+
+    K = intrinsics_from_hfov(28, 28, 90.0)
+    records = []
+    for index, offset_deg in enumerate((0.0, 9e-5, -9e-5)):
+        a = math.radians(offset_deg)
+        yaw = torch.eye(4, dtype=torch.float64)
+        yaw[:3, :3] = torch.tensor(
+            [[math.cos(a), 0.0, math.sin(a)], [0.0, 1.0, 0.0], [-math.sin(a), 0.0, math.cos(a)]],
+            dtype=torch.float64,
+        )
+        records.append(
+            FrameRecord(
+                frame_id=f"room_0_vp00_translation_{index:03d}",
+                scene="room_0",
+                regime="translation",
+                params={"viewpoint": 0},
+                T_world_from_camera=base_pose() @ yaw,
+                K=K,
+                height=28,
+                width=28,
+                rgb_path=f"rgb/{index}.png",
+                depth_path=f"depth/{index}.npy",
+            )
+        )
+    manifest = Manifest(
+        scene="room_0",
+        metadata={"depth_convention": {"raw_verdict": "planar_z", "stored_depth": "planar_z"}},
+        frames=records,
+    )
+    worst = max(translation_rotation_residuals(manifest).values())
+    assert worst == pytest.approx(1.8e-4, rel=1e-6)

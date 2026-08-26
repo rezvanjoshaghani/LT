@@ -501,3 +501,74 @@ def test_depth_content_is_protected_not_only_its_shape(tmp_path):
     np.savez(depth_path, **tampered)
     with pytest.raises(ValueError, match="depth digest"):
         validate_feature_cache(cache_root, "stub_depth", manifest, check_digest=True)
+
+
+def test_validation_does_not_take_the_cache_at_its_own_word(tmp_path):
+    """Shape comes from the manifest and the encoder spec, not from meta.json.
+
+    A cache that declares its own dimensions and is checked against them agrees
+    with itself whatever it holds. A 1x1 grid claimed for a 28x28 frame passed,
+    because nothing asked what the frame and the encoder imply.
+    """
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    meta["patch_grid"] = [1, 1]
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="cache declares patch grid"):
+        validate_feature_cache(cache_root, "stub", manifest)
+
+
+def test_an_extra_feature_array_is_refused_because_the_mean_would_average_it(tmp_path):
+    """dataset_mean_vector averages every array in the archive.
+
+    One stray key moves the Mean-Feature floor and the centering statistic
+    together, and a check that only looks for the frames it expects cannot see
+    it.
+    """
+    from lot.evaluate import dataset_mean_vector
+
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+
+    with np.load(directory / "features.npz") as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    honest = dataset_mean_vector(cache_root, "stub", [manifest.scene])
+    shape = next(iter(arrays.values())).shape
+    arrays["not_a_frame"] = np.full(shape, 50.0, dtype=np.float16)
+    np.savez(directory / "features.npz", **arrays)
+
+    assert not torch.allclose(dataset_mean_vector(cache_root, "stub", [manifest.scene]), honest)
+    with pytest.raises(ValueError, match="the manifest does not name"):
+        validate_feature_cache(cache_root, "stub", manifest)
+
+
+def test_a_spec_with_no_declared_width_is_not_coerced(tmp_path):
+    """VGGT's width is unknown before the model runs, so its spec declares None.
+
+    Comparing the cache's channel count against it must skip rather than coerce:
+    int(None) raises, and it would have raised on the real VGGT cache the first
+    time evaluation opened one.
+    """
+    from lot.encoders import ENCODERS
+
+    assert ENCODERS["vggt_1b"].channels is None
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+
+    # Move the cache under the vggt_1b name, which has no declared width.
+    target = cache_dir(cache_root, "vggt_1b", manifest.scene)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    directory.rename(target)
+    meta = json.loads((target / "meta.json").read_text(encoding="utf-8"))
+    meta["encoder"] = "vggt_1b"
+    (target / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    validate_feature_cache(cache_root, "vggt_1b", manifest, check_digest=True)

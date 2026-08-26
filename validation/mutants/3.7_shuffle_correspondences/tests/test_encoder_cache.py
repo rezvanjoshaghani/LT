@@ -10,6 +10,8 @@ import dataclasses
 import json
 import os
 
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -50,11 +52,16 @@ def stub_spec(provides_depth: bool = False) -> EncoderSpec:
 
 
 class StubEncoder(FrozenEncoder):
-    """Deterministic stand-in for a frozen encoder. Never loads a model.
+    """Deterministic stand-in for a frozen encoder.
 
-    Each channel of a patch holds the mean brightness of that patch's pixels,
-    so a cached value can be checked against the source image by hand.
+    Each channel of a patch holds the mean brightness of that patch's pixels, so
+    a cached value can be checked against the source image by hand. It carries a
+    parameterless module so the weight fingerprint the cache records is defined
+    for it too, rather than being a hole only the stubs fall into.
     """
+
+    def _load(self) -> Any:
+        return torch.nn.Module()
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
         count, height, width, _ = images_uint8.shape
@@ -72,6 +79,9 @@ class StubEncoder(FrozenEncoder):
 
 class BadShapeEncoder(FrozenEncoder):
     """Returns a transposed patch grid, which the base class must reject."""
+
+    def _load(self) -> Any:
+        return torch.nn.Module()
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
         count, height, width, _ = images_uint8.shape
@@ -469,3 +479,70 @@ def test_vggt_batching_does_not_mix_frames():
     together = encoder.encode(frames).features
     apart = torch.cat([encoder.encode(frames[i : i + 1]).features for i in (0, 1)])
     assert torch.allclose(together, apart, atol=1e-3)
+
+
+def test_depth_content_is_protected_not_only_its_shape(tmp_path):
+    """Shape and frame presence do not protect content.
+
+    Every value in a depth archive can change while the keys and shapes stay
+    right. That is inert for Experiment Zero, whose geometry is ground truth,
+    and it is a Phase 4 blocker: VGGT depth and its confidence become scientific
+    inputs there, and the validator claimed digest mode covered every array.
+    """
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    encoder = StubEncoder(stub_spec(provides_depth=True), "cpu")
+    cache_scene_features(manifest, root, encoder, cache_root, export_depth=True)
+    validate_feature_cache(cache_root, "stub_depth", manifest, check_digest=True)
+
+    depth_path = cache_dir(cache_root, "stub_depth", manifest.scene) / "depth.npz"
+    with np.load(depth_path) as archive:
+        tampered = {name: np.full_like(archive[name], 9.0) for name in archive.files}
+    np.savez(depth_path, **tampered)
+    with pytest.raises(ValueError, match="depth digest"):
+        validate_feature_cache(cache_root, "stub_depth", manifest, check_digest=True)
+
+
+def test_validation_does_not_take_the_cache_at_its_own_word(tmp_path):
+    """Shape comes from the manifest and the encoder spec, not from meta.json.
+
+    A cache that declares its own dimensions and is checked against them agrees
+    with itself whatever it holds. A 1x1 grid claimed for a 28x28 frame passed,
+    because nothing asked what the frame and the encoder imply.
+    """
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    meta["patch_grid"] = [1, 1]
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="cache declares patch grid"):
+        validate_feature_cache(cache_root, "stub", manifest)
+
+
+def test_an_extra_feature_array_is_refused_because_the_mean_would_average_it(tmp_path):
+    """dataset_mean_vector averages every array in the archive.
+
+    One stray key moves the Mean-Feature floor and the centering statistic
+    together, and a check that only looks for the frames it expects cannot see
+    it.
+    """
+    from lot.evaluate import dataset_mean_vector
+
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+
+    with np.load(directory / "features.npz") as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    honest = dataset_mean_vector(cache_root, "stub", [manifest.scene])
+    shape = next(iter(arrays.values())).shape
+    arrays["not_a_frame"] = np.full(shape, 50.0, dtype=np.float16)
+    np.savez(directory / "features.npz", **arrays)
+
+    assert not torch.allclose(dataset_mean_vector(cache_root, "stub", [manifest.scene]), honest)
+    with pytest.raises(ValueError, match="the manifest does not name"):
+        validate_feature_cache(cache_root, "stub", manifest)

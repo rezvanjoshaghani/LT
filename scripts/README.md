@@ -237,6 +237,28 @@ the provenance rather than recording it, which is the exact failure the check
 is for. Re-caching is about sixteen minutes of GPU per encoder at the measured
 5.4 frames per second, spread across an 18-task array.
 
+### Pin the encoder revisions first
+
+```bash
+python scripts/pin_encoder_revisions.py
+```
+
+It prints two export lines. Set them before the caching jobs, so the pin and
+the cache agree by construction, and record them in AMENDMENTS.md, because they
+are part of what the frozen protocol means by "the encoder".
+
+The two pins are not the same kind of object. VGGT is a Hugging Face
+repository and the weights are files in it, so the revision pins the bytes.
+DINOv2 is a Torch Hub repository and the ref pins the code, which chooses the
+checkpoint URL on dl.fbaipublicfiles.com; it does not pin the bytes at that
+URL. That is why the fingerprint sits beside the pin rather than being replaced
+by it. The pin makes a checkpoint retrievable, the fingerprint notices when the
+bytes behind it move.
+
+Torch Hub also does not record which commit it downloaded, so a cache fetched
+from `main` cannot say which `main`. Pinning before the rebuild is the only
+moment this is free.
+
 ```bash
 mv cache/features cache/features_v1
 ```

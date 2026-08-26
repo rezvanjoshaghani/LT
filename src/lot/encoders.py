@@ -990,7 +990,8 @@ def main(argv: list[str] | None = None) -> None:
                 fingerprints.setdefault(meta["weights_fingerprint"], []).append(scene)
                 print(
                     f"[{scene}] cache valid, {meta['frame_count']} frames, "
-                    f"weights {meta['weights_fingerprint'][:12]}"
+                    f"weights {meta['weights_fingerprint'][:12]}, "
+                    f"revision {meta.get('weights_revision', 'unpinned')}"
                 )
         if len(fingerprints) > 1:
             # One encoder, one set of weights. Scenes cached from different

@@ -65,6 +65,13 @@ mkdir -p "$TORCH_HOME" "$HF_HOME"
 # fall back to CPU when CUDA is absent, so they belong with the GPU allocation
 # that is loading those weights anyway, not in an 18-task CPU array that never
 # opens an encoder.
+# Which checkpoints this job is about to bake into a cache. Unpinned is
+# permitted and recorded as such: a fingerprint still notices a change, it just
+# cannot get the old weights back. scripts/pin_encoder_revisions.py resolves
+# both, and they belong in AMENDMENTS.md once chosen.
+echo "LOT_DINOV2_REVISION=${LOT_DINOV2_REVISION:-unpinned}"
+echo "LOT_VGGT_REVISION=${LOT_VGGT_REVISION:-unpinned}"
+
 export LOT_ENCODER_SMOKE=1
 "$MM" run -n "$LOT_ENV" python -m pytest tests/test_encoder_cache.py     -k "vggt_batching or grid_orientation or sees_one_frame" -q
 

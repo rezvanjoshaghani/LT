@@ -1,14 +1,32 @@
-"""Figures and tables, built from outputs/eval/*.parquet and nothing else.
+"""Figures and tables, built from outputs/eval/*.parquet and the analysis config.
 
-CLAUDE.md requires that every figure be regenerable from the evaluation
-parquet alone, so this module never reads a render, a cache, or a config. It
-takes a directory of per-scene parquet files and produces the paper figure,
-the paper table, and a console summary compact enough to read at a glance.
+CLAUDE.md requires every figure be regenerable from the evaluation parquet
+alone; PROTOCOL 3.2 requires the bin edges live in a committed analysis config
+rather than in rows or in source. So this module reads exactly two things: the
+parquet, and configs/analysis.yaml. It never touches a render or a cache.
 
-Margins are computed pair by pair, not as a difference of two averages. Every
-variant is scored on the same pair, so the paired difference is the quantity
-with meaning, and it stays correct when one variant has no scorable region on
-a pair and another does.
+Four things this layer is responsible for and the evaluation layer is not.
+
+Binning. Rows carry continuous rotation_deg and parallax. The edges come from
+the config, so changing a bin is a config edit and an amendment, never a source
+change.
+
+Regime discipline, PROTOCOL 3.3. In-place rotation is the sole source of the
+primary rotation analysis and translation the sole source of the primary
+parallax analysis, because each regime holds the other axis at exactly zero.
+Orbit varies on both at once and appears only in the joint view. Orbit pairs on
+a primary curve would silently mix an interaction into a marginal.
+
+Support and uncertainty, PROTOCOL 3.4. Every bin reports how many scenes, how
+many camera pairs, and how many feature comparisons stand behind it, and every
+reported number carries a bootstrap interval resampled at the scene level.
+Unsupported bins stay plotted, shaded, and labelled with their n; they are never
+used for a headline.
+
+Pairing, PROTOCOL 3.7. A margin is a difference measured on one pair, between
+variants that scored the same records. The evaluation layer arranges that by
+scoring every variant on the path's common valid set; this layer verifies it
+from the persisted masks and refuses to subtract across a mismatch.
 """
 
 from __future__ import annotations
@@ -16,9 +34,12 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
-from .datasets import parallax_bin_order, rotation_bin_order
+import numpy as np
+
+from .analysis_config import DEFAULT_CONFIG_PATH, AnalysisConfig, load_analysis_config
+from .datasets import bin_order, parallax_bin, rotation_bin
 from .evaluate import (
     MEAN_FEATURE,
     NEIGHBOR_PATCH,
@@ -30,16 +51,24 @@ from .evaluate import (
 )
 
 PATH_ORDER = (PER_POINT, SPLAT_POOL)
+# Ladder order: worst-case null first, correct answer last.
 VARIANT_ORDER = (
-    ORACLE_TRANSPORT,
-    NO_WARP_COPY,
-    NEIGHBOR_PATCH,
     RANDOM_PATCH,
     MEAN_FEATURE,
+    NO_WARP_COPY,
+    NEIGHBOR_PATCH,
+    ORACLE_TRANSPORT,
 )
 
-# What identifies one measured comparison, up to which method was used.
-PAIR_KEYS = ("scene", "context_frame_id", "target_frame_id", "encoder", "path")
+# PROTOCOL 3.3: which regime is the sole source of which primary analysis.
+PRIMARY_REGIME = {"parallax_bin": "translation", "rotation_bin": "rotation"}
+JOINT_REGIME = "orbit"
+
+# What identifies one comparison, up to which method was used.
+COMPARISON_KEYS = ("scene", "context_frame_id", "target_frame_id", "encoder", "path")
+
+RAW = "cosine_mean"
+CENTERED = "cosine_centered_mean"
 
 
 def read_eval_dir(eval_dir: Path) -> list[dict[str, Any]]:
@@ -60,39 +89,99 @@ def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(value)
 
 
-def group_by_pair(rows: Iterable[dict[str, Any]]) -> dict[tuple, dict[str, dict[str, Any]]]:
-    """Index rows by the comparison they belong to, then by variant."""
-    grouped: dict[tuple, dict[str, dict[str, Any]]] = {}
-    for row in rows:
-        key = tuple(row[k] for k in PAIR_KEYS)
-        grouped.setdefault(key, {})[row["variant"]] = row
-    return grouped
+# ---------------------------------------------------------------------------
+# Binning, applied here and only here
+# ---------------------------------------------------------------------------
 
+def assign_bins(rows: Iterable[dict[str, Any]], config: AnalysisConfig) -> list[dict[str, Any]]:
+    """Attach bin labels from the committed config to rows that carry no labels."""
+    out = []
+    for row in rows:
+        if "parallax_bin" in row or "rotation_bin" in row:
+            raise ValueError(
+                "rows already carry bin labels; PROTOCOL 3.2 keeps labels out of "
+                "rows so the analysis config is the only place edges live"
+            )
+        out.append(
+            {
+                **row,
+                "parallax_bin": parallax_bin(row["parallax"], config),
+                "rotation_bin": rotation_bin(row["rotation_deg"], config),
+            }
+        )
+    return out
+
+
+def restrict_to_regime(
+    records: Sequence[dict[str, Any]], axis: str
+) -> list[dict[str, Any]]:
+    """PROTOCOL 3.3: keep only the regime that is the sole source of this axis.
+
+    The other regimes hold this axis at exactly zero, or vary it jointly with
+    the other axis. Either way their pairs are not points on this curve.
+    """
+    if axis not in PRIMARY_REGIME:
+        raise ValueError(f"no primary regime defined for {axis!r}")
+    regime = PRIMARY_REGIME[axis]
+    return [r for r in records if r["regime"] == regime]
+
+
+def assert_single_regime(records: Sequence[dict[str, Any]], regime: str) -> None:
+    """Guard a primary curve against a pair from another regime."""
+    found = {r["regime"] for r in records}
+    if found - {regime}:
+        raise ValueError(
+            f"a primary {regime} analysis received pairs from {sorted(found - {regime})}; "
+            "PROTOCOL 3.3 keeps orbit out of both marginals"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pairing on sample identity
+# ---------------------------------------------------------------------------
 
 def paired_records(
-    rows: Iterable[dict[str, Any]], metric: str = "cosine_mean"
-) -> list[dict[str, Any]]:
+    rows: Iterable[dict[str, Any]], metric: str = RAW
+) -> tuple[list[dict[str, Any]], int]:
     """One record per comparison and variant, carrying its margin over the floor.
 
-    A comparison contributes only when both the variant and No-Warp-Copy scored
-    something on it, so a margin is always a difference measured on one pair.
+    PROTOCOL 3.7 makes a margin a difference between variants measured on the
+    same records. The evaluation layer scores every variant of a path on that
+    path's common valid set, so the masks within a comparison should be
+    identical and the difference of the two means is then the paired difference.
+    That is verified here rather than assumed: a comparison whose variant and
+    floor carry different masks is excluded and counted, because its difference
+    of means would be a difference of populations wearing the shape of a method
+    effect.
+
+    Returns (records, mask_mismatches).
     """
+    grouped: dict[tuple, dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        key = tuple(row[k] for k in COMPARISON_KEYS)
+        grouped.setdefault(key, {})[row["variant"]] = row
+
     records: list[dict[str, Any]] = []
-    for key, variants in group_by_pair(rows).items():
+    mismatches = 0
+    for variants in grouped.values():
         floor = variants.get(NO_WARP_COPY)
         if floor is None or not _finite(floor[metric]):
             continue
         for variant, row in variants.items():
             if not _finite(row[metric]):
                 continue
+            if row["sample_mask"] != floor["sample_mask"]:
+                mismatches += 1
+                continue
             records.append(
                 {
                     "scene": row["scene"],
                     "split": row["split"],
                     "regime": row["regime"],
+                    "camera_pair": (row["context_frame_id"], row["target_frame_id"]),
                     "parallax_bin": row["parallax_bin"],
-                    "parallax": row["parallax"],
                     "rotation_bin": row["rotation_bin"],
+                    "parallax": row["parallax"],
                     "rotation_deg": row["rotation_deg"],
                     "encoder": row["encoder"],
                     "path": row["path"],
@@ -103,63 +192,504 @@ def paired_records(
                     "n": row["n"],
                 }
             )
-    return records
+    return records, mismatches
 
 
-def aggregate(
-    records: Sequence[dict[str, Any]], keys: Sequence[str], fields: Sequence[str]
-) -> dict[tuple, dict[str, Any]]:
-    """Mean of each field over records sharing the given keys, plus a count."""
-    sums: dict[tuple, dict[str, float]] = {}
-    counts: dict[tuple, int] = {}
-    for record in records:
-        key = tuple(record[k] for k in keys)
-        bucket = sums.setdefault(key, {field: 0.0 for field in fields})
-        for field in fields:
-            bucket[field] += float(record[field])
-        counts[key] = counts.get(key, 0) + 1
+# ---------------------------------------------------------------------------
+# Support and uncertainty
+# ---------------------------------------------------------------------------
+
+def support_counts(records: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """PROTOCOL 3.4's three counts for one cell."""
     return {
-        key: {**{f: bucket[f] / counts[key] for f in fields}, "n_pairs": counts[key]}
-        for key, bucket in sums.items()
+        "n_scenes": len({r["scene"] for r in records}),
+        "n_camera_pairs": len({r["camera_pair"] for r in records}),
+        "n_feature_comparisons": int(sum(r["n"] for r in records)),
     }
 
 
-def summary_table(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The paper table: every variant's score and margin, by encoder, path, and bin."""
-    stats = aggregate(
-        records,
-        ("encoder", "metric", "path", "parallax_bin", "variant"),
-        ("value", "margin"),
+def is_supported(counts: dict[str, int], config: AnalysisConfig) -> bool:
+    """The support decision rests on scenes and camera pairs, not raw comparisons."""
+    return (
+        counts["n_scenes"] >= config.support_min_scenes
+        and counts["n_camera_pairs"] >= config.support_min_camera_pairs
     )
+
+
+def mean_value(records: Sequence[dict[str, Any]]) -> float:
+    """Point estimate of an absolute score."""
+    values = [r["value"] for r in records]
+    return float(np.mean(values)) if values else float("nan")
+
+
+def mean_margin(records: Sequence[dict[str, Any]]) -> float:
+    """Point estimate of a margin over the floor."""
+    values = [r["margin"] for r in records]
+    return float(np.mean(values)) if values else float("nan")
+
+
+def bootstrap_interval(
+    records: Sequence[dict[str, Any]],
+    statistic: Callable[[Sequence[dict[str, Any]]], float],
+    config: AnalysisConfig,
+    unit: str = "scene",
+) -> tuple[float, float]:
+    """Resample whole units and recompute the statistic inside every replicate.
+
+    PROTOCOL 3.4 puts the primary interval at the scene level and the secondary
+    at the camera-pair level; individual points and patches are never resampled,
+    because records within a scene are not independent draws.
+
+    The replicate calls the same function that produced the point estimate. For
+    a mean that is more work than resampling precomputed per-scene values, and
+    the two agree. It is written this way because Phase 4's retained fractions
+    and selection differentials are ratio statistics, where resampling
+    precomputed values is simply wrong, and one mechanism that is right
+    everywhere beats two that must be kept in step.
+    """
+    if not records:
+        return float("nan"), float("nan")
+    by_unit: dict[Any, list[dict[str, Any]]] = {}
+    for record in records:
+        by_unit.setdefault(record[unit], []).append(record)
+    keys = sorted(by_unit, key=repr)
+    rng = np.random.default_rng(config.bootstrap_seed)
+    replicates = np.empty(config.bootstrap_resamples, dtype=float)
+    for index in range(config.bootstrap_resamples):
+        drawn = rng.integers(0, len(keys), size=len(keys))
+        sample: list[dict[str, Any]] = []
+        for position in drawn:
+            sample.extend(by_unit[keys[position]])
+        replicates[index] = statistic(sample)
+    finite = replicates[np.isfinite(replicates)]
+    if finite.size == 0:
+        return float("nan"), float("nan")
+    tail = (1.0 - config.bootstrap_confidence) / 2.0
+    return (
+        float(np.quantile(finite, tail)),
+        float(np.quantile(finite, 1.0 - tail)),
+    )
+
+
+def cell_summary(
+    records: Sequence[dict[str, Any]],
+    config: AnalysisConfig,
+    statistic: Callable[[Sequence[dict[str, Any]]], float] = mean_margin,
+) -> dict[str, Any]:
+    """Point estimate, both intervals, and the three support counts for one cell."""
+    counts = support_counts(records)
+    low, high = bootstrap_interval(records, statistic, config, unit="scene")
+    pair_low, pair_high = bootstrap_interval(records, statistic, config, unit="camera_pair")
+    return {
+        **counts,
+        "estimate": statistic(records),
+        "ci_low": low,
+        "ci_high": high,
+        "pair_ci_low": pair_low,
+        "pair_ci_high": pair_high,
+        "supported": is_supported(counts, config),
+    }
+
+
+def group_by(
+    records: Iterable[dict[str, Any]], keys: Sequence[str]
+) -> dict[tuple, list[dict[str, Any]]]:
+    grouped: dict[tuple, list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(tuple(record[k] for k in keys), []).append(record)
+    return grouped
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.9: the operational transport check
+# ---------------------------------------------------------------------------
+
+def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> dict[str, Any]:
+    """Compare the two paths on the cells both scored, per PROTOCOL 3.9.
+
+    The evaluation layer scored each path on the cross-path intersection and
+    emitted it as its own column, so this is a comparison of one population by
+    two operators. Comparing the full-population scores instead would fold the
+    coverage difference into the operator difference, and the coverage
+    difference is exactly what is reported beside it rather than inside it.
+    """
+    by_key: dict[tuple, dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        if row["variant"] != ORACLE_TRANSPORT:
+            continue
+        key = (row["scene"], row["context_frame_id"], row["target_frame_id"], row["encoder"])
+        by_key.setdefault(key, {})[row["path"]] = row
+
+    differences: list[float] = []
+    coverage: list[int] = []
+    for paths in by_key.values():
+        if set(paths) != set(PATH_ORDER):
+            continue
+        a = paths[PER_POINT]["cosine_intersect_mean"]
+        b = paths[SPLAT_POOL]["cosine_intersect_mean"]
+        if _finite(a) and _finite(b):
+            differences.append(abs(a - b))
+            coverage.append(
+                int(paths[PER_POINT]["coverage_difference"])
+                + int(paths[SPLAT_POOL]["coverage_difference"])
+            )
+    if not differences:
+        return {"comparisons": 0, "max_abs_difference": float("nan"), "within_tolerance": False}
+    return {
+        "comparisons": len(differences),
+        "mean_abs_difference": float(np.mean(differences)),
+        "max_abs_difference": float(np.max(differences)),
+        "tolerance": config.path_agreement_tolerance,
+        "within_tolerance": bool(np.max(differences) <= config.path_agreement_tolerance),
+        "mean_coverage_difference_cells": float(np.mean(coverage)),
+        "max_coverage_difference_cells": int(np.max(coverage)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.10: the four required figures
+# ---------------------------------------------------------------------------
+
+def _pyplot():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+UNSUPPORTED_BAND = dict(color="0.55", alpha=0.22, zorder=0)
+
+
+def _shade_unsupported(panel, positions: Sequence[int], labelled: bool = True) -> None:
+    """Shade a band behind bins below the support threshold.
+
+    A band rather than a greyed marker: a greyed point on a line is close to
+    invisible, and a band still reads when several series share one axis.
+    """
+    for position in positions:
+        panel.axvspan(position - 0.5, position + 0.5, **UNSUPPORTED_BAND)
+    if positions and labelled:
+        panel.plot([], [], color="0.55", linewidth=8, alpha=0.35, label="below support")
+
+
+def _annotate_counts(panel, positions, counts, y) -> None:
+    """PROTOCOL 3.4 asks for n shown; shown for every bin, not only shaded ones."""
+    for position, count in zip(positions, counts):
+        panel.annotate(
+            f"n={count}",
+            (position, y),
+            fontsize=6,
+            ha="center",
+            va="bottom",
+            rotation=90,
+            color="0.35",
+        )
+
+
+def figure_a_null_ladder(
+    records: Sequence[dict[str, Any]],
+    path: Path,
+    config: AnalysisConfig,
+    omissions: dict[str, int] | None = None,
+) -> None:
+    """Figure A: the full null ladder per encoder, raw and centered.
+
+    Mean-Feature appears in raw only. Its prediction is the mean vector, so
+    centering sends it to the zero vector and its centered cosine is undefined;
+    PROTOCOL 3.7 records that as not applicable rather than manufacturing a
+    number, and a marker drawn at zero would be exactly that manufacture.
+    """
+    plt = _pyplot()
     encoders = sorted({r["encoder"] for r in records})
-    metrics = sorted({r["metric"] for r in records})
-    table: list[dict[str, Any]] = []
+    metrics = [RAW, CENTERED]
+    figure, axes = plt.subplots(1, len(metrics), figsize=(6.0 * len(metrics), 4.6), squeeze=False)
+    for column, metric in enumerate(metrics):
+        panel = axes[0][column]
+        subset = [r for r in records if r["metric"] == metric and r["path"] == PER_POINT]
+        variants = [v for v in VARIANT_ORDER if any(r["variant"] == v for r in subset)]
+        for offset, encoder in enumerate(encoders):
+            xs, ys, low, high, counts = [], [], [], [], []
+            for position, variant in enumerate(variants):
+                cell = [r for r in subset if r["encoder"] == encoder and r["variant"] == variant]
+                if not cell:
+                    continue
+                summary = cell_summary(cell, config, statistic=mean_value)
+                xs.append(position + (offset - (len(encoders) - 1) / 2) * 0.12)
+                ys.append(summary["estimate"])
+                low.append(max(0.0, summary["estimate"] - summary["ci_low"]))
+                high.append(max(0.0, summary["ci_high"] - summary["estimate"]))
+                counts.append(summary["n_camera_pairs"])
+            if xs:
+                panel.errorbar(
+                    xs, ys, yerr=[low, high], fmt="o", capsize=3, markersize=5, label=encoder
+                )
+        panel.set_xticks(range(len(variants)))
+        panel.set_xticklabels(variants, rotation=30, ha="right", fontsize=8)
+        panel.set_title(
+            metric + ("" if metric == RAW else "   Mean-Feature not applicable"), fontsize=10
+        )
+        panel.set_ylabel("cosine", fontsize=9)
+        panel.grid(alpha=0.3)
+        panel.legend(fontsize=7)
+    if omissions:
+        figure.text(
+            0.5,
+            0.005,
+            "per-variant omissions: " + ", ".join(f"{k} {v}" for k, v in sorted(omissions.items())),
+            ha="center",
+            fontsize=7,
+            color="0.35",
+        )
+    figure.suptitle("Figure A: null ladder, per-point path", fontsize=11)
+    figure.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def figure_ceiling_and_floor(
+    records: Sequence[dict[str, Any]],
+    path: Path,
+    config: AnalysisConfig,
+    axis: str,
+    title: str,
+) -> None:
+    """Figures B and C: the ceiling and the floor as absolute curves.
+
+    PROTOCOL 3.10 calls the floor curve mandatory. A ceiling plotted alone, or a
+    margin plotted with the floor implicit at zero, reproduces the raw-cosine
+    mistake the floors exist to prevent: it shows a number moving without
+    showing what a trivial answer would have scored beside it.
+    """
+    plt = _pyplot()
+    regime = PRIMARY_REGIME[axis]
+    subset = restrict_to_regime(records, axis)
+    assert_single_regime(subset, regime)
+    subset = [r for r in subset if r["path"] == PER_POINT]
+    if not subset:
+        raise ValueError(f"no {regime} records to plot")
+    encoders = sorted({r["encoder"] for r in subset})
+    edges = config.parallax_edges() if axis == "parallax_bin" else config.rotation_edges()
+    order = [b for b in bin_order(edges) if any(r[axis] == b for r in subset)]
+    metrics = [RAW, CENTERED]
+
+    figure, axes = plt.subplots(
+        len(metrics),
+        len(encoders),
+        figsize=(5.4 * len(encoders), 4.2 * len(metrics)),
+        squeeze=False,
+    )
+    for row_index, metric in enumerate(metrics):
+        for column, encoder in enumerate(encoders):
+            panel = axes[row_index][column]
+            unsupported: list[int] = []
+            counts: list[int] = []
+            series = {ORACLE_TRANSPORT: [], NO_WARP_COPY: []}
+            bands = {ORACLE_TRANSPORT: ([], []), NO_WARP_COPY: ([], [])}
+            for position, label in enumerate(order):
+                pool = [
+                    r
+                    for r in subset
+                    if r[axis] == label and r["encoder"] == encoder and r["metric"] == metric
+                ]
+                supported = True
+                for variant in (ORACLE_TRANSPORT, NO_WARP_COPY):
+                    cell = [r for r in pool if r["variant"] == variant]
+                    summary = cell_summary(cell, config, statistic=mean_value)
+                    series[variant].append(summary["estimate"])
+                    bands[variant][0].append(summary["ci_low"])
+                    bands[variant][1].append(summary["ci_high"])
+                    supported = supported and summary["supported"]
+                    if variant == ORACLE_TRANSPORT:
+                        counts.append(summary["n_camera_pairs"])
+                if not supported:
+                    unsupported.append(position)
+            positions = list(range(len(order)))
+            _shade_unsupported(panel, unsupported)
+            panel.fill_between(
+                positions,
+                series[NO_WARP_COPY],
+                series[ORACLE_TRANSPORT],
+                alpha=0.18,
+                color="tab:green",
+                label="margin",
+            )
+            for variant, style in ((ORACLE_TRANSPORT, "-o"), (NO_WARP_COPY, "--s")):
+                panel.plot(positions, series[variant], style, markersize=4, label=variant)
+                panel.fill_between(positions, bands[variant][0], bands[variant][1], alpha=0.15)
+            finite = [v for v in series[NO_WARP_COPY] if math.isfinite(v)]
+            if finite:
+                _annotate_counts(panel, positions, counts, min(finite))
+            panel.set_xticks(positions)
+            panel.set_xticklabels(order, rotation=45, ha="right", fontsize=8)
+            panel.set_title(f"{encoder}   {metric}", fontsize=9)
+            panel.set_xlabel(axis.replace("_", " "), fontsize=9)
+            if column == 0:
+                panel.set_ylabel("cosine", fontsize=9)
+            panel.grid(alpha=0.3)
+            panel.legend(fontsize=6)
+    figure.suptitle(title, fontsize=11)
+    figure.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def figure_d_orbit_joint(
+    records: Sequence[dict[str, Any]],
+    path: Path,
+    config: AnalysisConfig,
+    metric: str = CENTERED,
+) -> None:
+    """Figure D: orbit as a rotation-by-parallax heatmap, never collapsed.
+
+    Orbit moves on both axes at once and the two are tied together by the orbit
+    radius, so either marginal would report an interaction as if it were a main
+    effect. The populated cells therefore form a band rather than filling the
+    grid, and that shape is the point: an empty cell is a combination the camera
+    program cannot produce, which is a fact about the design and not missing
+    data. Empty cells stay blank, cells below support are hatched, and every
+    populated cell carries its margin and its n.
+    """
+    plt = _pyplot()
+    subset = [
+        r
+        for r in records
+        if r["regime"] == JOINT_REGIME
+        and r["path"] == PER_POINT
+        and r["metric"] == metric
+        and r["variant"] == ORACLE_TRANSPORT
+    ]
+    if not subset:
+        raise ValueError("no orbit records to plot")
+    encoders = sorted({r["encoder"] for r in subset})
+    rows = [
+        b for b in bin_order(config.rotation_edges()) if any(r["rotation_bin"] == b for r in subset)
+    ]
+    cols = [
+        b for b in bin_order(config.parallax_edges()) if any(r["parallax_bin"] == b for r in subset)
+    ]
+
+    summaries: dict[tuple[str, int, int], dict[str, Any]] = {}
+    grids: dict[str, np.ndarray] = {}
     for encoder in encoders:
-        for metric in metrics:
-            for path in PATH_ORDER:
-                for bin_label in parallax_bin_order():
-                    present = [
-                        v
-                        for v in VARIANT_ORDER
-                        if (encoder, metric, path, bin_label, v) in stats
-                    ]
-                    if not present:
-                        continue
-                    row: dict[str, Any] = {
-                        "encoder": encoder,
-                        "metric": metric,
-                        "path": path,
-                        "parallax_bin": bin_label,
-                        "n_pairs": stats[
-                            (encoder, metric, path, bin_label, present[0])
-                        ]["n_pairs"],
-                    }
-                    for variant in present:
-                        entry = stats[(encoder, metric, path, bin_label, variant)]
-                        row[f"value[{variant}]"] = entry["value"]
-                        if variant != NO_WARP_COPY:
-                            row[f"margin[{variant}]"] = entry["margin"]
-                    table.append(row)
+        grid = np.full((len(rows), len(cols)), np.nan)
+        for i, rot in enumerate(rows):
+            for j, par in enumerate(cols):
+                cell = [
+                    r
+                    for r in subset
+                    if r["encoder"] == encoder
+                    and r["rotation_bin"] == rot
+                    and r["parallax_bin"] == par
+                ]
+                if not cell:
+                    continue
+                summary = cell_summary(cell, config)
+                summaries[(encoder, i, j)] = summary
+                grid[i, j] = summary["estimate"]
+        grids[encoder] = grid
+    pooled = np.concatenate([g[np.isfinite(g)] for g in grids.values()])
+    vmin, vmax = (float(pooled.min()), float(pooled.max())) if pooled.size else (0.0, 1.0)
+
+    figure, axes = plt.subplots(
+        1,
+        len(encoders),
+        figsize=(1.6 * max(len(cols), 3) * len(encoders) + 2, 1.15 * max(len(rows), 3) + 2.6),
+        squeeze=False,
+    )
+    for column, encoder in enumerate(encoders):
+        panel = axes[0][column]
+        image = panel.imshow(grids[encoder], cmap="viridis", vmin=vmin, vmax=vmax, aspect="auto")
+        for (owner, i, j), summary in summaries.items():
+            if owner != encoder:
+                continue
+            if not summary["supported"]:
+                panel.add_patch(
+                    plt.Rectangle(
+                        (j - 0.5, i - 0.5),
+                        1,
+                        1,
+                        fill=False,
+                        hatch="///",
+                        edgecolor="0.85",
+                        linewidth=0.0,
+                    )
+                )
+            midpoint = (vmin + vmax) / 2
+            panel.text(
+                j,
+                i,
+                f"{summary['estimate']:+.3f}\nn={summary['n_camera_pairs']}",
+                ha="center",
+                va="center",
+                fontsize=6,
+                color="white" if summary["estimate"] < midpoint else "black",
+            )
+        panel.set_xticks(range(len(cols)))
+        panel.set_xticklabels(cols, rotation=45, ha="right", fontsize=8)
+        panel.set_yticks(range(len(rows)))
+        panel.set_yticklabels(rows, fontsize=8)
+        panel.set_xlabel("parallax bin", fontsize=9)
+        if column == 0:
+            panel.set_ylabel("rotation bin", fontsize=9)
+        panel.set_title(encoder, fontsize=9)
+        figure.colorbar(image, ax=panel, fraction=0.046)
+    figure.suptitle(
+        f"Figure D: orbit joint analysis, margin over No-Warp-Copy, {metric}. "
+        "Blank cell = combination the program cannot produce; hatched = below support.",
+        fontsize=8,
+    )
+    figure.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+# ---------------------------------------------------------------------------
+# Table and entrypoint
+# ---------------------------------------------------------------------------
+
+def summary_table(
+    records: Sequence[dict[str, Any]], config: AnalysisConfig
+) -> list[dict[str, Any]]:
+    """One row per reported cell, with support and both intervals on every number."""
+    table: list[dict[str, Any]] = []
+    for axis, regime in PRIMARY_REGIME.items():
+        edges = config.parallax_edges() if axis == "parallax_bin" else config.rotation_edges()
+        scoped = [r for r in records if r["regime"] == regime]
+        for key, cell in group_by(scoped, ("encoder", "metric", "path", axis, "variant")).items():
+            encoder, metric, path, label, variant = key
+            summary = cell_summary(cell, config, statistic=mean_value)
+            margin = cell_summary(cell, config, statistic=mean_margin)
+            table.append(
+                {
+                    "analysis": regime,
+                    "axis": axis,
+                    "bin": label,
+                    "bin_index": bin_order(edges).index(label),
+                    "encoder": encoder,
+                    "metric": metric,
+                    "path": path,
+                    "variant": variant,
+                    "value": summary["estimate"],
+                    "value_ci_low": summary["ci_low"],
+                    "value_ci_high": summary["ci_high"],
+                    "margin": margin["estimate"],
+                    "margin_ci_low": margin["ci_low"],
+                    "margin_ci_high": margin["ci_high"],
+                    "margin_pair_ci_low": margin["pair_ci_low"],
+                    "margin_pair_ci_high": margin["pair_ci_high"],
+                    "n_scenes": summary["n_scenes"],
+                    "n_camera_pairs": summary["n_camera_pairs"],
+                    "n_feature_comparisons": summary["n_feature_comparisons"],
+                    "supported": summary["supported"],
+                }
+            )
+    table.sort(key=lambda r: (r["analysis"], r["encoder"], r["metric"], r["path"],
+                              r["bin_index"], r["variant"]))
     return table
 
 
@@ -171,251 +701,82 @@ def write_table(path: Path, table: Sequence[dict[str, Any]]) -> None:
     path = Path(path)
     if path.exists():
         raise FileExistsError(f"{path} exists; delete it to regenerate.")
+    if not table:
+        raise ValueError("no table rows to write")
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(list(table)), path)
 
 
-def _axis_table(
-    records: Sequence[dict[str, Any]],
-    axis: str,
-    order: Sequence[str],
-    title: str,
-    regimes: Sequence[str] | None = None,
-) -> list[str]:
-    """Oracle-Transport against one axis of viewpoint change, beside its floor."""
-    if regimes is not None:
-        records = [r for r in records if r["regime"] in regimes]
-    lines = [title]
-    if not records:
-        return lines + ["  (no pairs)"]
-    lines.append(
-        f"{'encoder':18s} {'path':11s} {'bin':>10s} {'pairs':>6s} "
-        f"{'cosine':>7s} {'floor':>7s} {'margin':>7s}"
-    )
-    floors = aggregate(
-        [r for r in records if r["variant"] == NO_WARP_COPY],
-        ("encoder", "path", axis),
-        ("value",),
-    )
-    stats = aggregate(
-        [r for r in records if r["variant"] == ORACLE_TRANSPORT],
-        ("encoder", "path", axis),
-        ("value", "margin"),
-    )
-    for encoder in sorted({r["encoder"] for r in records}):
-        for path in PATH_ORDER:
-            for bin_label in order:
-                key = (encoder, path, bin_label)
-                if key not in stats:
-                    continue
-                entry = stats[key]
-                lines.append(
-                    f"{encoder:18s} {path:11s} {bin_label:>10s} {entry['n_pairs']:6d} "
-                    f"{entry['value']:7.4f} {floors[key]['value']:7.4f} "
-                    f"{entry['margin']:+7.4f}"
-                )
-    return lines
-
-
-def format_console_summary(records: Sequence[dict[str, Any]]) -> str:
-    """A compact reading of the result, for the run log and for the writeup."""
-    encoders = sorted({r["encoder"] for r in records})
-    oracle = [r for r in records if r["variant"] == ORACLE_TRANSPORT]
-
-    lines = _axis_table(
-        records,
-        "parallax_bin",
-        parallax_bin_order(),
-        "Oracle-Transport by parallax, with its No-Warp-Copy floor",
-    )
-    lines.append("")
-    # In-place rotation has no baseline, so the table above holds all of it in
-    # one cell. The angle is the axis it actually varies on.
-    lines += _axis_table(
-        records,
-        "rotation_bin",
-        rotation_bin_order(),
-        "Oracle-Transport by rotation angle, in-place rotation only",
-        regimes=("rotation",),
-    )
-    lines.append("")
-    lines.append("By regime, pooled over parallax")
-    lines.append(f"{'encoder':18s} {'path':11s} {'regime':12s} {'pairs':>6s} "
-                 f"{'cosine':>7s} {'margin':>7s}")
-    by_regime = aggregate(oracle, ("encoder", "path", "regime"), ("value", "margin"))
-    for key in sorted(by_regime):
-        entry = by_regime[key]
-        lines.append(
-            f"{key[0]:18s} {key[1]:11s} {key[2]:12s} {entry['n_pairs']:6d} "
-            f"{entry['value']:7.4f} {entry['margin']:+7.4f}"
-        )
-    lines.append("")
-    lines.append("Floors and nulls, pooled over everything")
-    lines.append(f"{'encoder':18s} {'path':11s} {'variant':18s} {'cosine':>7s} {'margin':>7s}")
-    everything = aggregate(records, ("encoder", "path", "variant"), ("value", "margin"))
-    for encoder in encoders:
-        for path in PATH_ORDER:
-            for variant in VARIANT_ORDER:
-                key = (encoder, path, variant)
-                if key not in everything:
-                    continue
-                entry = everything[key]
-                lines.append(
-                    f"{encoder:18s} {path:11s} {variant:18s} "
-                    f"{entry['value']:7.4f} {entry['margin']:+7.4f}"
-                )
-    return "\n".join(lines)
-
-
-def margin_versus_axis_figure(
-    records: Sequence[dict[str, Any]],
-    path: Path,
-    axis: str = "parallax_bin",
-    order: Sequence[str] | None = None,
-    axis_label: str = "parallax bin (baseline / median depth)",
-    regimes: Sequence[str] | None = None,
-) -> None:
-    """Margin over No-Warp-Copy against one axis of viewpoint change.
-
-    One panel per evaluation path and metric, one line per encoder. The floor is
-    the zero line by construction, and Mean-Feature is drawn as a second
-    reference so the distance between a real result and a location-free guess
-    stays visible. A viewpoint change has two axes and neither alone describes
-    every regime, so this takes the axis as an argument: parallax separates the
-    translating regimes, rotation angle separates the in-place one.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    if regimes is not None:
-        records = [r for r in records if r["regime"] in regimes]
-    if not records:
-        raise ValueError("no records to plot")
-    encoders = sorted({r["encoder"] for r in records})
-    metrics = sorted({r["metric"] for r in records})
-    order = list(order) if order is not None else parallax_bin_order()
-    figure, axes = plt.subplots(
-        len(metrics),
-        len(PATH_ORDER),
-        figsize=(5.2 * len(PATH_ORDER), 4.2 * len(metrics)),
-        squeeze=False,
-    )
-    for row_index, metric in enumerate(metrics):
-        for column, evaluation_path in enumerate(PATH_ORDER):
-            panel = axes[row_index][column]
-            for variant, style in ((ORACLE_TRANSPORT, "-o"), (MEAN_FEATURE, "--s")):
-                stats = aggregate(
-                    [
-                        r
-                        for r in records
-                        if r["variant"] == variant
-                        and r["path"] == evaluation_path
-                        and r["metric"] == metric
-                    ],
-                    ("encoder", axis),
-                    ("margin",),
-                )
-                for encoder in encoders:
-                    present = [b for b in order if (encoder, b) in stats]
-                    if not present:
-                        continue
-                    panel.plot(
-                        range(len(present)),
-                        [stats[(encoder, b)]["margin"] for b in present],
-                        style,
-                        label=f"{encoder} {variant}",
-                        markersize=4,
-                    )
-                    panel.set_xticks(range(len(present)))
-                    panel.set_xticklabels(present, rotation=45, ha="right", fontsize=8)
-            panel.axhline(0.0, color="black", linewidth=1)
-            panel.set_title(f"{evaluation_path}, {metric}", fontsize=10)
-            panel.set_xlabel(axis_label, fontsize=9)
-            if column == 0:
-                panel.set_ylabel("margin over No-Warp-Copy", fontsize=9)
-            panel.grid(alpha=0.3)
-    for row in axes:
-        for panel in row:
-            if panel.get_legend_handles_labels()[0]:
-                panel.legend(fontsize=7, loc="best")
-                break
-        else:
-            continue
-        break
-    figure.suptitle("Experiment Zero: how far a frozen feature transports", fontsize=11)
-    figure.tight_layout()
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Build the Experiment Zero figure and table from eval parquet."
+        description="Build the Experiment Zero figures and table from eval parquet."
     )
     parser.add_argument("--eval-dir", type=Path, required=True)
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        default=None,
-        help="where the figure and table go (default: the eval directory's parent)",
-    )
-    parser.add_argument("--metric", type=str, default="cosine_mean")
+    parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--analysis-config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
+    config = load_analysis_config(args.analysis_config)
     out_dir = args.out_dir or Path(args.eval_dir).parent
-    rows = read_eval_dir(args.eval_dir)
-    metrics = [args.metric]
-    if args.metric == "cosine_mean" and "cosine_centered_mean" in rows[0]:
-        # Report both readings side by side. Neither alone is honest when an
-        # encoder spends most of a feature's length on one shared direction.
-        metrics.append("cosine_centered_mean")
+
+    rows = assign_bins(read_eval_dir(args.eval_dir), config)
     records: list[dict[str, Any]] = []
-    for metric in metrics:
-        records.extend(paired_records(rows, metric=metric))
-    scored = len({tuple(r[k] for k in PAIR_KEYS) for r in rows})
-    usable = len({(r["scene"], r["encoder"], r["path"], r["variant"]) for r in records})
-    print(f"read {len(rows)} rows, {scored} comparisons, {len(records)} scored records")
-    for metric in metrics:
-        print()
-        print(f"===== {metric} =====")
-        print(format_console_summary([r for r in records if r["metric"] == metric]))
-    figures = {
-        "margin_versus_parallax.png": dict(
-            axis="parallax_bin",
-            order=parallax_bin_order(),
-            axis_label="parallax bin (baseline / median depth)",
-            regimes=None,
-        ),
-        # In-place rotation has no baseline, so the parallax figure collapses it
-        # to one point. Its own axis is the angle.
-        "margin_versus_rotation.png": dict(
-            axis="rotation_bin",
-            order=rotation_bin_order(),
-            axis_label="rotation bin (degrees between the two views)",
-            regimes=("rotation",),
-        ),
-    }
+    mismatches = 0
+    for metric in (RAW, CENTERED):
+        part, count = paired_records(rows, metric=metric)
+        records.extend(part)
+        mismatches += count
+    print(f"read {len(rows)} rows, {len(records)} paired records")
+    if mismatches:
+        print(f"WARNING: {mismatches} comparisons excluded for mask mismatch")
+
+    agreement = path_agreement(rows, config)
+    print(
+        f"PROTOCOL 3.9 path agreement on the cross-path intersection: "
+        f"max |per_point - splat_pool| = {agreement['max_abs_difference']:.5f} "
+        f"over {agreement['comparisons']} comparisons, tolerance "
+        f"{agreement.get('tolerance', float('nan'))}, "
+        f"within = {agreement['within_tolerance']}"
+    )
+    print(
+        f"  coverage difference beside it: mean "
+        f"{agreement.get('mean_coverage_difference_cells', float('nan')):.2f} cells, "
+        f"max {agreement.get('max_coverage_difference_cells', 0)}"
+    )
+
     table_path = Path(out_dir) / "tables" / "experiment_zero.parquet"
-    print()
-    # The table is the artifact the numbers live in, so it is written before the
-    # figure. A missing plotting library must not cost the run its results.
-    write_table(table_path, summary_table(records))
+    write_table(table_path, summary_table(records, config))
     print(f"table  -> {table_path}")
-    for name, options in figures.items():
-        figure_path = Path(out_dir) / "figures" / name
+
+    figures = Path(out_dir) / "figures"
+    plan = [
+        ("figure_a_null_ladder.png", lambda p: figure_a_null_ladder(records, p, config)),
+        (
+            "figure_b_parallax_translation.png",
+            lambda p: figure_ceiling_and_floor(
+                records, p, config, "parallax_bin",
+                "Figure B: ceiling and floor versus parallax, translation regime",
+            ),
+        ),
+        (
+            "figure_c_rotation_inplace.png",
+            lambda p: figure_ceiling_and_floor(
+                records, p, config, "rotation_bin",
+                "Figure C: ceiling and floor versus rotation angle, in-place rotation regime",
+            ),
+        ),
+        ("figure_d_orbit_joint.png", lambda p: figure_d_orbit_joint(records, p, config)),
+    ]
+    for name, build in plan:
+        target = figures / name
         try:
-            margin_versus_axis_figure(records, figure_path, **options)
+            build(target)
         except ImportError as error:
             print(f"figures skipped: {error}. Install matplotlib and rerun; the table is written.")
             break
         except ValueError as error:
             print(f"{name} skipped: {error}")
         else:
-            print(f"figure -> {figure_path}")
-    assert usable  # every scene contributed something
+            print(f"figure -> {target}")
 
 
 if __name__ == "__main__":

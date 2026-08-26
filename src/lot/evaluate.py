@@ -255,6 +255,7 @@ class PairGeometry:
     grid: tuple[int, int]
     universe_ids: np.ndarray
     per_point_mask: np.ndarray      # [Hp * Wp] bool, cells scored per-point
+    per_point_cells: np.ndarray     # [N] universe cell of each per-point sample
     splat_mask: np.ndarray          # [Hp * Wp] bool, cells scored splat-and-pool
     random_patch: np.ndarray        # [Hp * Wp] int, hashed source patch per cell
     coverage_mean: float
@@ -266,6 +267,16 @@ class PairGeometry:
     @property
     def scorable(self) -> bool:
         return bool(self.per_point_mask.any() and self.splat_mask.any())
+
+    @property
+    def cross_path_mask(self) -> np.ndarray:
+        """Cells scored on both paths. PROTOCOL 3.9 compares the paths here.
+
+        Agreement measured on differing populations would mix operator
+        difference with selection difference, which is the fault every other
+        paired quantity in this protocol is arranged to avoid.
+        """
+        return self.per_point_mask & self.splat_mask
 
 
 def pair_parallax(baseline_m: float, depth_target: Tensor, covisible: Tensor) -> float:
@@ -338,10 +349,12 @@ def pair_geometry(
     size = patches_h * patches_w
 
     per_point_mask = np.zeros(size, dtype=bool)
+    per_point_cells = np.zeros(0, dtype=np.int64)
     if samples.uv_target.shape[0]:
         cols = torch.round((samples.uv_target[:, 0] + 0.5) / patch_size - 0.5).long()
         rows = torch.round((samples.uv_target[:, 1] + 0.5) / patch_size - 0.5).long()
-        per_point_mask[(rows * patches_w + cols).cpu().numpy()] = True
+        per_point_cells = (rows * patches_w + cols).cpu().numpy()
+        per_point_mask[per_point_cells] = True
 
     covisible_per_patch = fraction_per_patch(masks.covisible, patch_size)
     splat_mask = (
@@ -361,6 +374,7 @@ def pair_geometry(
         grid=grid,
         universe_ids=ids,
         per_point_mask=per_point_mask,
+        per_point_cells=per_point_cells,
         splat_mask=splat_mask,
         random_patch=derived_draw(ids, RANDOM_PATCH_SALT, size),
         coverage_mean=float(coverage.mean()) if coverage.numel() else float("nan"),
@@ -493,6 +507,17 @@ def splat_neighbor_prediction(
     return prediction, defined, direction
 
 
+def _intersection_metrics(
+    prediction: Tensor, target: Tensor, center: Tensor, centered_defined: bool
+) -> dict[str, float]:
+    """The same scores restricted to the cells both paths scored, for 3.9."""
+    metrics = agreement_metrics(prediction, target, center, centered_defined)
+    return {
+        "cosine_intersect_mean": metrics["cosine_mean"],
+        "cosine_centered_intersect_mean": metrics["cosine_centered_mean"],
+    }
+
+
 def evaluate_pair_for_encoder(
     geometry: PairGeometry,
     features_context: Tensor,
@@ -509,6 +534,12 @@ def evaluate_pair_for_encoder(
     """
     rows: list[dict[str, Any]] = []
     center = mean_vector.to(torch.float32)
+    # PROTOCOL 3.9 compares the paths on the cells both scored, so each path also
+    # reports its score restricted to that intersection. Computed here, where the
+    # per-sample values live, rather than reconstructed at figure time from
+    # aggregates that cannot support it.
+    shared = geometry.cross_path_mask
+    shared_count = int(shared.sum())
 
     # ---- per-point path -------------------------------------------------
     reads = gather_value_pairs(features_context, features_target, geometry.samples, patch_size)
@@ -517,15 +548,26 @@ def evaluate_pair_for_encoder(
     predictions: dict[str, Tensor] = {_READ_NAMES[key]: reads[key] for key in _READ_NAMES}
     predictions[MEAN_FEATURE] = center[None, :].expand(count, -1)
     blob = pack_mask(geometry.per_point_mask)
+    in_shared = torch.from_numpy(shared[geometry.per_point_cells])
     for variant in VARIANTS:
         rows.append(
             {
                 "path": PER_POINT,
                 "variant": variant,
                 "n": count,
+                "n_intersect": shared_count,
+                "coverage_difference": int(
+                    (geometry.per_point_mask & ~geometry.splat_mask).sum()
+                ),
                 "sample_mask": blob,
                 **agreement_metrics(
                     predictions[variant], target_values, center, variant != MEAN_FEATURE
+                ),
+                **_intersection_metrics(
+                    predictions[variant][in_shared],
+                    target_values[in_shared],
+                    center,
+                    variant != MEAN_FEATURE,
                 ),
                 "coverage_mean": float("nan"),
             }
@@ -552,15 +594,24 @@ def evaluate_pair_for_encoder(
     }
     targets = flat_target[:, index].T
     blob = pack_mask(selected)
+    in_shared_splat = torch.from_numpy(shared[np.flatnonzero(selected)])
     for variant in VARIANTS:
         rows.append(
             {
                 "path": SPLAT_POOL,
                 "variant": variant,
                 "n": int(index.numel()),
+                "n_intersect": shared_count,
+                "coverage_difference": int((selected & ~geometry.per_point_mask).sum()),
                 "sample_mask": blob,
                 **agreement_metrics(
                     splat_predictions[variant], targets, center, variant != MEAN_FEATURE
+                ),
+                **_intersection_metrics(
+                    splat_predictions[variant][in_shared_splat],
+                    targets[in_shared_splat],
+                    center,
+                    variant != MEAN_FEATURE,
                 ),
                 "coverage_mean": geometry.coverage_mean,
             }

@@ -32,6 +32,7 @@ class AnalysisConfig:
     parallax_bin_edges: tuple[float, ...]
     bin_right_closed: bool
     zero_parallax_tol: float
+    min_expected_median_depth_m: float
     zero_rotation_tol_deg: float
     assert_translation_parallax_floor: bool
 
@@ -61,6 +62,23 @@ class AnalysisConfig:
     frame_min_valid_fraction: float
     frame_min_clearance_m: float
     frame_near_depth_floor_m: float
+
+    def __post_init__(self) -> None:
+        # A rotation frame's position is a simulator read-back, so it carries
+        # noise up to rotation_position_bound_m. That noise becomes a parallax
+        # of at most bound / depth, and if that exceeds zero_parallax_tol the
+        # pairs of the one regime defined by having no baseline are binned as
+        # though they had one. The two constants are only meaningful together,
+        # so they are checked together rather than left to agree by luck.
+        worst = self.rotation_position_bound_m / self.min_expected_median_depth_m
+        if worst > self.zero_parallax_tol:
+            raise ValueError(
+                f"rotation_position_bound_m {self.rotation_position_bound_m:g} over "
+                f"min_expected_median_depth_m {self.min_expected_median_depth_m:g} "
+                f"gives a parallax of {worst:g}, above zero_parallax_tol "
+                f"{self.zero_parallax_tol:g}: an in-place rotation pair at the "
+                "bound would be binned as if it had a baseline"
+            )
 
     def rotation_edges(self) -> tuple[float, ...]:
         """Rotation bin edges with the mandatory open-ended overflow appended."""

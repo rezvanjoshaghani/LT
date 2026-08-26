@@ -233,27 +233,30 @@ def test_pair_quantities_match_the_relative_pose_directly():
 # PROTOCOL 3.4: the translation floor assertion
 # ---------------------------------------------------------------------------
 
-def test_translation_floor_is_enforced_not_absorbed():
-    """MINOR-3: a bin that quietly accepts them would hide a broken program."""
-    manifest, stats = make_scene(parallaxes=(0.1, 0.2))
-    pairs = build_scene_pairs(manifest, stats, ANALYSIS)
-    assert_translation_parallax_floor(pairs, ANALYSIS)  # the honest program passes
+def test_translation_floor_is_enforced_on_the_reported_statistic():
+    """MINOR-3, and the quantity matters as much as the check.
 
-    manifest, stats = make_scene(parallaxes=(0.005,))
-    offending = build_scene_pairs(manifest, stats, ANALYSIS)
+    The assertion is about the parallax that is reported and binned, the median
+    over the co-visible set. Checking the whole-frame sampling proxy instead
+    would let a pair pass here and still be reported inside the interval this
+    forbids, since the two are different numbers over different populations.
+    """
+    first_edge = ANALYSIS.parallax_edges()[0]
+    # A translation pair inside the forbidden interval is refused.
     with pytest.raises(ValueError, match="asserts empty"):
-        assert_translation_parallax_floor(offending, ANALYSIS)
+        assert_translation_parallax_floor("translation", first_edge / 2, ANALYSIS, "a pair")
+    # Exact zero, and anything at or above the first edge, are fine.
+    assert_translation_parallax_floor("translation", 0.0, ANALYSIS, "a pair")
+    assert_translation_parallax_floor("translation", first_edge, ANALYSIS, "a pair")
+    # A pair with no co-visible surface has no reported parallax to check.
+    assert_translation_parallax_floor("translation", float("nan"), ANALYSIS, "a pair")
 
 
 def test_orbit_pairs_are_not_subject_to_the_floor():
-    """PROTOCOL 3.4: orbit pairs may legitimately fall in (0, 0.025)."""
-    manifest, stats = make_scene(parallaxes=(0.005,))
-    pairs = build_scene_pairs(manifest, stats, ANALYSIS)
-    relabelled = [
-        p if p.regime != "translation" else dataclasses_replace(p, regime="orbit")
-        for p in pairs
-    ]
-    assert_translation_parallax_floor(relabelled, ANALYSIS)
+    """PROTOCOL 3.4: orbit pairs may legitimately fall in that interval."""
+    first_edge = ANALYSIS.parallax_edges()[0]
+    assert_translation_parallax_floor("orbit", first_edge / 2, ANALYSIS, "an orbit pair")
+    assert_translation_parallax_floor("rotation", first_edge / 2, ANALYSIS, "a rotation pair")
 
 
 def dataclasses_replace(record, **changes):

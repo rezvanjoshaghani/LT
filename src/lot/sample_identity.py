@@ -19,7 +19,7 @@ Random-Patch's patch choice and Neighbor-Patch's direction cannot correlate.
 
 from __future__ import annotations
 
-import zlib
+import hashlib
 
 import numpy as np
 import torch
@@ -51,9 +51,22 @@ def _mix64(value: np.ndarray) -> np.ndarray:
 
 
 def pair_seed(scene: str, context_frame_id: str, target_frame_id: str) -> np.uint64:
-    """The part of a sample_id that does not depend on where in the frame it sits."""
+    """The part of a sample_id that does not depend on where in the frame it sits.
+
+    The digest is taken at full 64-bit width. An earlier version reduced the key
+    with crc32 first, which capped the pair space at 2 to the 32 no matter how
+    wide the mix that followed: over the 79,272 pairs the camera programs
+    produce, the birthday bound puts about one collision in that space, and
+    exhaustive enumeration found four. Two pairs sharing a seed give identical
+    sample_ids to their samples at matching target coordinates, which is exactly
+    what the global identity contract of PROTOCOL 3.2 forbids, and it would
+    survive undetected because a within-pair uniqueness check cannot see across
+    pairs. A cross-pair join, which is how Phase 4 matches surviving sets, would
+    have merged them silently.
+    """
     key = f"{scene}|{context_frame_id}|{target_frame_id}".encode("utf-8")
-    return _mix64(np.array([zlib.crc32(key)], dtype=np.uint64))[0]
+    digest = hashlib.blake2b(key, digest_size=8).digest()
+    return np.uint64(int.from_bytes(digest, "big"))
 
 
 def sample_ids(

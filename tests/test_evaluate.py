@@ -443,3 +443,81 @@ def test_coverage_holes_are_a_legitimate_cross_path_difference():
     geometry.splat_mask[0] = False
     assert_source_read_sets_agree(geometry, "uncovered pair")
     assert cross_path_record_difference(geometry)["per_point_only_uncovered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the external review
+# ---------------------------------------------------------------------------
+
+def test_sample_ids_are_globally_unique_not_merely_per_pair():
+    """PROTOCOL 3.2 makes the identity global, and a 32-bit seed is not.
+
+    An earlier version reduced the pair key with crc32 before the 64-bit mix,
+    which capped the pair space at 2^32 however wide the mix that followed. Over
+    the 79,272 pairs the camera programs produce, the birthday bound puts about
+    one collision in that space and enumeration found four. Two pairs sharing a
+    seed give identical ids to their samples at matching target coordinates, and
+    a cross-pair join, which is how Phase 4 matches surviving sets, would merge
+    them silently. The within-pair uniqueness assertion cannot see it.
+    """
+    from lot.sample_identity import pair_seed
+
+    scenes = ["apartment_2", "hotel_0", "room_0", "office_1"]
+    regimes = {"rotation": 13, "translation": 17, "orbit": 18}
+    seen: dict[int, tuple] = {}
+    for scene in scenes:
+        for viewpoint in range(6):
+            for regime, count in regimes.items():
+                ids = [f"{scene}_vp{viewpoint:02d}_{regime}_{i:03d}" for i in range(count)]
+                for context in ids:
+                    for target in ids:
+                        if context == target:
+                            continue
+                        seed = int(pair_seed(scene, context, target))
+                        key = (scene, context, target)
+                        assert seed not in seen, (
+                            f"pair seed collision between {seen.get(seed)} and {key}"
+                        )
+                        seen[seed] = key
+    assert len(seen) > 15_000
+
+
+def test_a_pair_scorable_on_one_path_is_not_discarded():
+    """Requiring both paths would condition per-point results on splat success.
+
+    That removes exactly the difficult, low-coverage pairs and biases every
+    per-point aggregate towards easy geometry. Coverage differences between the
+    paths are reported, not resolved by dropping the pair.
+    """
+    geometry, features = identity_pair()
+    geometry.splat_mask[:] = False
+    assert geometry.scorable
+    rows = evaluate_pair_for_encoder(
+        geometry, features, features, torch.zeros(features.shape[0])
+    )
+    assert {r["path"] for r in rows} == {PER_POINT}
+    assert len(rows) == len(VARIANTS)
+
+    geometry.per_point_mask[:] = False
+    geometry.splat_mask[:] = False
+    assert not geometry.scorable
+
+
+def test_the_mean_vector_is_written_atomically_and_checked_on_reuse(tmp_path):
+    """The documented run is an 18-task array over one output directory."""
+    from lot.encoders import cache_dir
+    from lot.evaluate import load_or_build_mean_vector
+
+    directory = cache_dir(tmp_path / "cache", "dinov2_vitb14", "room_0")
+    directory.mkdir(parents=True)
+    np.savez(directory / "features.npz", a=np.full((4, 2, 2), 3.0, dtype=np.float16))
+
+    out = tmp_path / "out"
+    first = load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
+    assert torch.allclose(first, torch.full((4,), 3.0))
+    assert not list(out.glob("*.partial"))
+    # Reuse is validated against provenance, not taken on trust.
+    again = load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
+    assert torch.equal(first, again)
+    with pytest.raises(ValueError, match="built for"):
+        load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_1"], out)

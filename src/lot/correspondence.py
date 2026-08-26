@@ -57,7 +57,7 @@ from .sample_identity import (
     derived_draw,
     sample_ids,
 )
-from .visibility import DEFAULT_RELATIVE_DEPTH_TOL
+from .visibility import default_relative_depth_tol
 
 # Salt for choosing which co-visible candidates to evaluate. Selection is a hash
 # of sample_id rather than a shuffle, so the chosen set does not depend on how
@@ -149,7 +149,7 @@ def sample_correspondences(
     target_frame_id: str,
     patch_size: int = PATCH_SIZE,
     mode: str = "patch_center",
-    depth_consistency_tol: float = DEFAULT_RELATIVE_DEPTH_TOL,
+    depth_consistency_tol: float | None = None,
 ) -> CorrespondenceSamples:
     """Sample co-visible target locations with ground-truth warps and null locations.
 
@@ -168,6 +168,8 @@ def sample_correspondences(
     depth_consistency_tol: relative depth spread allowed across those four
         pixels, used by "patch_center" only.
     """
+    if depth_consistency_tol is None:
+        depth_consistency_tol = default_relative_depth_tol()
     if depth_target.shape != covisible.shape:
         raise ValueError("depth_target and covisible must have the same shape")
     height, width = depth_target.shape

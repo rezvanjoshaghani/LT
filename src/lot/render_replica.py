@@ -279,9 +279,9 @@ def _plane_residual_spread(z: Tensor, x: Tensor, y: Tensor) -> float:
 def classify_depth_convention(
     depth: Tensor,
     K: Tensor,
-    center_crop: float = 0.5,
-    flat_tol: float = 0.01,
-    margin: float = 3.0,
+    center_crop: float | None = None,
+    flat_tol: float | None = None,
+    margin: float | None = None,
     max_samples: int = 20000,
 ) -> dict[str, Any]:
     """Decide whether a depth map of a planar surface is planar z or euclidean.
@@ -303,6 +303,10 @@ def classify_depth_convention(
     'euclidean_ray', or 'ambiguous'), spread_planar, spread_euclidean,
     median_m, valid_fraction.
     """
+    config = _analysis()
+    center_crop = config.depth_convention_center_crop if center_crop is None else center_crop
+    flat_tol = config.depth_convention_flat_tol if flat_tol is None else flat_tol
+    margin = config.depth_convention_margin if margin is None else margin
     if depth.dim() != 2:
         raise ValueError(f"depth must be [H, W], got {tuple(depth.shape)}")
     if not 0 < center_crop <= 1:
@@ -713,18 +717,17 @@ def validate_manifest(
 FRAME_STATS_VERSION = 2
 FRAME_STATS_NAME = "frame_stats.json"
 
-# Defaults for the usability test below. They are deliberately permissive: the
-# job is to drop frames that are not views of the scene, not to judge views.
-MIN_USABLE_VALID_FRACTION = 0.5
-MIN_USABLE_CLEARANCE_M = 0.15
+def _analysis():
+    """The normative config, resolved lazily so importing needs no file read."""
+    from .analysis_config import load_analysis_config
 
-# A depth below this is a rendering artifact, not a surface. Used wherever a
-# depth map is asked whether a pixel saw anything.
-NEAR_DEPTH_FLOOR_M = 0.05
+    return load_analysis_config()
+
+
 
 
 def frame_depth_stats(
-    depth: np.ndarray, center_crop: float = 0.5, near_m: float = NEAR_DEPTH_FLOOR_M
+    depth: np.ndarray, center_crop: float | None = None, near_m: float | None = None
 ) -> dict[str, float]:
     """Depth quality statistics for one rendered frame, in meters.
 
@@ -737,6 +740,9 @@ def frame_depth_stats(
     pixel cannot decide whether a frame is usable. Statistics that no valid
     pixel supports come back as nan.
     """
+    config = _analysis()
+    center_crop = config.depth_convention_center_crop if center_crop is None else center_crop
+    near_m = config.frame_near_depth_floor_m if near_m is None else near_m
     d = np.asarray(depth, dtype=np.float64)
     if d.ndim != 2:
         raise ValueError(f"depth must be [H, W], got {d.shape}")
@@ -778,8 +784,8 @@ def _stat(stats: dict[str, Any], key: str) -> float:
 
 def frame_is_usable(
     stats: dict[str, float],
-    min_valid_fraction: float = MIN_USABLE_VALID_FRACTION,
-    min_clearance_m: float = MIN_USABLE_CLEARANCE_M,
+    min_valid_fraction: float | None = None,
+    min_clearance_m: float | None = None,
 ) -> bool:
     """Whether one frame is a view of the scene at all.
 
@@ -801,6 +807,11 @@ def frame_is_usable(
     matters most, and distant views carry the near-homography regime. Median
     depth belongs in the stratification, not in the gate.
     """
+    config = _analysis()
+    if min_valid_fraction is None:
+        min_valid_fraction = config.frame_min_valid_fraction
+    if min_clearance_m is None:
+        min_clearance_m = config.frame_min_clearance_m
     clearance = _stat(stats, "center_p01_m")
     if not math.isfinite(clearance):
         return False
@@ -1450,7 +1461,12 @@ def render_scene(cfg: RenderConfig, scene: str) -> Path:
     }
     manifest = Manifest(scene=scene, metadata=metadata, frames=records)
     write_manifest(manifest_path, manifest)
-    validate_manifest(load_manifest(manifest_path), out_dir, check_files=True)
+    validate_manifest(
+        load_manifest(manifest_path),
+        out_dir,
+        check_files=True,
+        rotation_position_bound_m=_analysis().rotation_position_bound_m,
+    )
     write_scene_qc(out_dir, manifest, cfg.qc_frames_per_regime)
     print(f"[{scene}] {len(records)} frames {per_regime}; manifest {manifest_path}")
     return manifest_path
@@ -1528,7 +1544,10 @@ def main(argv: list[str] | None = None) -> None:
             out_dir = cfg.output_root / scene
             try:
                 validate_manifest(
-                    load_manifest(out_dir / MANIFEST_NAME), out_dir, check_files=True
+                    load_manifest(out_dir / MANIFEST_NAME),
+                    out_dir,
+                    check_files=True,
+                    rotation_position_bound_m=_analysis().rotation_position_bound_m,
                 )
             except FileNotFoundError:
                 print(f"[{scene}] MISSING: no manifest at {out_dir / MANIFEST_NAME}")
@@ -1578,7 +1597,12 @@ def main(argv: list[str] | None = None) -> None:
         if args.qc_only:
             out_dir = cfg.output_root / scene
             manifest = load_manifest(out_dir / MANIFEST_NAME)
-            validate_manifest(manifest, out_dir, check_files=True)
+            validate_manifest(
+                manifest,
+                out_dir,
+                check_files=True,
+                rotation_position_bound_m=_analysis().rotation_position_bound_m,
+            )
             write_scene_qc(out_dir, manifest, cfg.qc_frames_per_regime)
             print(f"[{scene}] QC sheets written under {out_dir / 'qc'}")
         else:

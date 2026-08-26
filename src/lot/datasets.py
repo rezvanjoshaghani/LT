@@ -288,32 +288,32 @@ def hash_stratum(stratum: tuple[str, ...]) -> int:
 
 
 def assert_translation_parallax_floor(
-    pairs: Sequence[PairRecord], config: AnalysisConfig
+    regime: str, parallax: float, config: AnalysisConfig, where: str
 ) -> None:
-    """PROTOCOL 3.4: (0, 0.025) is empty for translation-program pairs.
+    """PROTOCOL 3.4: (0, first edge) is empty for translation-program pairs.
 
     The translation program sizes its moves from a design floor, so no
     translation pair should land between exact zero and the first edge. The
     assertion is enforced rather than silently absorbed by a bin, because a bin
     that quietly accepts them would hide a program that stopped honouring its
-    own floor. Orbit pairs may legitimately fall there and are not checked.
+    own floor.
+
+    The quantity asserted about is the reported parallax, the median of baseline
+    over ground-truth depth across the co-visible set, not the whole-frame proxy
+    the strata are formed on. Those differ, so asserting on the proxy would let
+    a pair pass here and still be reported inside the interval this forbids.
+    Orbit pairs may legitimately fall there and are not checked.
     """
     if not config.assert_translation_parallax_floor:
         return
+    if regime != "translation" or not math.isfinite(parallax):
+        return
     first_edge = config.parallax_edges()[0]
-    offenders = [
-        pair
-        for pair in pairs
-        if pair.regime == "translation"
-        and config.zero_parallax_tol <= pair.stratum_parallax < first_edge
-    ]
-    if offenders:
-        example = offenders[0]
+    if config.zero_parallax_tol <= parallax < first_edge:
         raise ValueError(
-            f"{len(offenders)} translation pairs fall in the open interval "
-            f"(0, {first_edge:g}) that PROTOCOL 3.4 asserts empty; first is "
-            f"{example.context_frame_id} to {example.target_frame_id} at "
-            f"parallax {example.stratum_parallax:g}"
+            f"{where}: translation pair at reported parallax {parallax:g} falls "
+            f"in the open interval (0, {first_edge:g}) that PROTOCOL 3.4 asserts "
+            "empty by the program's design floor"
         )
 
 

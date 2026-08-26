@@ -190,6 +190,7 @@ def paired_records(
                     "value": row[metric],
                     "margin": row[metric] - floor[metric],
                     "n": row["n"],
+                    "neighbor_omitted": row.get("neighbor_omitted", 0),
                 }
             )
     return records, mismatches
@@ -381,6 +382,35 @@ def matched_orbit_minus_translation(records: Sequence[dict[str, Any]]) -> float:
     return mean_margin(orbit) - mean_margin(translation)
 
 
+def matched_summaries(
+    records: Sequence[dict[str, Any]], keys: Sequence[str], config: AnalysisConfig
+) -> dict[tuple, dict[str, Any]]:
+    """Summaries for the orbit-minus-translation difference, supported per arm.
+
+    Support has to hold for each arm separately. Counting the pooled records
+    would let two arms that each fail the threshold add up to a cell that
+    passes, and a difference resting on an unsupported arm is unsupported no
+    matter how many records the other arm brings.
+    """
+    summaries = summaries_for(
+        records, keys, config, statistic=matched_orbit_minus_translation
+    )
+    grouped = group_by(records, keys)
+    for key, summary in summaries.items():
+        cell = grouped[key]
+        arms = {
+            regime: support_counts([r for r in cell if r["regime"] == regime])
+            for regime in (JOINT_REGIME, PRIMARY_REGIME["parallax_bin"])
+        }
+        summary["supported"] = all(is_supported(counts, config) for counts in arms.values())
+        summary["n_camera_pairs"] = min(counts["n_camera_pairs"] for counts in arms.values())
+        summary["n_scenes"] = min(counts["n_scenes"] for counts in arms.values())
+        summary["arm_support"] = {
+            regime: counts["n_camera_pairs"] for regime, counts in arms.items()
+        }
+    return summaries
+
+
 # ---------------------------------------------------------------------------
 # PROTOCOL 3.9: the operational transport check
 # ---------------------------------------------------------------------------
@@ -401,6 +431,8 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
         key = (row["scene"], row["context_frame_id"], row["target_frame_id"], row["encoder"])
         by_key.setdefault(key, {})[row["path"]] = row
 
+    per_point_values: list[float] = []
+    splat_values: list[float] = []
     differences: list[float] = []
     coverage: list[int] = []
     for paths in by_key.values():
@@ -409,19 +441,37 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
         a = paths[PER_POINT]["cosine_intersect_mean"]
         b = paths[SPLAT_POOL]["cosine_intersect_mean"]
         if _finite(a) and _finite(b):
+            per_point_values.append(a)
+            splat_values.append(b)
             differences.append(abs(a - b))
             coverage.append(
                 int(paths[PER_POINT]["coverage_difference"])
                 + int(paths[SPLAT_POOL]["coverage_difference"])
             )
     if not differences:
-        return {"comparisons": 0, "max_abs_difference": float("nan"), "within_tolerance": False}
+        return {
+            "comparisons": 0,
+            "aggregate_abs_difference": float("nan"),
+            "max_abs_difference": float("nan"),
+            "within_tolerance": False,
+        }
+    tolerance = config.path_agreement_tolerance
+    # The gate is the difference of the two aggregates, which is the quantity the
+    # 0.003 tolerance was established on: the completed run compared pooled
+    # per-path scores. The per-pair maximum is reported beside it as a
+    # diagnostic, not gated, because a tolerance calibrated on an aggregate says
+    # nothing about the worst single pair, and gating on the maximum would apply
+    # a number to a statistic it was never measured against.
+    aggregate = abs(float(np.mean(per_point_values)) - float(np.mean(splat_values)))
     return {
         "comparisons": len(differences),
+        "aggregate_abs_difference": aggregate,
         "mean_abs_difference": float(np.mean(differences)),
+        "median_abs_difference": float(np.median(differences)),
         "max_abs_difference": float(np.max(differences)),
-        "tolerance": config.path_agreement_tolerance,
-        "within_tolerance": bool(np.max(differences) <= config.path_agreement_tolerance),
+        "pairs_over_tolerance": int(np.sum(np.asarray(differences) > tolerance)),
+        "tolerance": tolerance,
+        "within_tolerance": bool(aggregate <= tolerance),
         "mean_coverage_difference_cells": float(np.mean(coverage)),
         "max_coverage_difference_cells": int(np.max(coverage)),
     }
@@ -691,9 +741,7 @@ def figure_d_orbit_joint(
         and r["variant"] == ORACLE_TRANSPORT
         and r["regime"] in (JOINT_REGIME, PRIMARY_REGIME["parallax_bin"])
     ]
-    matched = summaries_for(
-        joint, ("encoder", "parallax_bin"), config, statistic=matched_orbit_minus_translation
-    )
+    matched = matched_summaries(joint, ("encoder", "parallax_bin"), config)
 
     figure, axes = plt.subplots(
         2,
@@ -830,12 +878,7 @@ def summary_table(
         if r["variant"] == ORACLE_TRANSPORT
         and r["regime"] in (JOINT_REGIME, PRIMARY_REGIME["parallax_bin"])
     ]
-    matched = summaries_for(
-        joint,
-        ("encoder", "metric", "path", "parallax_bin"),
-        config,
-        statistic=matched_orbit_minus_translation,
-    )
+    matched = matched_summaries(joint, ("encoder", "metric", "path", "parallax_bin"), config)
     for (encoder, metric, path, label), summary in matched.items():
         if not math.isfinite(summary["estimate"]):
             continue
@@ -989,7 +1032,15 @@ def main(argv: list[str] | None = None) -> None:
         mismatches += count
     print(f"read {len(rows)} rows, {len(records)} paired records")
     if mismatches:
-        print(f"WARNING: {mismatches} comparisons excluded for mask mismatch")
+        # Not a warning. Every variant of a path is scored on that path's common
+        # valid set, so identical masks are an invariant of the evaluation, and a
+        # mismatch means the run that produced this parquet did not hold it. Any
+        # table built on top would be subtracting across populations.
+        raise SystemExit(
+            f"{mismatches} comparisons carry mismatched masks between a variant "
+            "and its floor. PROTOCOL 3.7 makes every difference paired, so this "
+            "parquet cannot be reported on; re-run the evaluation."
+        )
 
     if args.counts_only:
         table = counts_table(records, config)
@@ -1002,25 +1053,56 @@ def main(argv: list[str] | None = None) -> None:
 
     agreement = path_agreement(rows, config)
     print(
-        f"PROTOCOL 3.9 path agreement on the cross-path intersection: "
-        f"max |per_point - splat_pool| = {agreement['max_abs_difference']:.5f} "
-        f"over {agreement['comparisons']} comparisons, tolerance "
-        f"{agreement.get('tolerance', float('nan'))}, "
-        f"within = {agreement['within_tolerance']}"
+        f"PROTOCOL 3.9 path agreement on the cross-path intersection, over "
+        f"{agreement['comparisons']} comparisons:"
+    )
+    print(
+        f"  gated: |mean(per_point) - mean(splat_pool)| = "
+        f"{agreement['aggregate_abs_difference']:.5f}, tolerance "
+        f"{agreement.get('tolerance', float('nan'))}, within = "
+        f"{agreement['within_tolerance']}"
+    )
+    print(
+        f"  diagnostic, not gated: per-pair |difference| median "
+        f"{agreement.get('median_abs_difference', float('nan')):.5f}, max "
+        f"{agreement['max_abs_difference']:.5f}, "
+        f"{agreement.get('pairs_over_tolerance', 0)} pairs above the tolerance"
     )
     print(
         f"  coverage difference beside it: mean "
         f"{agreement.get('mean_coverage_difference_cells', float('nan')):.2f} cells, "
         f"max {agreement.get('max_coverage_difference_cells', 0)}"
     )
+    if not agreement["within_tolerance"]:
+        # PROTOCOL 3.9 states the two paths must agree within the tolerance. A
+        # run that fails it has a transport operator that does not reach the
+        # representational ceiling, which changes what every later rung means,
+        # so it stops here rather than producing a table that reads as if it had.
+        raise SystemExit(
+            "PROTOCOL 3.9 path agreement failed: aggregate difference "
+            f"{agreement['aggregate_abs_difference']:.5f} exceeds tolerance "
+            f"{agreement['tolerance']}. Do not report these results; find the "
+            "difference between the two paths first."
+        )
 
+    # PROTOCOL 3.7 reports per-variant omission counts beside Figure A in place
+    # of differing n, since the common-valid rule gives every variant one n.
+    omissions = {
+        NEIGHBOR_PATCH: int(
+            sum(r["neighbor_omitted"] for r in rows if r["variant"] == NEIGHBOR_PATCH)
+            / max(1, len({r["metric"] for r in records}))
+        )
+    }
     table_path = Path(out_dir) / "tables" / "experiment_zero.parquet"
     write_table(table_path, summary_table(records, config))
     print(f"table  -> {table_path}")
 
     figures = Path(out_dir) / "figures"
     plan = [
-        ("figure_a_null_ladder.png", lambda p: figure_a_null_ladder(records, p, config)),
+        (
+            "figure_a_null_ladder.png",
+            lambda p: figure_a_null_ladder(records, p, config, omissions=omissions),
+        ),
         (
             "figure_b_parallax_translation.png",
             lambda p: figure_ceiling_and_floor(
@@ -1037,17 +1119,27 @@ def main(argv: list[str] | None = None) -> None:
         ),
         ("figure_d_orbit_joint.png", lambda p: figure_d_orbit_joint(records, p, config)),
     ]
+    failures: list[str] = []
     for name, build in plan:
         target = figures / name
         try:
             build(target)
         except ImportError as error:
-            print(f"figures skipped: {error}. Install matplotlib and rerun; the table is written.")
-            break
+            raise SystemExit(
+                f"matplotlib is required to produce the four figures PROTOCOL "
+                f"3.10 requires: {error}"
+            )
         except ValueError as error:
-            print(f"{name} skipped: {error}")
+            failures.append(f"{name}: {error}")
         else:
             print(f"figure -> {target}")
+    if failures:
+        # PROTOCOL 3.10 requires four figures. One that cannot be built is a
+        # fact about the run that has to surface, not a line in a log above a
+        # successful exit.
+        raise SystemExit(
+            "required figures could not be produced: " + "; ".join(failures)
+        )
 
 
 if __name__ == "__main__":

@@ -44,11 +44,12 @@ fi
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 # PROTOCOL 3.1 keeps the single-frame shape test and the batch-equality test in
-# the suite permanently. They are gated on this variable because they need
-# weights and a GPU; nothing set it, so the only runs that could execute them
-# were the runs that skipped them. Set here so a cluster run is a run that
-# checks them.
+# the suite permanently. Setting the variable alone does nothing: it only lifts
+# a pytest skip, and this job runs a module, not pytest. So the job runs them,
+# and refuses to do its own work if they fail. A cluster run is then a run that
+# has checked the encoder contract rather than one that could have.
 export LOT_ENCODER_SMOKE=1
+"$MM" run -n "$LOT_ENV" python -m pytest tests/test_encoder_cache.py     -k "vggt_batching or grid_orientation or sees_one_frame" -q
 
 "$MM" run -n "$LOT_ENV" python -m lot.evaluate \
     --config "$CONFIG" \

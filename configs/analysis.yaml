@@ -18,7 +18,14 @@ parallax_bin_edges: [0.025, 0.05, 0.1, 0.2, 0.4]
 bin_right_closed: true
 # A pair with no baseline at all is a different physical situation from one with
 # a small baseline, so exact zero gets its own bin rather than the smallest.
-zero_parallax_tol: 1.0e-9
+# Read-back noise in a rotation frame's position produces a small but nonzero
+# baseline, and therefore a small but nonzero parallax. The zero bin must be
+# wide enough to hold it, or in-place rotation pairs silently leave the bin that
+# exists for them. The consistency of these three values is asserted at load.
+zero_parallax_tol: 1.0e-5
+# The smallest median scene depth any accepted viewpoint can have. Used only to
+# turn the position bound into a parallax bound.
+min_expected_median_depth_m: 1.0
 zero_rotation_tol_deg: 1.0e-6
 # PROTOCOL 3.4: for translation-program pairs the open interval (0, 0.025) is
 # empty by the program's design floor, and the assertion is enforced rather than

@@ -292,6 +292,7 @@ def test_path_agreement_uses_the_intersection_columns():
         )
     result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
     assert result["comparisons"] == 1
+    assert result["aggregate_abs_difference"] == pytest.approx(0.0005, abs=1e-9)
     assert result["max_abs_difference"] == pytest.approx(0.0005, abs=1e-9)
     assert result["within_tolerance"]
     assert result["max_coverage_difference_cells"] == 6
@@ -307,7 +308,7 @@ def test_path_agreement_reports_coverage_beside_it_not_inside_it():
             coverage_difference=17,
         )
     result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
-    assert result["max_abs_difference"] == pytest.approx(0.0)
+    assert result["aggregate_abs_difference"] == pytest.approx(0.0)
     assert result["mean_coverage_difference_cells"] == pytest.approx(34.0)
 
 
@@ -388,3 +389,48 @@ def test_table_and_figures_regenerate_from_the_parquet_alone(tmp_path):
 def test_read_eval_dir_needs_something_to_read(tmp_path):
     with pytest.raises(FileNotFoundError):
         read_eval_dir(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the external review
+# ---------------------------------------------------------------------------
+
+def test_matched_difference_support_needs_both_arms():
+    """Two arms that each fail the threshold must not add up to a supported cell."""
+    from lot.figures import matched_summaries
+
+    rows = population(scenes=4, pairs=20, regime="orbit", parallax=0.08, rotation=15.0)
+    rows += population(scenes=4, pairs=20, regime="translation", parallax=0.08)
+    records, _ = paired_records(assign_bins(rows, ANALYSIS))
+    joint = [r for r in records if r["variant"] == ORACLE_TRANSPORT]
+    summaries = matched_summaries(joint, ("encoder", "parallax_bin"), ANALYSIS)
+    assert summaries
+    for summary in summaries.values():
+        # 20 pairs per arm, threshold 30: pooled would reach 40 and pass.
+        assert summary["arm_support"] == {"orbit": 20, "translation": 20}
+        assert not summary["supported"]
+
+
+def test_path_agreement_gates_the_aggregate_and_reports_the_spread():
+    """The 0.003 tolerance was established on pooled per-path scores.
+
+    Gating on the worst single pair would apply that number to a statistic it
+    was never measured against, so the aggregate is gated and the per-pair
+    spread is reported beside it.
+    """
+    rows = []
+    for index, (a, b) in enumerate([(0.90, 0.90), (0.90, 0.90), (0.80, 0.95)]):
+        for path, value in ((PER_POINT, a), (SPLAT_POOL, b)):
+            rows += comparison(
+                {ORACLE_TRANSPORT: 0.5, NO_WARP_COPY: 0.4},
+                path=path,
+                cosine_intersect_mean=value,
+                context_frame_id=f"c{index}",
+                target_frame_id=f"t{index}",
+            )
+    result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
+    assert result["max_abs_difference"] == pytest.approx(0.15, abs=1e-9)
+    assert result["pairs_over_tolerance"] == 1
+    # The aggregate difference is small even though one pair is far out.
+    assert result["aggregate_abs_difference"] == pytest.approx(0.05, abs=1e-9)
+    assert not result["within_tolerance"]

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import time
@@ -239,6 +240,25 @@ def preprocess_images(
     return x
 
 
+def model_fingerprint(model: Any) -> str:
+    """A hash of every frozen parameter, recorded beside the cache it produced.
+
+    Torch Hub resolves a mutable branch head and the VGGT loader takes no
+    revision, so a later rebuild can pull different weights while every version
+    string in the metadata stays the same. Pinning the revisions is the real
+    fix and needs the exact identifiers; this makes the change detectable
+    meanwhile, which is the difference between a cache that is wrong and a cache
+    that is wrong and silent.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(
+            tensor.detach().to(torch.float32).cpu().numpy().tobytes(order="C")
+        )
+    return digest.hexdigest()
+
+
 class FrozenEncoder:
     """Common behaviour of the frozen encoder wrappers.
 
@@ -252,11 +272,19 @@ class FrozenEncoder:
         self.device = torch.device(device)
         self._model: Any = None
         self._channels: int | None = spec.channels
+        self._fingerprint: str | None = None
 
     @property
     def channels(self) -> int | None:
         """Feature width. None until the first batch, for models that declare none."""
         return self._channels
+
+    @property
+    def fingerprint(self) -> str:
+        """Hash of the loaded weights. Loads the model if it is not loaded yet."""
+        if self._fingerprint is None:
+            self._fingerprint = model_fingerprint(self.model)
+        return self._fingerprint
 
     @property
     def model(self) -> Any:
@@ -543,6 +571,8 @@ def cache_scene_features(
         "has_depth": bool(export_depth),
         "batch_size": batch_size,
         "device": str(encoder.device),
+        "source": encoder.spec.source,
+        "weights_fingerprint": encoder.fingerprint,
         "encode_seconds": round(encode_seconds, 3),
         "total_seconds": round(total_seconds, 3),
         "frames_per_second": round(len(manifest.frames) / max(total_seconds, 1e-9), 3),

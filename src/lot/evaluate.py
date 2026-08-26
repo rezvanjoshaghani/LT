@@ -34,6 +34,7 @@ import argparse
 import dataclasses
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -56,7 +57,12 @@ from .datasets import (
 )
 from .encoders import ENCODERS, PATCH_SIZE, cache_dir, patch_grid_shape
 from .geometry import relative_pose
-from .render_replica import MANIFEST_NAME, REPLICA_SCENES, load_manifest
+from .render_replica import (
+    MANIFEST_NAME,
+    REPLICA_SCENES,
+    load_manifest,
+    validate_manifest,
+)
 from .sample_identity import (
     NEIGHBOR_PATCH_SALT,
     RANDOM_PATCH_SALT,
@@ -181,14 +187,54 @@ def dataset_mean_vector(cache_root: Path, encoder: str, scenes: Sequence[str]) -
 def load_or_build_mean_vector(
     cache_root: Path, encoder: str, scenes: Sequence[str], out_dir: Path
 ) -> Tensor:
-    """Read the global mean vector from out_dir, computing and storing it once."""
+    """Read the global mean vector from out_dir, computing and storing it once.
+
+    Written through a process-unique temporary name and renamed into place. The
+    documented run is an 18-task SLURM array over one output directory, so an
+    exists-check followed by a direct write leaves a window in which one task
+    reads a half-written array while another is still writing it. The rename is
+    atomic, so a reader sees either the old file or the whole new one. Two tasks
+    racing to build it is harmless because the vector is a deterministic
+    function of the cache; a torn read is not.
+
+    The stored vector is validated against a provenance record on load. A vector
+    left over from a different encoder, a different training split, or a
+    different cache would otherwise be picked up silently and would move both
+    the Mean-Feature floor and the centering statistic at once.
+    """
     out_dir = Path(out_dir)
     path = out_dir / f"mean_vector_{encoder}.npy"
-    if path.exists():
-        return torch.from_numpy(np.load(path)).to(torch.float32)
+    record = out_dir / f"mean_vector_{encoder}.json"
+    provenance = {
+        "encoder": encoder,
+        "scenes": sorted(scenes),
+        "cache_root": str(cache_root),
+        "eval_version": EVAL_VERSION,
+    }
+    if path.exists() and record.exists():
+        stored = json.loads(record.read_text(encoding="utf-8"))
+        if stored != provenance:
+            raise ValueError(
+                f"{path} was built for {stored}, this run needs {provenance}; "
+                "delete it rather than reusing a floor built from other frames"
+            )
+        vector = torch.from_numpy(np.load(path)).to(torch.float32)
+        if vector.dim() != 1 or vector.numel() == 0:
+            raise ValueError(f"{path} is not a [C] vector, got {tuple(vector.shape)}")
+        return vector
     mean = dataset_mean_vector(cache_root, encoder, scenes)
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(path, mean.numpy())
+    stamp = f".{os.getpid()}.partial"
+    tmp = path.with_name(path.name + stamp)
+    # Written through a handle: np.save appends .npy to any name that lacks it,
+    # so passing the temporary path directly would create a file the rename
+    # cannot find.
+    with open(tmp, "wb") as handle:
+        np.save(handle, mean.numpy())
+    os.replace(tmp, path)
+    tmp_record = record.with_name(record.name + stamp)
+    tmp_record.write_text(json.dumps(provenance, indent=1), encoding="utf-8")
+    os.replace(tmp_record, record)
     return mean
 
 
@@ -270,7 +316,15 @@ class PairGeometry:
 
     @property
     def scorable(self) -> bool:
-        return bool(self.per_point_mask.any() and self.splat_mask.any())
+        """Whether any path has something to score.
+
+        Deliberately "or", not "and". Requiring both would condition the
+        per-point result on the splat path finding support, which removes
+        exactly the difficult, low-coverage pairs and biases every per-point
+        aggregate towards easy geometry. PROTOCOL 4.4 wants coverage
+        differences between paths reported, not resolved by dropping the pair.
+        """
+        return bool(self.per_point_mask.any() or self.splat_mask.any())
 
     @property
     def cross_path_mask(self) -> np.ndarray:
@@ -553,13 +607,14 @@ def evaluate_pair_for_encoder(
     predictions[MEAN_FEATURE] = center[None, :].expand(count, -1)
     blob = pack_mask(geometry.per_point_mask)
     in_shared = torch.from_numpy(shared[geometry.per_point_cells])
-    for variant in VARIANTS:
+    for variant in VARIANTS if count else ():
         rows.append(
             {
                 "path": PER_POINT,
                 "variant": variant,
                 "n": count,
                 "n_intersect": shared_count,
+                "neighbor_omitted": int(geometry.samples.neighbor_omitted),
                 "coverage_difference": int(
                     (geometry.per_point_mask & ~geometry.splat_mask).sum()
                 ),
@@ -599,13 +654,14 @@ def evaluate_pair_for_encoder(
     targets = flat_target[:, index].T
     blob = pack_mask(selected)
     in_shared_splat = torch.from_numpy(shared[np.flatnonzero(selected)])
-    for variant in VARIANTS:
+    for variant in VARIANTS if int(index.numel()) else ():
         rows.append(
             {
                 "path": SPLAT_POOL,
                 "variant": variant,
                 "n": int(index.numel()),
                 "n_intersect": shared_count,
+                "neighbor_omitted": int(geometry.samples.neighbor_omitted),
                 "coverage_difference": int((selected & ~geometry.per_point_mask).sum()),
                 "sample_mask": blob,
                 **agreement_metrics(
@@ -740,13 +796,16 @@ def evaluate_scene(
     """Evaluate one scene's sampled pairs. Returns (rows, run metadata)."""
     scene_root = cfg.renders_root / scene
     manifest = load_manifest(scene_root / MANIFEST_NAME)
+    # PROTOCOL 3.3's defining property of the in-place rotation regime is
+    # checked on the way in, not only by a test that passes the bound by hand.
+    validate_manifest(
+        manifest,
+        scene_root,
+        check_files=False,
+        rotation_position_bound_m=analysis.rotation_position_bound_m,
+    )
     frames = {f.frame_id: f for f in manifest.frames}
     all_pairs = load_scene_pairs(cfg.renders_root, scene, config=analysis)
-    # PROTOCOL 3.4 asserts the open interval below the first parallax edge is
-    # empty for translation-program pairs, by that program's design floor. A bin
-    # that quietly absorbed them would hide a program that had stopped honouring
-    # its own floor, so the assertion runs before anything is sampled.
-    assert_translation_parallax_floor(all_pairs, analysis)
     pairs = subsample_by_stratum(
         all_pairs, analysis.max_pairs_per_stratum, seed=cfg.seed, config=analysis
     )
@@ -774,6 +833,18 @@ def evaluate_scene(
                 analysis,
             )
             neighbor_omitted += geometry.samples.neighbor_omitted
+            # PROTOCOL 3.4 asserts the interval below the first parallax edge is
+            # empty for translation-program pairs. The quantity it asserts about
+            # is the reported statistic, the median over the co-visible set,
+            # which is only known here. Asserting on the sampling proxy instead
+            # would let a pair pass the check and still land in the forbidden
+            # interval of the bin it is actually reported in.
+            assert_translation_parallax_floor(
+                pair.regime,
+                geometry.parallax,
+                analysis,
+                f"{scene} {pair.context_frame_id} -> {pair.target_frame_id}",
+            )
             universe_size = geometry.size
             if not geometry.scorable:
                 # PROTOCOL 3.2 permits exactly one nonfinite representation, the

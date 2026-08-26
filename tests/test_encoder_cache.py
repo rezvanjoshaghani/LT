@@ -10,6 +10,8 @@ import dataclasses
 import json
 import os
 
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -50,11 +52,16 @@ def stub_spec(provides_depth: bool = False) -> EncoderSpec:
 
 
 class StubEncoder(FrozenEncoder):
-    """Deterministic stand-in for a frozen encoder. Never loads a model.
+    """Deterministic stand-in for a frozen encoder.
 
-    Each channel of a patch holds the mean brightness of that patch's pixels,
-    so a cached value can be checked against the source image by hand.
+    Each channel of a patch holds the mean brightness of that patch's pixels, so
+    a cached value can be checked against the source image by hand. It carries a
+    parameterless module so the weight fingerprint the cache records is defined
+    for it too, rather than being a hole only the stubs fall into.
     """
+
+    def _load(self) -> Any:
+        return torch.nn.Module()
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
         count, height, width, _ = images_uint8.shape
@@ -72,6 +79,9 @@ class StubEncoder(FrozenEncoder):
 
 class BadShapeEncoder(FrozenEncoder):
     """Returns a transposed patch grid, which the base class must reject."""
+
+    def _load(self) -> Any:
+        return torch.nn.Module()
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
         count, height, width, _ = images_uint8.shape

@@ -49,7 +49,11 @@ from .correspondence import (
     gather_value_pairs,
     sample_correspondences,
 )
-from .datasets import load_scene_pairs, subsample_by_stratum
+from .datasets import (
+    assert_translation_parallax_floor,
+    load_scene_pairs,
+    subsample_by_stratum,
+)
 from .encoders import ENCODERS, PATCH_SIZE, cache_dir, patch_grid_shape
 from .geometry import relative_pose
 from .render_replica import MANIFEST_NAME, REPLICA_SCENES, load_manifest
@@ -737,11 +741,14 @@ def evaluate_scene(
     scene_root = cfg.renders_root / scene
     manifest = load_manifest(scene_root / MANIFEST_NAME)
     frames = {f.frame_id: f for f in manifest.frames}
+    all_pairs = load_scene_pairs(cfg.renders_root, scene, config=analysis)
+    # PROTOCOL 3.4 asserts the open interval below the first parallax edge is
+    # empty for translation-program pairs, by that program's design floor. A bin
+    # that quietly absorbed them would hide a program that had stopped honouring
+    # its own floor, so the assertion runs before anything is sampled.
+    assert_translation_parallax_floor(all_pairs, analysis)
     pairs = subsample_by_stratum(
-        load_scene_pairs(cfg.renders_root, scene, config=analysis),
-        analysis.max_pairs_per_stratum,
-        seed=cfg.seed,
-        config=analysis,
+        all_pairs, analysis.max_pairs_per_stratum, seed=cfg.seed, config=analysis
     )
     cache = _SceneCache(scene_root, cfg.cache_root, cfg.encoders, scene)
     rows: list[dict[str, Any]] = []
@@ -791,6 +798,7 @@ def evaluate_scene(
     metadata = {
         "eval_version": EVAL_VERSION,
         "scene": scene,
+        "pairs_available": len(all_pairs),
         "pairs_considered": len(pairs),
         "pairs_dropped_unscorable": dropped_unscorable,
         "neighbor_patch_omitted_records": neighbor_omitted,

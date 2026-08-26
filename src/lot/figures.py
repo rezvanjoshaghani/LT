@@ -868,6 +868,87 @@ def summary_table(
     return table
 
 
+def counts_table(
+    records: Sequence[dict[str, Any]], config: AnalysisConfig
+) -> list[dict[str, Any]]:
+    """Support counts per reported cell, and nothing else.
+
+    PROTOCOL 3.4 permits bin edges and support thresholds to be set from counts
+    alone, never from outcome values, before the freeze locks them. Counts are
+    design facts; margins are results. This view exists so that decision can be
+    made without the margins in front of you, which is the difference between
+    choosing a threshold and choosing which claims survive it.
+    """
+    out: list[dict[str, Any]] = []
+    for axis, regime in PRIMARY_REGIME.items():
+        edges = config.parallax_edges() if axis == "parallax_bin" else config.rotation_edges()
+        scoped = [
+            r
+            for r in records
+            if r["regime"] == regime
+            and r["variant"] == ORACLE_TRANSPORT
+            and r["metric"] == RAW
+            and r["path"] == PER_POINT
+        ]
+        for key, cell in group_by(scoped, ("encoder", axis)).items():
+            encoder, label = key
+            counts = support_counts(cell)
+            out.append(
+                {
+                    "analysis": regime,
+                    "axis": axis,
+                    "bin": label,
+                    "bin_index": bin_order(edges).index(label),
+                    "encoder": encoder,
+                    **counts,
+                    "supported_at_current_threshold": is_supported(counts, config),
+                }
+            )
+    joint = [
+        r
+        for r in records
+        if r["regime"] == JOINT_REGIME
+        and r["variant"] == ORACLE_TRANSPORT
+        and r["metric"] == RAW
+        and r["path"] == PER_POINT
+    ]
+    for key, cell in group_by(joint, ("encoder", "rotation_bin", "parallax_bin")).items():
+        encoder, rotation_label, parallax_label = key
+        counts = support_counts(cell)
+        out.append(
+            {
+                "analysis": JOINT_REGIME,
+                "axis": "rotation_bin x parallax_bin",
+                "bin": f"{rotation_label} x {parallax_label}",
+                "bin_index": bin_order(config.rotation_edges()).index(rotation_label),
+                "encoder": encoder,
+                **counts,
+                "supported_at_current_threshold": is_supported(counts, config),
+            }
+        )
+    out.sort(key=lambda r: (r["analysis"], r["encoder"], r["bin_index"], r["bin"]))
+    return out
+
+
+def format_counts(table: Sequence[dict[str, Any]], config: AnalysisConfig) -> str:
+    lines = [
+        "Support counts only. PROTOCOL 3.4 permits thresholds to be set from "
+        "these and never from outcome values.",
+        f"current thresholds: scenes >= {config.support_min_scenes}, "
+        f"camera pairs >= {config.support_min_camera_pairs}",
+        "",
+        f"{'analysis':<12} {'encoder':<18} {'bin':<22} {'scenes':>7} {'pairs':>7} "
+        f"{'comparisons':>12}  supported",
+    ]
+    for row in table:
+        lines.append(
+            f"{row['analysis']:<12} {row['encoder']:<18} {row['bin']:<22} "
+            f"{row['n_scenes']:>7} {row['n_camera_pairs']:>7} "
+            f"{row['n_feature_comparisons']:>12}  {row['supported_at_current_threshold']}"
+        )
+    return chr(10).join(lines)
+
+
 def write_table(path: Path, table: Sequence[dict[str, Any]]) -> None:
     """Write the summary table as parquet. Refuses to overwrite."""
     import pyarrow as pa
@@ -889,6 +970,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--analysis-config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument(
+        "--counts-only",
+        action="store_true",
+        help="print support counts and exit, with no outcome values, so a "
+        "threshold can be chosen from design facts alone",
+    )
     args = parser.parse_args(argv)
     config = load_analysis_config(args.analysis_config)
     out_dir = args.out_dir or Path(args.eval_dir).parent
@@ -903,6 +990,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"read {len(rows)} rows, {len(records)} paired records")
     if mismatches:
         print(f"WARNING: {mismatches} comparisons excluded for mask mismatch")
+
+    if args.counts_only:
+        table = counts_table(records, config)
+        print(format_counts(table, config))
+        counts_path = Path(out_dir) / "tables" / "support_counts.parquet"
+        if not counts_path.exists():
+            write_table(counts_path, table)
+            print(f"{chr(10)}counts -> {counts_path}")
+        return
 
     agreement = path_agreement(rows, config)
     print(

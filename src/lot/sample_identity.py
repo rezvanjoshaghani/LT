@@ -67,6 +67,11 @@ def sample_ids(
     """
     if uv_target.dim() != 2 or uv_target.shape[-1] != 2:
         raise ValueError(f"uv_target must be [N, 2], got {tuple(uv_target.shape)}")
+    if uv_target.shape[0] == 0:
+        # A pair can have no eligible correspondence at all, when nothing is
+        # co-visible or every candidate fails a filter. That is a result to
+        # record, not an error, and the caller drops the pair and counts it.
+        return np.zeros(0, dtype=np.uint64)
     quantized = torch.round(uv_target.detach().to(torch.float64) * COORD_QUANTUM)
     if not torch.equal(quantized, uv_target.detach().to(torch.float64) * COORD_QUANTUM):
         raise ValueError(

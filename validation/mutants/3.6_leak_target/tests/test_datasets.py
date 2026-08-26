@@ -8,6 +8,7 @@ import torch
 from lot.analysis_config import load_analysis_config
 from lot.datasets import (
     ROW_FIELDS,
+    PairRecord,
     ZERO_BIN,
     assert_translation_parallax_floor,
     bin_label,
@@ -313,3 +314,89 @@ def test_summary_counts_add_up():
     assert sum(summary["by_regime"].values()) == len(pairs)
     assert sum(summary["by_stratum_parallax_bin"].values()) == len(pairs)
     assert sum(summary["by_rotation_bin"].values()) == len(pairs)
+
+
+def test_every_config_value_is_either_read_or_declared_reserved():
+    """A normative constant nothing reads describes the code rather than governing it.
+
+    Two keys had gone dead unnoticed: epsilon_margin was read nowhere, and
+    bin_right_closed was named in a docstring while the comparison beside it was
+    a literal. Both changed the config digest, so editing either invalidated an
+    existing run and altered no behaviour. This walks the source rather than
+    trusting review to notice the next one.
+    """
+    import dataclasses
+    from pathlib import Path
+
+    from lot.analysis_config import AnalysisConfig
+
+    source_root = Path(__file__).resolve().parents[1] / "src" / "lot"
+    body = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(source_root.glob("*.py"))
+    )
+    # analysis_config.py counts: a field read through an accessor it defines,
+    # such as parallax_edges(), is read. as_dict and the digests use getattr, so
+    # they cannot make an unread field look read.
+    body += (source_root / "analysis_config.py").read_text(encoding="utf-8").split(
+        "RESERVED_FOR_LATER_PHASES"
+    )[0]
+    _ = (
+    )
+    reserved = set(AnalysisConfig.RESERVED_FOR_LATER_PHASES)
+    unread = [
+        field.name
+        for field in dataclasses.fields(AnalysisConfig)
+        if field.name not in reserved and f".{field.name}" not in body
+    ]
+    assert not unread, (
+        f"config values nothing outside analysis_config.py reads: {unread}. "
+        "Either wire them up or list them in RESERVED_FOR_LATER_PHASES with a reason."
+    )
+    # And the reserved list may not name something that is in fact read, which
+    # would let a live constant hide behind the exemption.
+    live = [name for name in reserved if f".{name}" in body]
+    assert not live, f"reserved but actually read: {live}"
+
+
+def test_the_sampling_design_is_not_moved_by_a_reporting_edit():
+    """PROTOCOL 3.4 lets the reporting edges be widened once, from counts.
+
+    That happens after the pairs are drawn, so it cannot be allowed to redefine
+    which pairs a later scene would contribute. The strata read their own frozen
+    edges, and only those are part of the measurement identity.
+    """
+    import dataclasses
+
+    pairs = [
+        PairRecord(
+            scene="room_0", split="train", viewpoint=0, regime="orbit",
+            context_frame_id=f"c{i}", target_frame_id=f"t{i}",
+            baseline_m=0.2, context_median_depth_m=2.0,
+            rotation_deg=angle, stratum_parallax=0.08,
+        )
+        for i, angle in enumerate((5.0, 15.0, 25.0, 35.0))
+    ]
+    widened = dataclasses.replace(ANALYSIS, rotation_bin_edges_deg=(50.0,))
+    assert [stratum_of(p, ANALYSIS) for p in pairs] == [stratum_of(p, widened) for p in pairs]
+    assert widened.measurement_digest() == ANALYSIS.measurement_digest()
+
+    # Editing the sampling design does move the strata, and is gated.
+    resampled = dataclasses.replace(ANALYSIS, stratum_rotation_edges_deg=(50.0,))
+    assert [stratum_of(p, ANALYSIS) for p in pairs] != [stratum_of(p, resampled) for p in pairs]
+    assert resampled.measurement_digest() != ANALYSIS.measurement_digest()
+
+
+def test_bin_right_closed_decides_which_side_an_edge_belongs_to():
+    """The flag was named in a docstring while the comparison was a literal."""
+    import dataclasses
+
+    right_open = dataclasses.replace(ANALYSIS, bin_right_closed=False)
+    assert rotation_bin(10.0, ANALYSIS) == "0-10"
+    assert rotation_bin(10.0, right_open) == "10-20"
+    assert parallax_bin(0.05, ANALYSIS) == "0.025-0.05"
+    assert parallax_bin(0.05, right_open) == "0.05-0.1"
+    # A value strictly inside a bin is unaffected either way.
+    assert rotation_bin(15.0, ANALYSIS) == rotation_bin(15.0, right_open) == "10-20"
+    # And the overflow bin still catches everything above the last edge.
+    assert rotation_bin(500.0, ANALYSIS) == rotation_bin(500.0, right_open) == "50+"

@@ -736,3 +736,80 @@ def test_a_report_is_bound_to_the_config_that_measured_it_but_not_to_how_it_repo
     assert measurement.reporting_digest() == ANALYSIS.reporting_digest()
     with pytest.raises(ValueError, match="measurement config"):
         read_eval_dir(eval_dir, measurement)
+
+
+def test_the_interval_says_how_many_replicates_produced_it():
+    """A quantile over three draws and one over a thousand print identically.
+
+    A cell whose statistic is undefined in a replicate contributes nothing to
+    that draw, and there is no honest way to make it; the quantiles are then
+    over the draws in which the cell existed. That is tolerable and has to be
+    visible.
+    """
+    import dataclasses
+
+    from lot.figures import bootstrap_cells
+
+    config = dataclasses.replace(ANALYSIS, bootstrap_resamples=200)
+    records = [{"scene": "lonely", "camera_pair": ("a", "b"), "bin": "X",
+                "margin": 0.42, "n": 10}]
+    for i in range(17):
+        records.append({"scene": f"s{i}", "camera_pair": (f"c{i}", f"t{i}"),
+                        "bin": "Y", "margin": 0.1 + 0.01 * i, "n": 10})
+
+    intervals = bootstrap_cells(records, ("bin",), mean_margin, config, unit="scene")
+    low_x, high_x, draws_x = intervals[("X",)]
+    _, _, draws_y = intervals[("Y",)]
+    # The lonely cell's interval has zero width because every replicate that
+    # contains its one scene gives the same estimate. The replicate count is
+    # what tells the reader the interval is not what it looks like.
+    assert low_x == high_x == pytest.approx(0.42)
+    assert 0 < draws_x < config.bootstrap_resamples
+    assert draws_y == config.bootstrap_resamples
+
+
+def test_the_table_carries_the_replicate_counts():
+    table = summary_table(full_records(), ANALYSIS)
+    per_regime = [r for r in table if r["analysis"] != "orbit_minus_translation"]
+    assert per_regime
+    for row in per_regime:
+        assert row["bootstrap_resamples"] == ANALYSIS.bootstrap_resamples
+        assert 0 <= row["margin_ci_replicates"] <= row["bootstrap_resamples"]
+        assert 0 <= row["margin_pair_ci_replicates"] <= row["bootstrap_resamples"]
+
+
+def test_counts_cover_both_paths():
+    """Thresholds set from this view govern splat cells too.
+
+    A pair can be scorable on one path and not the other, so per-bin counts
+    differ by path. Showing only the per-point counts let a threshold be chosen
+    against numbers that did not describe half the cells it would gate.
+    """
+    from lot.figures import counts_table, format_counts
+
+    rows = []
+    for path, pairs in ((PER_POINT, 40), (SPLAT_POOL, 12)):
+        for scene_index in range(4):
+            for pair_index in range(pairs):
+                rows += comparison(
+                    {},
+                    scene=f"scene_{scene_index}",
+                    context_frame_id=f"{path}_c{pair_index}",
+                    target_frame_id=f"{path}_t{pair_index}",
+                    path=path,
+                )
+    records = []
+    for metric in (RAW, CENTERED):
+        part, _ = paired_records(assign_bins(rows, ANALYSIS), metric=metric)
+        records.extend(part)
+
+    table = counts_table(records, ANALYSIS)
+    assert table
+    assert {row["path"] for row in table} == {PER_POINT, SPLAT_POOL}
+    by_path = {row["path"]: row["n_camera_pairs"] for row in table}
+    # The two paths carry different support, which is the whole reason both
+    # have to be shown: a threshold read off the per-point column alone would
+    # have been chosen against numbers that did not describe the splat cells.
+    assert by_path[PER_POINT] == 40 and by_path[SPLAT_POOL] == 12
+    printed = format_counts(table, ANALYSIS)
+    assert "path" in printed and SPLAT_POOL in printed

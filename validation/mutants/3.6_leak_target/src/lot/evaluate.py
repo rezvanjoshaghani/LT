@@ -515,7 +515,15 @@ def pair_geometry(
         per_point_cells=per_point_cells,
         splat_mask=splat_mask,
         neighbor_option_ok=neighbor_option_ok,
-        random_patch=derived_draw(ids, RANDOM_PATCH_SALT, size),
+        # Modulo the context grid, which is the grid this index reads from.
+        # The target grid was used here and the context grid on the per-point
+        # path; the two agree only because every frame in this study is one
+        # resolution. A larger target grid would index the context map out of
+        # bounds, and a smaller one would give the same record two different
+        # nulls on the two paths.
+        random_patch=derived_draw(
+            ids, RANDOM_PATCH_SALT, context_grid[0] * context_grid[1]
+        ),
         coverage_mean=float(coverage.mean()) if coverage.numel() else float("nan"),
     )
 
@@ -965,6 +973,13 @@ def evaluate_scene(
                 f"{scene} {pair.context_frame_id} -> {pair.target_frame_id}",
             )
             universe_size = geometry.size
+            # The two paths must not select records by different rules. Defined
+            # since the second review and, until now, called only by its tests,
+            # which is the same fault one level up: a check that exists and is
+            # correct but is not wired to the thing it protects.
+            assert_source_read_sets_agree(
+                geometry, f"{scene} {pair.context_frame_id} -> {pair.target_frame_id}"
+            )
             if not geometry.scorable:
                 # PROTOCOL 3.2 permits exactly one nonfinite representation, the
                 # centered columns of Mean-Feature. A pair with no scored
@@ -1022,6 +1037,13 @@ def evaluate_scene(
                 # their own encoder.
                 "weights_revision": load_cache_meta(cfg.cache_root, encoder, scene).get(
                     "weights_revision", "unpinned"
+                ),
+                # For DINOv2 this is the real pin: the hub ref fixes the loader
+                # that chooses the checkpoint URL, while the URL itself is
+                # unversioned. For VGGT it is the inference implementation,
+                # which decides what the features are given the same weights.
+                "code_revision": load_cache_meta(cfg.cache_root, encoder, scene).get(
+                    "code_revision", "unknown"
                 ),
             }
             for encoder in cfg.encoders

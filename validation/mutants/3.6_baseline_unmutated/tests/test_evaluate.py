@@ -599,3 +599,48 @@ def test_both_paths_choose_the_same_neighbour_direction_under_translation():
     splat_rule = splat_neighbor_option_ok(geometry.plan, (SMALL_GRID, SMALL_GRID))[cells]
     assert not np.array_equal(point_rule, splat_rule)
     assert np.array_equal(samples.neighbor_option_ok, point_rule & splat_rule)
+
+
+def test_the_pair_loop_checks_that_both_paths_select_records_alike():
+    """The assertion existed and only its tests called it.
+
+    A check that is correct and unwired protects nothing, which is the same
+    fault as a gate that reports a stop condition and continues. This pins the
+    call site rather than the function, because the function was never the part
+    that was missing.
+    """
+    import inspect
+
+    from lot import evaluate
+
+    body = inspect.getsource(evaluate.evaluate_scene)
+    assert "assert_source_read_sets_agree(" in body, (
+        "evaluate_scene must run the cross-path read-set check on every pair"
+    )
+
+
+def test_random_patch_draws_from_the_grid_it_reads(monkeypatch):
+    """Both paths index the context map, so both must draw modulo its size.
+
+    The splat path used the target grid. The two agree only because every frame
+    in this study is one resolution; a larger target grid would index the
+    context map out of bounds, and a smaller one would give one record two
+    different nulls on the two paths.
+    """
+    import inspect
+
+    from lot import correspondence, evaluate
+
+    per_point = inspect.getsource(correspondence.sample_correspondences)
+    assert "ctx_patches_h * ctx_patches_w" in per_point
+
+    geometry, features = identity_pair()
+    context_cells = features.shape[1] * features.shape[2]
+    assert geometry.random_patch.min() >= 0
+    assert geometry.random_patch.max() < context_cells
+
+    # And the two paths agree record for record on which patch they read.
+    rows = geometry.samples.random_patch_index[:, 0].cpu().numpy()
+    cols = geometry.samples.random_patch_index[:, 1].cpu().numpy()
+    per_point_flat = rows * features.shape[2] + cols
+    assert np.array_equal(per_point_flat, geometry.random_patch[geometry.per_point_cells])

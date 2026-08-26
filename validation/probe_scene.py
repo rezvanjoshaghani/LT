@@ -158,6 +158,7 @@ def build_scene(root: Path, feature_mode: str = "smooth"):
         "has_depth": False,
         "weights_fingerprint": "validation-probe",
         "weights_revision": "validation-probe",
+        "code_revision": "validation-probe",
         "features_digest": features_digest(features),
         "depth_digest": None,
     }, indent=1), encoding="utf-8")

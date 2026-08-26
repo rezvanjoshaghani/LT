@@ -362,13 +362,17 @@ class DinoV2Encoder(FrozenEncoder):
     HUB_REPO = "facebookresearch/dinov2"
 
     def _load(self) -> Any:
-        # LOT_DINOV2_REVISION pins the Torch Hub ref. A fingerprint tells you the
-        # weights changed; only a pinned ref lets you get the old ones back, and
-        # a rebuild after an upstream update would otherwise leave every scene
-        # agreeing on a checkpoint that is not the preregistered one.
+        # LOT_DINOV2_REVISION pins the Torch Hub ref, which is a code revision.
+        # It fixes the hubconf that chooses the checkpoint URL; it does not fix
+        # the bytes served at that URL, because dl.fbaipublicfiles.com serves an
+        # unversioned file. So the ref is recorded as code_revision, and
+        # weights_revision says plainly that there is nothing to pin. Recording
+        # the ref under weights_revision, which an earlier version did, told a
+        # reader the checkpoint was retrievable when only the loader was.
         revision = os.environ.get("LOT_DINOV2_REVISION")
         repo = f"{self.HUB_REPO}:{revision}" if revision else self.HUB_REPO
-        self.revision = revision or "unpinned"
+        self.code_revision = revision or "unpinned"
+        self.revision = "unpinnable: torch.hub checkpoint URL is unversioned"
         return torch.hub.load(repo, self.spec.source, trust_repo=True)
 
     def _forward(self, images_uint8: np.ndarray) -> EncodedBatch:
@@ -741,7 +745,9 @@ def validate_feature_cache(
     meta = load_cache_meta(cache_root, encoder_name, manifest.scene)
     if meta["encoder"] != encoder_name or meta["scene"] != manifest.scene:
         raise ValueError(f"cache is for {meta['encoder']} / {meta['scene']}")
-    for field in ("weights_fingerprint", "features_digest", "weights_revision"):
+    for field in (
+        "weights_fingerprint", "features_digest", "weights_revision", "code_revision"
+    ):
         if not meta.get(field):
             raise ValueError(
                 f"{encoder_name} / {manifest.scene}: cache metadata carries no "

@@ -30,6 +30,8 @@ class AnalysisConfig:
 
     rotation_bin_edges_deg: tuple[float, ...]
     parallax_bin_edges: tuple[float, ...]
+    stratum_parallax_edges: tuple[float, ...]
+    stratum_rotation_edges_deg: tuple[float, ...]
     bin_right_closed: bool
     zero_parallax_tol: float
     min_expected_median_depth_m: float
@@ -80,8 +82,32 @@ class AnalysisConfig:
     # the support thresholds set from realized counts after the run, which is a
     # reporting edit by construction. Collapsing the two would either forbid the
     # documented workflow or bind nothing.
+    # Values PROTOCOL names that no phase implemented so far consumes. The
+    # config file already says as much in a comment; this is the same statement
+    # in a form a test can check, because a comment cannot notice when the set
+    # changes. A field outside this tuple that nothing reads fails that test,
+    # and a field inside it that something does read fails it too, so the
+    # exemption cannot be used to park a live constant.
+    #
+    # Until Phase 4 consumes them, editing any of these changes the config
+    # digest, which invalidates an existing run, and changes no behaviour.
+    RESERVED_FOR_LATER_PHASES = (
+        "epsilon_margin",
+        "depth_boundary_dilation_px",
+        "depth_boundary_gradient_threshold",
+        "texture_gradient_threshold",
+        "depth_convention_slope_threshold",
+    )
+
     MEASUREMENT_FIELDS = (
         "assert_translation_parallax_floor",
+        # The sampling design. These decide which pairs were drawn, so a run is
+        # not comparable across a change to them. The reporting bin edges are
+        # deliberately not here: PROTOCOL 3.4 permits those to be widened once
+        # from counts after the run, and widening a label cannot retroactively
+        # change a sample.
+        "stratum_parallax_edges",
+        "stratum_rotation_edges_deg",
         "covisible_relative_depth_tol",
         "min_covisible_fraction",
         "points_per_pair",
@@ -181,6 +207,14 @@ class AnalysisConfig:
         """Parallax bin edges with the mandatory open-ended overflow appended."""
         return tuple(self.parallax_bin_edges) + (float("inf"),)
 
+    def stratum_parallax_edges_full(self) -> tuple[float, ...]:
+        """Sampling-design parallax edges, overflow appended."""
+        return tuple(self.stratum_parallax_edges) + (float("inf"),)
+
+    def stratum_rotation_edges_full(self) -> tuple[float, ...]:
+        """Sampling-design rotation edges, overflow appended."""
+        return tuple(self.stratum_rotation_edges_deg) + (float("inf"),)
+
 
 def load_analysis_config(path: Path | None = None) -> AnalysisConfig:
     """Load the normative config. Unknown or missing keys are an error."""
@@ -209,6 +243,11 @@ def load_analysis_config(path: Path | None = None) -> AnalysisConfig:
                 f"{raw['points_per_pair']!r}"
             )
         raw["points_per_pair"] = None
-    raw["rotation_bin_edges_deg"] = tuple(float(v) for v in raw["rotation_bin_edges_deg"])
-    raw["parallax_bin_edges"] = tuple(float(v) for v in raw["parallax_bin_edges"])
+    for key in (
+        "rotation_bin_edges_deg",
+        "parallax_bin_edges",
+        "stratum_parallax_edges",
+        "stratum_rotation_edges_deg",
+    ):
+        raw[key] = tuple(float(v) for v in raw[key])
     return AnalysisConfig(**raw)

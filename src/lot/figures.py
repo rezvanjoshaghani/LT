@@ -197,15 +197,17 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
             encoder
             for meta in sidecars.values()
             for encoder, entry in (meta.get("cache_provenance") or {}).items()
-            if entry.get("weights_revision", "unpinned") == "unpinned"
+            if "unpinn" in str(entry.get("weights_revision", "unpinned"))
+            or entry.get("code_revision", "unpinned") in ("unpinned", "unknown")
         }
     )
     if unpinned:
         print(
-            f"warning: {', '.join(unpinned)} were cached from an unpinned "
-            "checkpoint. The fingerprint would notice a change, but the "
-            "checkpoint these results used is not retrievable. See "
-            "scripts/pin_encoder_revisions.py"
+            f"warning: {', '.join(unpinned)} were cached without a full pin. "
+            "The fingerprint would notice a change, but what these results used "
+            "is not fully retrievable. DINOv2's checkpoint URL is unversioned "
+            "and cannot be pinned at all; its hub ref and VGGT's revisions can. "
+            "See scripts/pin_encoder_revisions.py"
         )
 
     # The config that reads a run must be the config that produced it, in every
@@ -530,9 +532,21 @@ def bootstrap_cells(
         for key, value in cell_estimates(sample, keys, statistic).items():
             if math.isfinite(value):
                 collected.setdefault(key, []).append(value)
+    # The replicate count travels with the interval. A cell whose statistic is
+    # undefined in a replicate contributes nothing to that draw, and there is no
+    # honest way to make it: the quantiles are then over the draws in which the
+    # cell existed, which is a different and narrower distribution. That is
+    # tolerable and has to be visible, because a quantile over three values and
+    # a quantile over a thousand print identically. A cell backed by one scene
+    # is the extreme case: every replicate that contains it gives exactly the
+    # same estimate, so the interval has width zero and reads as certainty.
     tail = (1.0 - config.bootstrap_confidence) / 2.0
     return {
-        key: (float(np.quantile(values, tail)), float(np.quantile(values, 1.0 - tail)))
+        key: (
+            float(np.quantile(values, tail)),
+            float(np.quantile(values, 1.0 - tail)),
+            len(values),
+        )
         for key, values in collected.items()
         if values
     }
@@ -548,19 +562,22 @@ def summaries_for(
     grouped = group_by(records, keys)
     scene_ci = bootstrap_cells(records, keys, statistic, config, unit="scene")
     pair_ci = bootstrap_cells(records, keys, statistic, config, unit="camera_pair")
-    nan = (float("nan"), float("nan"))
+    nan = (float("nan"), float("nan"), 0)
     out: dict[tuple, dict[str, Any]] = {}
     for key, cell in grouped.items():
         counts = support_counts(cell)
-        low, high = scene_ci.get(key, nan)
-        pair_low, pair_high = pair_ci.get(key, nan)
+        low, high, scene_draws = scene_ci.get(key, nan)
+        pair_low, pair_high, pair_draws = pair_ci.get(key, nan)
         out[key] = {
             **counts,
             "estimate": statistic(cell),
             "ci_low": low,
             "ci_high": high,
+            "ci_replicates": scene_draws,
             "pair_ci_low": pair_low,
             "pair_ci_high": pair_high,
+            "pair_ci_replicates": pair_draws,
+            "bootstrap_resamples": config.bootstrap_resamples,
             "supported": is_supported(counts, config),
         }
     return out
@@ -586,7 +603,19 @@ def bootstrap_interval(
     everywhere beats two that must be kept in step.
     """
     intervals = bootstrap_cells(records, (), statistic, config, unit=unit)
-    return intervals.get((), (float("nan"), float("nan")))
+    low, high, _ = intervals.get((), (float("nan"), float("nan"), 0))
+    return low, high
+
+
+def bootstrap_interval_with_count(
+    records: Sequence[dict[str, Any]],
+    statistic: Callable[[Sequence[dict[str, Any]]], float],
+    config: AnalysisConfig,
+    unit: str = "scene",
+) -> tuple[float, float, int]:
+    """The interval and how many replicates produced a value for it."""
+    intervals = bootstrap_cells(records, (), statistic, config, unit=unit)
+    return intervals.get((), (float("nan"), float("nan"), 0))
 
 
 def cell_summary(
@@ -596,15 +625,20 @@ def cell_summary(
 ) -> dict[str, Any]:
     """Point estimate, both intervals, and the three support counts for one cell."""
     counts = support_counts(records)
-    low, high = bootstrap_interval(records, statistic, config, unit="scene")
-    pair_low, pair_high = bootstrap_interval(records, statistic, config, unit="camera_pair")
+    low, high, draws = bootstrap_interval_with_count(records, statistic, config, unit="scene")
+    pair_low, pair_high, pair_draws = bootstrap_interval_with_count(
+        records, statistic, config, unit="camera_pair"
+    )
     return {
         **counts,
         "estimate": statistic(records),
         "ci_low": low,
         "ci_high": high,
+        "ci_replicates": draws,
         "pair_ci_low": pair_low,
         "pair_ci_high": pair_high,
+        "pair_ci_replicates": pair_draws,
+        "bootstrap_resamples": config.bootstrap_resamples,
         "supported": is_supported(counts, config),
     }
 
@@ -1157,11 +1191,18 @@ def summary_table(
                     "value_ci_high": summary["ci_high"],
                     "value_pair_ci_low": summary["pair_ci_low"],
                     "value_pair_ci_high": summary["pair_ci_high"],
+                    "value_ci_replicates": summary["ci_replicates"],
                     "margin": margin["estimate"],
                     "margin_ci_low": margin["ci_low"],
                     "margin_ci_high": margin["ci_high"],
                     "margin_pair_ci_low": margin["pair_ci_low"],
                     "margin_pair_ci_high": margin["pair_ci_high"],
+                    # How many of the bootstrap_resamples draws produced a value
+                    # for this cell. A quantile over three replicates and one
+                    # over a thousand print identically without it.
+                    "margin_ci_replicates": margin["ci_replicates"],
+                    "margin_pair_ci_replicates": margin["pair_ci_replicates"],
+                    "bootstrap_resamples": margin["bootstrap_resamples"],
                     # Diagnostics, not headline numbers. See comparison_weighted.
                     "value_comparison_weighted": comparison_weighted(cell, "value"),
                     "margin_comparison_weighted": comparison_weighted(cell, "margin"),
@@ -1232,10 +1273,9 @@ def counts_table(
             if r["regime"] == regime
             and r["variant"] == ORACLE_TRANSPORT
             and r["metric"] == RAW
-            and r["path"] == PER_POINT
         ]
-        for key, cell in group_by(scoped, ("encoder", axis)).items():
-            encoder, label = key
+        for key, cell in group_by(scoped, ("encoder", "path", axis)).items():
+            encoder, path, label = key
             counts = support_counts(cell)
             out.append(
                 {
@@ -1244,6 +1284,7 @@ def counts_table(
                     "bin": label,
                     "bin_index": bin_order(edges).index(label),
                     "encoder": encoder,
+                    "path": path,
                     **counts,
                     "supported_at_current_threshold": is_supported(counts, config),
                 }
@@ -1254,10 +1295,11 @@ def counts_table(
         if r["regime"] == JOINT_REGIME
         and r["variant"] == ORACLE_TRANSPORT
         and r["metric"] == RAW
-        and r["path"] == PER_POINT
     ]
-    for key, cell in group_by(joint, ("encoder", "rotation_bin", "parallax_bin")).items():
-        encoder, rotation_label, parallax_label = key
+    for key, cell in group_by(
+        joint, ("encoder", "path", "rotation_bin", "parallax_bin")
+    ).items():
+        encoder, path, rotation_label, parallax_label = key
         counts = support_counts(cell)
         out.append(
             {
@@ -1266,11 +1308,14 @@ def counts_table(
                 "bin": f"{rotation_label} x {parallax_label}",
                 "bin_index": bin_order(config.rotation_edges()).index(rotation_label),
                 "encoder": encoder,
+                "path": path,
                 **counts,
                 "supported_at_current_threshold": is_supported(counts, config),
             }
         )
-    out.sort(key=lambda r: (r["analysis"], r["encoder"], r["bin_index"], r["bin"]))
+    out.sort(
+        key=lambda r: (r["analysis"], r["encoder"], r["path"], r["bin_index"], r["bin"])
+    )
     return out
 
 
@@ -1278,16 +1323,19 @@ def format_counts(table: Sequence[dict[str, Any]], config: AnalysisConfig) -> st
     lines = [
         "Support counts only. PROTOCOL 3.4 permits thresholds to be set from "
         "these and never from outcome values.",
+        "Both paths are listed. A pair can be scorable on one path and not the "
+        "other, so per-bin counts differ by path, and a threshold chosen from "
+        "the per-point counts alone can leave splat cells unsupported unseen.",
         f"current thresholds: scenes >= {config.support_min_scenes}, "
         f"camera pairs >= {config.support_min_camera_pairs}",
         "",
-        f"{'analysis':<12} {'encoder':<18} {'bin':<22} {'scenes':>7} {'pairs':>7} "
-        f"{'comparisons':>12}  supported",
+        f"{'analysis':<12} {'encoder':<18} {'path':<11} {'bin':<22} {'scenes':>7} "
+        f"{'pairs':>7} {'comparisons':>12}  supported",
     ]
     for row in table:
         lines.append(
-            f"{row['analysis']:<12} {row['encoder']:<18} {row['bin']:<22} "
-            f"{row['n_scenes']:>7} {row['n_camera_pairs']:>7} "
+            f"{row['analysis']:<12} {row['encoder']:<18} {row['path']:<11} "
+            f"{row['bin']:<22} {row['n_scenes']:>7} {row['n_camera_pairs']:>7} "
             f"{row['n_feature_comparisons']:>12}  {row['supported_at_current_threshold']}"
         )
     return chr(10).join(lines)

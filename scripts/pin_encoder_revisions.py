@@ -130,7 +130,12 @@ def main() -> int:
     vggt_code, vggt_code_how = vggt_code_ref()
 
     for label, sha, how in (
-        ("DINOv2  (torch.hub facebookresearch/dinov2)", dinov2, dinov2_how),
+        ("DINOv2 code   (torch.hub facebookresearch/dinov2)", dinov2, dinov2_how),
+        (
+            "DINOv2 weights(dl.fbaipublicfiles.com)",
+            "not pinnable",
+            "the checkpoint URL is unversioned; the fingerprint is the only guard",
+        ),
         (f"VGGT weights  (hugging face {VGGT_REPO})", vggt, vggt_how),
         ("VGGT code     (github facebookresearch/vggt)", vggt_code, vggt_code_how),
     ):

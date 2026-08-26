@@ -546,3 +546,29 @@ def test_an_extra_feature_array_is_refused_because_the_mean_would_average_it(tmp
     assert not torch.allclose(dataset_mean_vector(cache_root, "stub", [manifest.scene]), honest)
     with pytest.raises(ValueError, match="the manifest does not name"):
         validate_feature_cache(cache_root, "stub", manifest)
+
+
+def test_a_spec_with_no_declared_width_is_not_coerced(tmp_path):
+    """VGGT's width is unknown before the model runs, so its spec declares None.
+
+    Comparing the cache's channel count against it must skip rather than coerce:
+    int(None) raises, and it would have raised on the real VGGT cache the first
+    time evaluation opened one.
+    """
+    from lot.encoders import ENCODERS
+
+    assert ENCODERS["vggt_1b"].channels is None
+    root, manifest = fake_scene_dir(tmp_path)
+    cache_root = tmp_path / "cache"
+    cache_scene_features(manifest, root, StubEncoder(stub_spec(), "cpu"), cache_root)
+    directory = cache_dir(cache_root, "stub", manifest.scene)
+
+    # Move the cache under the vggt_1b name, which has no declared width.
+    target = cache_dir(cache_root, "vggt_1b", manifest.scene)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    directory.rename(target)
+    meta = json.loads((target / "meta.json").read_text(encoding="utf-8"))
+    meta["encoder"] = "vggt_1b"
+    (target / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    validate_feature_cache(cache_root, "vggt_1b", manifest, check_digest=True)

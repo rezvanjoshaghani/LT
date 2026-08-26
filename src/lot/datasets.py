@@ -68,13 +68,23 @@ ROW_FIELDS = (
 )
 
 
-def bin_label(value: float, edges: Sequence[float], zero_tol: float, name: str) -> str:
+def bin_label(
+    value: float,
+    edges: Sequence[float],
+    zero_tol: float,
+    name: str,
+    right_closed: bool = True,
+) -> str:
     """Label the bin a non-negative value falls in.
 
-    Intervals are closed on the right, so a value equal to an edge belongs to
-    the lower bin, per the analysis config's bin_right_closed. Exact zero gets
-    its own label: no baseline at all, or no rotation at all, is a different
-    physical situation from a small one.
+    right_closed, from the analysis config's bin_right_closed, decides which
+    side an edge belongs to: closed on the right puts a value equal to an edge
+    in the lower bin, open on the right puts it in the upper one. The comparison
+    was written as a literal, so the config key described the code rather than
+    governing it and setting it to false changed nothing.
+
+    Exact zero gets its own label either way: no baseline at all, or no rotation
+    at all, is a different physical situation from a small one.
     """
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be finite and non-negative, got {value}")
@@ -82,7 +92,8 @@ def bin_label(value: float, edges: Sequence[float], zero_tol: float, name: str) 
         return ZERO_BIN
     lower = 0.0
     for edge in edges:
-        if value <= edge:
+        below = value <= edge if right_closed else value < edge
+        if below or not math.isfinite(edge):
             return f"{lower:g}-{edge:g}" if math.isfinite(edge) else f"{lower:g}+"
         lower = edge
     raise AssertionError("the last bin edge must be infinite")
@@ -100,7 +111,13 @@ def bin_order(edges: Sequence[float]) -> list[str]:
 
 def parallax_bin(value: float, config: AnalysisConfig) -> str:
     """Label the parallax bin a value falls in, using the committed edges."""
-    return bin_label(value, config.parallax_edges(), config.zero_parallax_tol, "parallax")
+    return bin_label(
+        value,
+        config.parallax_edges(),
+        config.zero_parallax_tol,
+        "parallax",
+        config.bin_right_closed,
+    )
 
 
 def parallax_bin_order(config: AnalysisConfig) -> list[str]:
@@ -109,7 +126,13 @@ def parallax_bin_order(config: AnalysisConfig) -> list[str]:
 
 def rotation_bin(degrees: float, config: AnalysisConfig) -> str:
     """Label the rotation bin an angle falls in, using the committed edges."""
-    return bin_label(degrees, config.rotation_edges(), config.zero_rotation_tol_deg, "rotation")
+    return bin_label(
+        degrees,
+        config.rotation_edges(),
+        config.zero_rotation_tol_deg,
+        "rotation",
+        config.bin_right_closed,
+    )
 
 
 def rotation_bin_order(config: AnalysisConfig) -> list[str]:
@@ -239,12 +262,31 @@ def stratum_of(pair: PairRecord, config: AnalysisConfig) -> tuple[str, str, str,
     would pool pairs that differ on the other: rotation pairs all share a
     parallax of zero, and translation pairs all share a rotation of zero, so
     either axis by itself collapses a whole regime into one cell.
+
+    The edges are the sampling-design ones, not the reporting bins, even though
+    the two currently hold the same numbers. PROTOCOL 3.4 permits the reporting
+    edges to be widened once from realized counts, which happens after the pairs
+    are drawn; using them here made that permitted edit silently redefine which
+    pairs a later scene would contribute, and nothing compared the two, because
+    the reporting edges are not part of the measurement identity.
     """
     return (
         pair.scene,
         pair.regime,
-        parallax_bin(pair.stratum_parallax, config),
-        rotation_bin(pair.rotation_deg, config),
+        bin_label(
+            pair.stratum_parallax,
+            config.stratum_parallax_edges_full(),
+            config.zero_parallax_tol,
+            "stratum parallax",
+            config.bin_right_closed,
+        ),
+        bin_label(
+            pair.rotation_deg,
+            config.stratum_rotation_edges_full(),
+            config.zero_rotation_tol_deg,
+            "stratum rotation",
+            config.bin_right_closed,
+        ),
     )
 
 

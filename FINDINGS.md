@@ -148,6 +148,25 @@ at the top of the parallax range will be genuinely hard.
   poses load as float64. Measured cost is 40 percent on CPU and far more on a
   consumer GPU.
 
+## Methods notes, corrected Phase 3 (Stream D)
+
+The 0.003 path-agreement tolerance was calibrated from the pilot run's
+aggregate discrepancy between direct per-point evaluation and splat-and-pool
+evaluation, and retained prospectively because it is less than 4 percent of
+the smallest effect interpreted in the study, the 0.072 one-patch localization
+cost. The tolerance gates the statistic it was calibrated on, the signed
+aggregate over pairs; per-pair dispersion between the two paths is reported
+beside it and judged by the path-agreement ledger
+(validation/evidence/path_agreement_ledger/), whose reconstruction and closure
+tolerances are frozen in configs/analysis.yaml. The materiality ratio is
+recomputed against the corrected margins when they exist and flagged for
+amendment if it exceeds roughly 10 percent.
+
+The ledger's attribution paragraph, naming the measured terms and any
+mechanism the preregistered contrasts support, is added here from the ledger's
+report once it passes on the corrected run. Nothing in this section is a
+result; the results section below remains withdrawn until Stream D reports.
+
 ## Phase 3: Experiment Zero, verdict (WITHDRAWN 2026-08-24)
 
 > **These numbers are withdrawn and are not a result.** An independent audit

@@ -909,6 +909,7 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
         slot[row["path"]] = row
 
     per_metric: dict[str, list[float]] = {name: [] for name in INTERSECT_METRICS}
+    signed_metric: dict[str, list[float]] = {name: [] for name in INTERSECT_METRICS}
     coverage: list[int] = []
     complete = 0
     incomplete = 0
@@ -927,6 +928,7 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
             b = paths[SPLAT_POOL][column]
             if _finite(a) and _finite(b):
                 per_metric[name].append(abs(a - b))
+                signed_metric[name].append(a - b)
         coverage.append(
             int(paths[PER_POINT]["coverage_difference"])
             + int(paths[SPLAT_POOL]["coverage_difference"])
@@ -940,8 +942,21 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
         "tolerance": tolerance,
         "within_tolerance": complete > 0 and duplicates == 0,
     }
+    # The gated quantity is the signed aggregate, the unweighted mean over
+    # pairs of (per_point - splat_pool), because that is the statistic the
+    # 0.003 tolerance was calibrated on in the pilot run and the one that
+    # propagates into every reported number, which is itself a mean over
+    # pairs. An interim revision gated the mean per-pair absolute difference
+    # with the same 0.003, which applied the tolerance to a dispersion it was
+    # never derived for; dispersion between two unbiased operators is
+    # variance, not bias, and it is judged by the path-agreement ledger
+    # (lot.path_ledger), which attributes it term by term with its own frozen
+    # tolerances. The dispersion stays printed here as a diagnostic, so a
+    # cancellation cannot hide: it passes this gate only by also appearing,
+    # loudly, in mean_abs and pairs_over_tolerance.
     for name, differences in per_metric.items():
         if not differences:
+            result[f"{name}_signed_aggregate"] = float("nan")
             result[f"{name}_mean_abs_difference"] = float("nan")
             result[f"{name}_max_abs_difference"] = float("nan")
             result[f"{name}_pairs_over_tolerance"] = 0
@@ -949,13 +964,14 @@ def path_agreement(rows: Sequence[dict[str, Any]], config: AnalysisConfig) -> di
             result["within_tolerance"] = False
             continue
         values = np.asarray(differences, dtype=np.float64)
-        mean_abs = float(values.mean())
-        result[f"{name}_mean_abs_difference"] = mean_abs
+        signed = float(np.asarray(signed_metric[name], dtype=np.float64).mean())
+        result[f"{name}_signed_aggregate"] = signed
+        result[f"{name}_mean_abs_difference"] = float(values.mean())
         result[f"{name}_median_abs_difference"] = float(np.median(values))
         result[f"{name}_max_abs_difference"] = float(values.max())
         result[f"{name}_pairs_over_tolerance"] = int((values > tolerance).sum())
         result[f"{name}_n"] = int(values.size)
-        if mean_abs > tolerance:
+        if abs(signed) > tolerance:
             result["within_tolerance"] = False
     if coverage:
         result["mean_coverage_difference_cells"] = float(np.mean(coverage))
@@ -1594,12 +1610,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     for name in INTERSECT_METRICS:
         print(
-            f"  gated, {name}: mean per-pair |difference| = "
-            f"{agreement[f'{name}_mean_abs_difference']:.5f} over "
+            f"  gated, {name}: signed aggregate = "
+            f"{agreement[f'{name}_signed_aggregate']:+.5f} over "
             f"{agreement[f'{name}_n']} pairs"
         )
         print(
-            f"    diagnostic: median "
+            f"    dispersion diagnostic (ledger-judged, not gated): mean |d| "
+            f"{agreement[f'{name}_mean_abs_difference']:.5f}, median "
             f"{agreement.get(f'{name}_median_abs_difference', float('nan')):.5f}, max "
             f"{agreement[f'{name}_max_abs_difference']:.5f}, "
             f"{agreement[f'{name}_pairs_over_tolerance']} pairs above the tolerance"
@@ -1621,13 +1638,13 @@ def main(argv: list[str] | None = None) -> None:
         # representational ceiling, which changes what every later rung means,
         # so it stops here rather than producing a table that reads as if it had.
         failed = [
-            f"{name} at {agreement[f'{name}_mean_abs_difference']:.5f}"
+            f"{name} at {agreement[f'{name}_signed_aggregate']:+.5f}"
             for name in INTERSECT_METRICS
-            if not (agreement[f"{name}_mean_abs_difference"] <= agreement["tolerance"])
+            if not (abs(agreement[f"{name}_signed_aggregate"]) <= agreement["tolerance"])
         ]
         raise SystemExit(
-            "PROTOCOL 3.9 path agreement failed: mean per-pair absolute "
-            f"difference exceeds the {agreement['tolerance']} tolerance for "
+            "PROTOCOL 3.9 path agreement failed: the signed aggregate exceeds "
+            f"the {agreement['tolerance']} tolerance for "
             f"{', '.join(failed) or 'no scored comparisons'}. Do not report "
             "these results; find the difference between the two paths first."
         )

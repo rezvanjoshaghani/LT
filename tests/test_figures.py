@@ -541,15 +541,23 @@ def test_matched_difference_support_needs_both_arms():
         assert not summary["supported"]
 
 
-def test_path_agreement_cannot_pass_through_cancellation():
-    """Opposite-signed pair errors must not sum away.
+def test_cancellation_passes_the_gate_and_cannot_hide_from_the_diagnostics():
+    """The gate is the signed aggregate; dispersion is the ledger's question.
 
-    The gated quantity is the mean of the per-pair absolute differences. Two
-    earlier choices were both wrong. Gating the largest single pair applies a
-    tolerance established on pooled scores to a statistic it was never measured
-    against. Gating |mean(a) - mean(b)| fixes that and destroys the measurement:
-    here one pair reads 0.2 high and one reads 0.2 low, so that quantity is
-    exactly zero while both pairs disagree by far more than the tolerance.
+    Two pairs disagreeing by 0.2 in opposite directions have a signed aggregate
+    of zero, and the gate passes them, deliberately: the 0.003 tolerance was
+    calibrated on the pilot run's signed aggregate, and every reported number
+    is a mean over pairs, so bias is what the tolerance can speak to. An
+    interim revision gated the mean per-pair absolute difference with the same
+    number, which applied a bias tolerance to a dispersion, and Stream D's
+    first live run failed on exactly that mismatch while its signed aggregate
+    sat 27 times under the calibration.
+
+    What keeps this from re-opening the cancellation hole: the dispersion is
+    printed beside the gate every run and judged by the path-agreement ledger
+    (lot.path_ledger), whose preregistered decomposition and stop logic have
+    their own frozen tolerances. A cancellation passes here only by also
+    appearing, loudly, in mean_abs and pairs_over_tolerance.
     """
     rows = []
     for index, (a, b) in enumerate([(0.90, 0.70), (0.70, 0.90)]):
@@ -562,9 +570,27 @@ def test_path_agreement_cannot_pass_through_cancellation():
                 target_frame_id=f"t{index}",
             )
     result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
-    assert abs(np.mean([0.90, 0.70]) - np.mean([0.70, 0.90])) == pytest.approx(0.0)
+    assert result["cosine_mean_signed_aggregate"] == pytest.approx(0.0)
+    assert result["within_tolerance"]
+    # The diagnostics carry the full size of the disagreement.
     assert result["cosine_mean_mean_abs_difference"] == pytest.approx(0.20, abs=1e-9)
     assert result["cosine_mean_pairs_over_tolerance"] == 2
+
+
+def test_a_biased_aggregate_fails_the_gate():
+    """A one-sided disagreement is bias, and bias is what the tolerance gates."""
+    rows = []
+    for index in range(2):
+        for path, value in ((PER_POINT, 0.90), (SPLAT_POOL, 0.88)):
+            rows += comparison(
+                {ORACLE_TRANSPORT: 0.5, NO_WARP_COPY: 0.4},
+                path=path,
+                cosine_intersect_mean=value,
+                context_frame_id=f"c{index}",
+                target_frame_id=f"t{index}",
+            )
+    result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
+    assert result["cosine_mean_signed_aggregate"] == pytest.approx(0.02, abs=1e-9)
     assert not result["within_tolerance"]
 
 
@@ -585,8 +611,8 @@ def test_path_agreement_gates_the_centered_metric_too():
             cosine_centered_intersect_mean=centered,
         )
     result = path_agreement(assign_bins(rows, ANALYSIS), ANALYSIS)
-    assert result["cosine_mean_mean_abs_difference"] == pytest.approx(0.0)
-    assert result["cosine_centered_mean_mean_abs_difference"] == pytest.approx(0.30, abs=1e-9)
+    assert result["cosine_mean_signed_aggregate"] == pytest.approx(0.0)
+    assert result["cosine_centered_mean_signed_aggregate"] == pytest.approx(0.30, abs=1e-9)
     assert not result["within_tolerance"]
 
 

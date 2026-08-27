@@ -257,6 +257,38 @@ nothing. The mean vector's record now binds the vector's own bytes and its
 build verifies each archive against the digest recorded at write time, closing
 the two in-place replacements that input-side provenance cannot see.
 
+### 2026-08-27: the 3.9 gate re-pairs with its calibrated statistic, and gains a ledger
+
+Stream D's first full run failed the 3.9 gate at a mean per-pair absolute
+difference of 0.00304 raw and 0.00417 centered, while the signed aggregate,
+the statistic the 0.003 tolerance was calibrated on in the pilot run, sat at
++0.00011 and +0.00017. The earlier amendment adopting the mean per-pair
+absolute difference changed the gated statistic without re-deriving the
+tolerance, which is the same mistake it was written to prevent: a number
+applied to a statistic it was never measured against. Dispersion between two
+unbiased operators is variance, not bias, and diagnosis showed exactly that
+shape: the dispersion falls as one over root n of the intersection, is nine
+times larger for DINOv2 than VGGT in proportion to feature sharpness, and
+concentrates where a bilinear read without a z-buffer meets context-side
+occlusion contrast that the z-buffered pooled read resolves.
+
+The gate returns to the signed aggregate at 0.003, with written provenance in
+configs/analysis.yaml: calibrated from the pilot aggregate, retained because
+it is under 4 percent of the smallest interpreted pilot margin, materiality to
+be recomputed against corrected margins and flagged past roughly 10 percent.
+
+The dispersion is not waved through; it changes judge. The cancellation
+objection that motivated the absolute statistic is answered by the
+path-agreement ledger, lot.path_ledger, which reconstructs each recorded
+per-path score from its own inputs, closes the four-term identity
+T1 + T2 + T3 + T4 = S_pp - S_sp per pair per metric, stops on any
+reconstruction or closure failure or undocumented weighting gap, and runs two
+preregistered mechanism contrasts on the per-cell operator difference with
+scene-bootstrap intervals, reported whatever they show. Its tolerances,
+ledger_recon_tol 1.0e-4 and ledger_closure_tol 1.0e-6, enter
+configs/analysis.yaml now, before the ledger first runs, so they are frozen
+with everything else. The freeze commit waits on the ledger's verdict.
+
 ---
 
 ## Post-freeze

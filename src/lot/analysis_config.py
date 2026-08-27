@@ -50,6 +50,8 @@ class AnalysisConfig:
     points_per_pair: int | None  # None means exhaustive; see the config comment
     max_pairs_per_stratum: int
     path_agreement_tolerance: float
+    ledger_recon_tol: float
+    ledger_closure_tol: float
 
     rotation_position_bound_m: float
     translation_rotation_bound_deg: float

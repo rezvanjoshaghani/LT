@@ -88,6 +88,20 @@ evaluate)
     echo
     echo "Per-scene run metadata is inside each parquet and beside it as <scene>.meta.json."
     ;;
+ledger)
+    # The path-agreement ledger: preflight bit checks, exact decomposition of
+    # the recorded per-path scores, and per-cell mechanism rows, one scene at
+    # a time. Use the sbatch array on the cluster; this mode runs all scenes
+    # in one process for small setups.
+    run_lot python -m lot.path_ledger --config "$CONFIG" \
+        --out validation/evidence/path_agreement_ledger
+    ;;
+ledger-report)
+    # Stop logic and the preregistered mechanism contrasts. Exits nonzero on
+    # any stop condition; the freeze commit waits on this verdict.
+    run_lot python -m lot.path_ledger --config "$CONFIG" --report \
+        --out validation/evidence/path_agreement_ledger
+    ;;
 counts)
     run_lot python -m lot.figures --eval-dir "$EVAL_DIR" --counts-only
     ;;
@@ -95,7 +109,7 @@ figures)
     run_lot python -m lot.figures --eval-dir "$EVAL_DIR"
     ;;
 *)
-    echo "unknown mode '$MODE'; use check, evaluate, counts, or figures" >&2
+    echo "unknown mode '$MODE'; use check, evaluate, ledger, ledger-report, counts, or figures" >&2
     exit 1
     ;;
 esac

@@ -78,7 +78,24 @@ points_per_pair: all
 # Pairs sampled per stratum of (scene, regime, parallax bin, rotation bin).
 max_pairs_per_stratum: 40
 # PROTOCOL 3.9: the two paths must agree within this.
+# Calibrated from the pilot run's aggregate path agreement; retained
+# prospectively because it is ~4% or less of the smallest interpreted pilot
+# transport margin (the 0.072 one-patch localization cost). The tolerance is
+# paired with the signed aggregate it was calibrated on; per-pair dispersion is
+# a reported diagnostic, judged by the path-agreement ledger, not by this
+# number. Recompute the materiality ratio against the corrected margins and
+# flag for amendment if it exceeds ~10%.
 path_agreement_tolerance: 0.003
+
+# The path-agreement ledger's frozen numeric tolerances, added before the
+# ledger first runs so they are frozen with everything else. Reconstruction:
+# a recorded per-path intersection score must be rebuilt from its own stored
+# inputs to within this; the recomputation mirrors the recording arithmetic,
+# so only dtype accumulation noise lives here. Closure: the four ledger terms
+# telescope to the recorded difference algebraically, so this bounds nothing
+# but the ledger's own float64 summation.
+ledger_recon_tol: 1.0e-4
+ledger_closure_tol: 1.0e-6
 
 # --- PROTOCOL 3.3, manifest assertions -------------------------------------
 # In-place rotation frames must share a camera position. Manifest poses are

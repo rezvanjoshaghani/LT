@@ -95,28 +95,48 @@ def build_scene(root):
     from PIL import Image
 
     K = intrinsics_from_hfov(SIDE, SIDE, 90.0)
-    posed = program_rotation(base_pose(), [-5.0, -2.5, 0.0, 2.5, 5.0], [])
-    posed += program_translation(base_pose(), [0.05, 0.1], 3.0)
     frames, features = [], {}
-    counters: dict[str, int] = {}
     # A depth map with real structure, so co-visibility and occlusion are not trivial.
     yy, xx = np.mgrid[0:SIDE, 0:SIDE]
     depth = np.where(xx < SIDE // 2, 2.0, 4.0).astype(np.float32)
     depth = depth + 0.002 * yy
-    for i, frame in enumerate(posed):
-        index = counters.get(frame.regime, 0)
-        counters[frame.regime] = index + 1
-        fid = f"{SCENE}_vp00_{frame.regime}_{index:03d}"
-        Image.fromarray(np.zeros((SIDE, SIDE, 3), np.uint8)).save(scene_root / f"rgb/{fid}.png")
-        np.save(scene_root / f"depth/{fid}.npy", depth)
-        frames.append(FrameRecord(
-            frame_id=fid, scene=SCENE, regime=frame.regime,
-            params=dict(frame.params, viewpoint=0),
-            T_world_from_camera=frame.T_world_from_camera, K=K,
-            height=SIDE, width=SIDE,
-            rgb_path=f"rgb/{fid}.png", depth_path=f"depth/{fid}.npy",
-        ))
-        features[fid] = smooth_features(SIDE // 14, SIDE // 14, CHANNELS, seed=100 + i)
+    # Viewpoint 1's depth straddles every patch center: stripe boundaries at
+    # columns 7 + 14k, so a center at u = 6.5 + 14k reads one pixel on each
+    # side and the four-corner consistency test rejects every per-point
+    # candidate, while the splat path keeps full support. Every vp01 pair is
+    # then a genuine one-path pair, made by the sampler's own rules rather than
+    # a forced mask, so the population accounting's one-path term is exercised
+    # by this scene instead of only by a unit test. Translation, not rotation:
+    # a planar z-depth map is only a consistent surface between two cameras
+    # when they share orientation.
+    striped = np.empty((SIDE, SIDE), dtype=np.float32)
+    for col in range(SIDE):
+        striped[:, col] = 3.0 if ((col + 7) // 14) % 2 == 0 else 5.0
+    programs = [
+        (0, depth, program_rotation(base_pose(), [-5.0, -2.5, 0.0, 2.5, 5.0], [])
+         + program_translation(base_pose(), [0.05, 0.1], 3.0)),
+        (1, striped, program_translation(base_pose(), [0.1, 0.2], 3.0)),
+    ]
+    i = 0
+    for viewpoint, depth_map, posed in programs:
+        counters: dict[str, int] = {}
+        for frame in posed:
+            index = counters.get(frame.regime, 0)
+            counters[frame.regime] = index + 1
+            fid = f"{SCENE}_vp{viewpoint:02d}_{frame.regime}_{index:03d}"
+            Image.fromarray(np.zeros((SIDE, SIDE, 3), np.uint8)).save(
+                scene_root / f"rgb/{fid}.png"
+            )
+            np.save(scene_root / f"depth/{fid}.npy", depth_map)
+            frames.append(FrameRecord(
+                frame_id=fid, scene=SCENE, regime=frame.regime,
+                params=dict(frame.params, viewpoint=viewpoint),
+                T_world_from_camera=frame.T_world_from_camera, K=K,
+                height=SIDE, width=SIDE,
+                rgb_path=f"rgb/{fid}.png", depth_path=f"depth/{fid}.npy",
+            ))
+            features[fid] = smooth_features(SIDE // 14, SIDE // 14, CHANNELS, seed=100 + i)
+            i += 1
     manifest = Manifest(
         scene=SCENE,
         metadata={"depth_convention": {"raw_verdict": "planar_z", "stored_depth": "planar_z"}},
@@ -200,6 +220,15 @@ production, and the expectation is built from those.
            f"({both} on both paths, {one} on one); {both} x 10 + {one} x 5 = "
            f"{expected} expected rows. Observed: {len(pairs)} distinct pairs, "
            f"{len(rows)} rows")
+    # The probe scene is built to contain both terms: viewpoint 1's striped
+    # depth makes every one of its pairs splat-only by the sampler's own rules.
+    # If either count is zero the scene has stopped exercising half the
+    # arithmetic, and this check would be passing on the half it still sees.
+    record("4.1c", "both population terms are exercised, not merely summed",
+           both >= 1 and one >= 1,
+           f"pairs on both paths: {both}; pairs on exactly one: {one}. A zero "
+           f"here means the probe scene regressed and the corresponding term "
+           f"of the expectation is vacuous.")
 
     by_path = Counter((r["path"], r["variant"]) for r in rows)
     print("\n  variants actually present, by path:")

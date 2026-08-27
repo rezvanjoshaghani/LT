@@ -106,31 +106,53 @@ def build_scene(root: Path, feature_mode: str = "smooth"):
     (scene_root / "depth").mkdir(parents=True)
 
     K = intrinsics_from_hfov(SIDE, SIDE, 90.0)
-    posed = program_rotation(base_pose(), [-10.0, -5.0, 0.0, 5.0, 10.0], [])
-    posed += program_translation(base_pose(), [0.05, 0.1, 0.2], 3.0)
 
     yy, xx = np.mgrid[0:SIDE, 0:SIDE]
     depth = np.where(xx < SIDE // 2, 2.0, 4.0).astype(np.float32) + 0.002 * yy
 
+    # Viewpoint 1's depth straddles every patch center: stripe boundaries sit
+    # at columns 7 + 14k, and a center at u = 6.5 + 14k reads pixels 6 + 14k
+    # and 7 + 14k, one on each side, so the four-corner consistency test
+    # rejects every per-point candidate while the splat path keeps full
+    # support. That makes every vp01 pair a genuine one-path pair, produced by
+    # the sampler's own rules rather than by forcing a mask, so the population
+    # accounting's one-path term is exercised by this scene rather than only
+    # by a unit test. Translation, not rotation: a planar z-depth map is only
+    # a consistent surface between two cameras when they share orientation.
+    striped = np.empty((SIDE, SIDE), dtype=np.float32)
+    for col in range(SIDE):
+        striped[:, col] = 3.0 if ((col + 7) // 14) % 2 == 0 else 5.0
+
+    programs = [
+        (0, depth, program_rotation(base_pose(), [-10.0, -5.0, 0.0, 5.0, 10.0], [])
+         + program_translation(base_pose(), [0.05, 0.1, 0.2], 3.0)),
+        (1, striped, program_translation(base_pose(), [0.1, 0.2], 3.0)),
+    ]
+
     frames, features = [], {}
-    counters: dict[str, int] = {}
-    for i, frame in enumerate(posed):
-        index = counters.get(frame.regime, 0)
-        counters[frame.regime] = index + 1
-        fid = f"{SCENE}_vp00_{frame.regime}_{index:03d}"
-        Image.fromarray(np.zeros((SIDE, SIDE, 3), np.uint8)).save(scene_root / f"rgb/{fid}.png")
-        np.save(scene_root / f"depth/{fid}.npy", depth.astype(np.float32))
-        frames.append(FrameRecord(
-            frame_id=fid, scene=SCENE, regime=frame.regime,
-            params=dict(frame.params, viewpoint=0),
-            T_world_from_camera=frame.T_world_from_camera, K=K,
-            height=SIDE, width=SIDE,
-            rgb_path=f"rgb/{fid}.png", depth_path=f"depth/{fid}.npy",
-        ))
-        if feature_mode == "surface":
-            features[fid] = surface_attached_features(frames[-1], depth, CHANNELS)
-        else:
-            features[fid] = smooth_features(SIDE // 14, SIDE // 14, CHANNELS, seed=100 + i)
+    i = 0
+    for viewpoint, depth_map, posed in programs:
+        counters: dict[str, int] = {}
+        for frame in posed:
+            index = counters.get(frame.regime, 0)
+            counters[frame.regime] = index + 1
+            fid = f"{SCENE}_vp{viewpoint:02d}_{frame.regime}_{index:03d}"
+            Image.fromarray(np.zeros((SIDE, SIDE, 3), np.uint8)).save(
+                scene_root / f"rgb/{fid}.png"
+            )
+            np.save(scene_root / f"depth/{fid}.npy", depth_map.astype(np.float32))
+            frames.append(FrameRecord(
+                frame_id=fid, scene=SCENE, regime=frame.regime,
+                params=dict(frame.params, viewpoint=viewpoint),
+                T_world_from_camera=frame.T_world_from_camera, K=K,
+                height=SIDE, width=SIDE,
+                rgb_path=f"rgb/{fid}.png", depth_path=f"depth/{fid}.npy",
+            ))
+            if feature_mode == "surface":
+                features[fid] = surface_attached_features(frames[-1], depth_map, CHANNELS)
+            else:
+                features[fid] = smooth_features(SIDE // 14, SIDE // 14, CHANNELS, seed=100 + i)
+            i += 1
 
     manifest = Manifest(
         scene=SCENE,

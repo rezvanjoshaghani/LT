@@ -415,6 +415,7 @@ class PairGeometry:
     per_point_cells: np.ndarray     # [N] universe cell of each per-point sample
     neighbor_option_ok: np.ndarray  # [cells, 4] offsets both paths admit
     splat_mask: np.ndarray          # [Hp * Wp] bool, cells scored splat-and-pool
+    splat_covisible_ok: np.ndarray  # [Hp * Wp] bool, one of splat_mask's two terms
     random_patch: np.ndarray        # [Hp * Wp] int, hashed source patch per cell
     coverage_mean: float
 
@@ -545,9 +546,13 @@ def pair_geometry(
         neighbor_option_ok[per_point_cells] = samples.neighbor_option_ok
 
     covisible_per_patch = fraction_per_patch(masks.covisible, patch_size)
-    splat_mask = (
-        (covisible_per_patch >= config.min_covisible_fraction) & (plan.coverage > 0)
+    # Kept separately as well as conjoined, because the cross-path accounting
+    # has to name every condition splat_mask applies. Crediting only coverage
+    # made a legitimately per-point-only cell look like a rule mismatch.
+    splat_covisible_ok = (
+        covisible_per_patch >= config.min_covisible_fraction
     ).reshape(-1).cpu().numpy()
+    splat_mask = splat_covisible_ok & (plan.coverage > 0).reshape(-1).cpu().numpy()
 
     ids = universe_sample_ids(scene, context_frame_id, target_frame_id, grid)
     where = f"{scene} {context_frame_id} -> {target_frame_id}"
@@ -564,6 +569,7 @@ def pair_geometry(
         per_point_mask=per_point_mask,
         per_point_cells=per_point_cells,
         splat_mask=splat_mask,
+        splat_covisible_ok=splat_covisible_ok,
         neighbor_option_ok=neighbor_option_ok,
         # Modulo the context grid, which is the grid this index reads from.
         # The target grid was used here and the context grid on the per-point
@@ -579,44 +585,63 @@ def pair_geometry(
 
 
 def cross_path_record_difference(geometry: PairGeometry) -> dict[str, int]:
-    """How the two paths' record sets differ, and why.
+    """How the two paths' record sets differ, and why, by every reason.
 
-    After the shared direction rule and the removal of the neighbour drop, the
-    only legitimate source of a difference is transport coverage: cells the warp
-    does not support cannot be scored on the splat path, while the per-point
-    path reads its correspondence directly. That is a property of the operator
-    and is reported. Anything else appearing here means one path is selecting
-    records by a rule the other does not apply, which is the fault the shared
-    rule exists to prevent, so the components are counted separately rather than
-    summarized.
+    The splat path scores a cell when two things hold: the warp covers it, and
+    at least min_covisible_fraction of its pixels are co-visible. The per-point
+    path scores a sample when the patch centre is co-visible and its four
+    surrounding pixels lie on one surface. Those are different questions, and a
+    patch centre can pass the second while its whole cell fails the first, so a
+    cell can be legitimately per-point-only for either of two reasons.
+
+    An earlier version of this function credited only coverage, which made the
+    other reason look like a rule mismatch. It survived three synthetic probes
+    because the sampler's four-corner consistency test rejects centres near a
+    depth edge, and the low-co-visible cells in those scenes were all near one.
+    Real orbit geometry produced the case within a few hundred pairs: a cell
+    more than half occluded whose centre sits on the visible part.
     """
     per_point = geometry.per_point_mask
     splat = geometry.splat_mask
     uncovered = (geometry.plan.coverage.reshape(-1) <= 0).cpu().numpy()
+    low_covisible = ~geometry.splat_covisible_ok
     only_per_point = per_point & ~splat
+    explained = only_per_point & (uncovered | low_covisible)
     return {
         "both": int((per_point & splat).sum()),
         "per_point_only": int(only_per_point.sum()),
         "per_point_only_uncovered": int((only_per_point & uncovered).sum()),
+        "per_point_only_low_covisible": int((only_per_point & low_covisible).sum()),
+        "per_point_only_unexplained": int((only_per_point & ~explained).sum()),
         "splat_only": int((splat & ~per_point).sum()),
     }
 
 
 def assert_source_read_sets_agree(geometry: PairGeometry, where: str) -> None:
-    """Every cell one path reads must be readable on the other, bar coverage.
+    """Every per-point-only cell must be one splat_mask's own terms excluded.
 
-    The read-equality test compares records present on both paths and therefore
-    cannot see a record that is absent from one. This closes that gap: a cell
-    the per-point path scored but the splat path did not must be a cell the warp
-    failed to cover, never a cell some null's own rule removed.
+    Read carefully, this cannot fail for splat_mask as currently defined: that
+    mask is the conjunction of the two conditions the difference is decomposed
+    by, so De Morgan makes every per-point-only cell fall under one of them.
+    That is the point. The check is not on this run's data, it is on the
+    accounting: conjoin a third term into splat_mask without naming it in
+    cross_path_record_difference and the cells it excludes become unexplained
+    here, which is exactly the drift that produced the false positive this
+    replaces.
+
+    The invariant people expect from the name, that no variant's own rule
+    narrows a path's record set, is not checkable from masks at all. It is
+    enforced where the rows are made, by scoring every variant on the path's
+    one selected set, and verified downstream in figures.paired_records, which
+    refuses a comparison whose variants carry different sample masks.
     """
     difference = cross_path_record_difference(geometry)
-    unexplained = difference["per_point_only"] - difference["per_point_only_uncovered"]
-    if unexplained:
+    if difference["per_point_only_unexplained"]:
         raise RuntimeError(
-            f"{where}: {unexplained} cells are scored per-point but absent from "
-            "the splat path for a reason other than transport coverage; the two "
-            "paths are selecting records by different rules"
+            f"{where}: {difference['per_point_only_unexplained']} cells are "
+            "scored per-point and absent from the splat path for a reason "
+            "cross_path_record_difference does not enumerate. splat_mask has "
+            "gained a condition the accounting has not; add it there"
         )
 
 
@@ -996,6 +1021,7 @@ def evaluate_scene(
     pairs_scored_per_point_only = 0
     pairs_scored_splat_only = 0
     neighbor_omitted = 0
+    cross_path_cells: dict[str, int] = {}
     universe_size = 0
     try:
         for pair in pairs:
@@ -1016,6 +1042,8 @@ def evaluate_scene(
                 analysis,
             )
             neighbor_omitted += geometry.samples.neighbor_omitted
+            for key, value in cross_path_record_difference(geometry).items():
+                cross_path_cells[key] = cross_path_cells.get(key, 0) + value
             # PROTOCOL 3.4 asserts the interval below the first parallax edge is
             # empty for translation-program pairs. The quantity it asserts about
             # is the reported statistic, the median over the co-visible set,
@@ -1081,6 +1109,10 @@ def evaluate_scene(
         "pairs_scored_per_point_only": pairs_scored_per_point_only,
         "pairs_scored_splat_only": pairs_scored_splat_only,
         "neighbor_patch_omitted_records": neighbor_omitted,
+        # PROTOCOL 4.4 wants the coverage difference between the paths
+        # reported rather than resolved by dropping pairs. Summed over the
+        # scene's pairs, by the reason each cell differs.
+        "cross_path_cells": cross_path_cells,
         "universe_size": universe_size,
         "encoders": list(cfg.encoders),
         "run_scenes": sorted(cfg.scenes),

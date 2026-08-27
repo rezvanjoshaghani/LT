@@ -432,13 +432,47 @@ def test_the_two_paths_score_the_same_records():
     assert_source_read_sets_agree(geometry, "identity pair")
 
 
-def test_a_record_set_difference_must_be_explained_by_coverage():
-    """Anything else means the two paths disagree about what a record is."""
+def test_a_per_point_only_cell_may_be_one_the_cell_test_excluded():
+    """Low co-visible fraction is a second legitimate reason, and was missing.
+
+    splat_mask is a conjunction: the warp covers the cell, and at least
+    min_covisible_fraction of its pixels are co-visible. The per-point path asks
+    a different question, whether the patch centre is co-visible and its four
+    surrounding pixels lie on one surface, and a centre can pass that while its
+    whole cell fails the fraction test.
+
+    The accounting credited only coverage, so this case raised as a rule
+    mismatch. It survived three synthetic probes because the four-corner
+    consistency test rejects centres near a depth edge and the low-co-visible
+    cells in those scenes were all near one; real orbit geometry produced it
+    within a few hundred pairs, on a cell more than half occluded whose centre
+    sits on the visible part.
+    """
     geometry, _ = identity_pair()
-    # Strip a covered cell from the splat side without touching coverage, which
-    # is exactly the shape of a null-specific removal.
-    geometry.splat_mask[0] = False
-    with pytest.raises(RuntimeError, match="different rules"):
+    cell = int(np.flatnonzero(geometry.per_point_mask & geometry.splat_mask)[0])
+    assert geometry.plan.coverage.reshape(-1)[cell] > 0, "the cell must stay covered"
+    geometry.splat_covisible_ok[cell] = False
+    geometry.splat_mask[cell] = False
+
+    difference = cross_path_record_difference(geometry)
+    assert difference["per_point_only_low_covisible"] >= 1
+    assert difference["per_point_only_unexplained"] == 0
+    assert_source_read_sets_agree(geometry, "half-occluded cell")
+
+
+def test_an_unenumerated_exclusion_is_still_refused():
+    """The check is on the accounting, not on the data.
+
+    It cannot fail for splat_mask as defined, because that mask is the
+    conjunction of the two conditions the difference is decomposed by. Conjoin
+    a third term without naming it in cross_path_record_difference and the
+    cells it excludes become unexplained, which is the drift that produced the
+    false positive this replaces.
+    """
+    geometry, _ = identity_pair()
+    cell = int(np.flatnonzero(geometry.per_point_mask & geometry.splat_mask)[0])
+    geometry.splat_mask[cell] = False  # neither coverage nor the fraction moved
+    with pytest.raises(RuntimeError, match="does not enumerate"):
         assert_source_read_sets_agree(geometry, "tampered pair")
 
 

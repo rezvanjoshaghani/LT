@@ -37,6 +37,7 @@ import math
 import os
 import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -196,6 +197,30 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
                 f"{sorted(declared)}. Provenance that does not cover the run "
                 "gates nothing"
             )
+    # Every provenance entry must carry all four fields, correctly formed,
+    # before anything compares identities. The identity tuple was assembled
+    # with entry.get(...), so an entry missing weights_fingerprint compared as
+    # None against None and matched across scenes: a whole field could be
+    # absent, consistently, and pass. For DINOv2 the fingerprint is the only
+    # evidence the unversioned checkpoint bytes did not change, so its absence
+    # is precisely the case that must not slide.
+    for stem, meta in sidecars.items():
+        for encoder, entry in (meta.get("cache_provenance") or {}).items():
+            for field in ("features_digest", "weights_fingerprint"):
+                value = entry.get(field)
+                if not (isinstance(value, str) and CONTENT_DIGEST.fullmatch(value)):
+                    raise ValueError(
+                        f"{eval_dir}: {stem} carries no well-formed {field} for "
+                        f"{encoder} (got {value!r}; expected 32 hex characters). "
+                        "Without it the cache these rows came from cannot be "
+                        "identified, and for DINOv2 the fingerprint is the only "
+                        "evidence the unversioned checkpoint bytes did not change"
+                    )
+            for field in ("weights_revision", "code_revision"):
+                if field not in entry:
+                    raise ValueError(
+                        f"{eval_dir}: {stem} carries no {field} for {encoder}"
+                    )
     # Every scene must have been evaluated from the same encoder, and an
     # encoder's identity is the whole triple: the weight bytes, the recorded
     # weights revision, and the inference implementation. Comparing the
@@ -285,13 +310,88 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
                 "the evaluation, which PROTOCOL 3.4 permits from counts alone."
             )
 
+    # The rows must be the population the metadata declares, checked before
+    # anything aggregates them. Concatenating whatever the files held meant a
+    # whole encoder could be absent, a file could carry another scene's rows,
+    # and complete camera pairs could vanish, all without leaving the partial
+    # comparisons the later completeness checks look for: a deleted pair is
+    # not incomplete, it is gone.
+    expected_variants = set(VARIANT_ORDER)
     rows: list[dict[str, Any]] = []
     for stem in sorted(tables):
-        rows.extend(tables[stem].to_pylist())
+        file_rows = tables[stem].to_pylist()
+        meta = sidecars[stem]
+        counters = {}
+        for key in ("pairs_scored_both_paths", "pairs_scored_per_point_only",
+                    "pairs_scored_splat_only"):
+            if meta.get(key) is None:
+                raise ValueError(
+                    f"{eval_dir}: {stem} records no {key}, so its row population "
+                    "cannot be reconciled against what the evaluator scored"
+                )
+            counters[key] = int(meta[key])
+        scenes_present = {row["scene"] for row in file_rows}
+        if scenes_present != {meta["scene"]} or stem != meta["scene"]:
+            raise ValueError(
+                f"{eval_dir}: {stem}.parquet holds rows for {sorted(scenes_present)} "
+                f"while its record says scene {meta['scene']!r}; a file carrying "
+                "another scene's rows is a mixed directory however its name reads"
+            )
+        declared_encoders = set(meta["encoders"])
+        encoders_present = {row["encoder"] for row in file_rows}
+        if encoders_present != declared_encoders:
+            raise ValueError(
+                f"{eval_dir}: {stem} declares encoders {sorted(declared_encoders)} "
+                f"but its rows carry {sorted(encoders_present)}. An encoder with "
+                "no rows disappeared without leaving a partial comparison behind"
+            )
+        # Per encoder and per path, the pair population must equal what the
+        # evaluator counted. Per path, not combined: a combined count cannot
+        # see a balanced error, where a lost per-point comparison and a
+        # spurious splat one leave the sum where it was.
+        for encoder in sorted(declared_encoders):
+            paths_by_pair: dict[tuple, set] = {}
+            variants: dict[tuple, set] = {}
+            for row in file_rows:
+                if row["encoder"] != encoder:
+                    continue
+                pair = (row["context_frame_id"], row["target_frame_id"])
+                paths_by_pair.setdefault(pair, set()).add(row["path"])
+                variants.setdefault((pair, row["path"]), set()).add(row["variant"])
+            both = sum(1 for p in paths_by_pair.values() if len(p) == 2)
+            pp_only = sum(1 for p in paths_by_pair.values() if p == {PER_POINT})
+            sp_only = sum(1 for p in paths_by_pair.values() if p == {SPLAT_POOL})
+            found = {
+                "pairs_scored_both_paths": both,
+                "pairs_scored_per_point_only": pp_only,
+                "pairs_scored_splat_only": sp_only,
+            }
+            if found != counters:
+                raise ValueError(
+                    f"{eval_dir}: {stem} / {encoder}: the evaluator scored "
+                    f"{counters} but the rows hold {found}. Camera pairs have "
+                    "been added or removed since the run wrote them"
+                )
+            short = {
+                key: sorted(missing := expected_variants - present)
+                for key, present in variants.items()
+                if present != expected_variants
+            }
+            if short:
+                first = next(iter(short.items()))
+                raise ValueError(
+                    f"{eval_dir}: {stem} / {encoder}: {len(short)} comparisons "
+                    f"do not carry all {len(expected_variants)} variants, first "
+                    f"{first[0]} missing {first[1]}"
+                )
+        rows.extend(file_rows)
     return rows
 
 
 FULL_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+# blake2b with digest_size 16, the format every content digest in this
+# repository uses: features, depth, the mean vector, the analysis config.
+CONTENT_DIGEST = re.compile(r"^[0-9a-f]{32}$")
 
 
 def is_pinned_revision(field: str, value: Any) -> bool:
@@ -1430,7 +1530,7 @@ def write_table(path: Path, table: Sequence[dict[str, Any]], replace: bool = Fal
     if not table:
         raise ValueError("no table rows to write")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".{os.getpid()}.partial")
+    tmp = path.with_name(path.name + f".{uuid.uuid4().hex}.partial")
     pq.write_table(pa.Table.from_pylist(list(table)), tmp)
     os.replace(tmp, path)
 
@@ -1558,7 +1658,7 @@ def main(argv: list[str] | None = None) -> None:
     # The staging directory is per-process, not a fixed shared name. A fixed one
     # is deleted on entry, so a second invocation would remove the first's
     # half-built figures out from under it.
-    staging = Path(out_dir) / f".partial.{os.getpid()}"
+    staging = Path(out_dir) / f".partial.{uuid.uuid4().hex}"
     if staging.exists():
         shutil.rmtree(staging)
     figures = staging / "figures"

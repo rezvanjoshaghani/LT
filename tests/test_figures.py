@@ -1,5 +1,6 @@
 """PROTOCOL 3.3, 3.4, 3.9, 3.10: the analysis layer, from the parquet and the config."""
 
+import hashlib
 import math
 from pathlib import Path
 
@@ -111,13 +112,43 @@ def run_meta(scene, run_scenes=None):
         "analysis_reporting_digest": ANALYSIS.reporting_digest(),
         "cache_provenance": {
             "dinov2_vitb14": {
-                "features_digest": f"d-{scene}",
-                "weights_fingerprint": "w0",
+                "features_digest": hashlib.blake2b(
+                    scene.encode("utf-8"), digest_size=16
+                ).hexdigest(),
+                "weights_fingerprint": "f" * 32,
                 "weights_revision": "unpinnable: torch.hub checkpoint URL is unversioned",
                 "code_revision": "c" * 40,
             }
         },
     }
+
+
+def scene_counters(rows):
+    """The per-path pair counters the evaluator would have recorded."""
+    paths_by_pair = {}
+    for row in rows:
+        pair = (row["context_frame_id"], row["target_frame_id"])
+        paths_by_pair.setdefault(pair, set()).add(row["path"])
+    return {
+        "pairs_scored_both_paths": sum(1 for p in paths_by_pair.values() if len(p) == 2),
+        "pairs_scored_per_point_only": sum(
+            1 for p in paths_by_pair.values() if p == {PER_POINT}
+        ),
+        "pairs_scored_splat_only": sum(
+            1 for p in paths_by_pair.values() if p == {SPLAT_POOL}
+        ),
+    }
+
+
+def write_scene(eval_dir, rows, meta):
+    """Write one scene's parquet with counters matching its rows.
+
+    Counters already present in meta are kept, which is how a test builds a
+    deliberate mismatch.
+    """
+    full = {**scene_counters(rows), **meta}
+    write_rows(eval_dir / f"{meta['scene']}.parquet", rows, full)
+    return full
 
 
 def population(scenes=4, pairs=40, regime="translation", parallax=0.08, rotation=0.0):
@@ -129,11 +160,15 @@ def population(scenes=4, pairs=40, regime="translation", parallax=0.08, rotation
     """
     tag = f"{regime}_{parallax:g}_{rotation:g}"
     rows = []
+    # A single-scene population carries the scene name the sidecar fixtures
+    # use, because read_eval_dir now reconciles each file's rows against its
+    # record: a file whose rows name another scene is a mixed directory.
+    names = ["room_0"] if scenes == 1 else [f"scene_{i}" for i in range(scenes)]
     for scene_index in range(scenes):
         for pair_index in range(pairs):
             rows += comparison(
                 {ORACLE_TRANSPORT: 0.9, NO_WARP_COPY: 0.5, MEAN_FEATURE: 0.2},
-                scene=f"scene_{scene_index}",
+                scene=names[scene_index],
                 context_frame_id=f"{tag}_c{pair_index}",
                 target_frame_id=f"{tag}_t{pair_index}",
                 regime=regime,
@@ -416,7 +451,12 @@ def test_table_and_figures_regenerate_from_the_parquet_alone(tmp_path):
     for parallax in (0.03, 0.08, 0.3):
         rows += population(scenes=4, pairs=40, parallax=parallax)
     eval_dir = tmp_path / "eval"
-    write_rows(eval_dir / "room_0.parquet", rows, run_meta("room_0"))
+    for scene in sorted({r["scene"] for r in rows}):
+        write_scene(
+            eval_dir,
+            [r for r in rows if r["scene"] == scene],
+            run_meta(scene, sorted({r["scene"] for r in rows})),
+        )
 
     reread = assign_bins(read_eval_dir(eval_dir), ANALYSIS)
     records, mismatches = paired_records(reread)
@@ -463,7 +503,7 @@ def test_the_parquet_alone_is_enough(tmp_path):
     second required artifact set that nothing declared.
     """
     eval_dir = tmp_path / "eval"
-    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0"))
+    write_scene(eval_dir, population(scenes=1, pairs=4), run_meta("room_0"))
     (eval_dir / "room_0.meta.json").unlink()
     rows = read_eval_dir(eval_dir)
     assert rows
@@ -729,7 +769,7 @@ def test_a_report_is_bound_to_the_config_that_measured_it_but_not_to_how_it_repo
     import dataclasses
 
     eval_dir = tmp_path / "eval"
-    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0"))
+    write_scene(eval_dir, population(scenes=1, pairs=4), run_meta("room_0"))
 
     # A reporting edit is permitted: this is the counts-then-threshold workflow.
     reporting = dataclasses.replace(ANALYSIS, support_min_camera_pairs=99)
@@ -871,7 +911,7 @@ def test_unpinned_provenance_refuses_the_report(tmp_path):
     # The declared-unpinnable weights marker alone is not a refusal: the
     # default run_meta fixture carries it and reads cleanly.
     clean_dir = tmp_path / "eval_clean"
-    write_rows(clean_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0"))
+    write_scene(clean_dir, population(scenes=1, pairs=4), run_meta("room_0"))
     assert read_eval_dir(clean_dir)
 
 
@@ -914,3 +954,73 @@ def test_provenance_must_cover_the_run(tmp_path):
     write_rows(partial_dir / "room_0.parquet", population(scenes=1, pairs=4), meta)
     with pytest.raises(ValueError, match="gates nothing"):
         read_eval_dir(partial_dir)
+
+
+def test_a_missing_fingerprint_is_refused_however_consistently_missing(tmp_path):
+    """None compared equal to None across scenes, so an absent field matched.
+
+    For DINOv2 the fingerprint is the only evidence the unversioned checkpoint
+    bytes did not change, so its absence is precisely the case that must not
+    slide through an identity comparison built on entry.get().
+    """
+    import copy
+
+    for field in ("weights_fingerprint", "features_digest"):
+        eval_dir = tmp_path / f"eval_{field}"
+        meta = copy.deepcopy(run_meta("room_0"))
+        del meta["cache_provenance"]["dinov2_vitb14"][field]
+        write_scene(eval_dir, population(scenes=1, pairs=4), meta)
+        with pytest.raises(ValueError, match=f"well-formed {field}"):
+            read_eval_dir(eval_dir)
+
+    # And a present but malformed value is the same defect wearing a value.
+    eval_dir = tmp_path / "eval_malformed"
+    meta = copy.deepcopy(run_meta("room_0"))
+    meta["cache_provenance"]["dinov2_vitb14"]["weights_fingerprint"] = "TODO"
+    write_scene(eval_dir, population(scenes=1, pairs=4), meta)
+    with pytest.raises(ValueError, match="well-formed weights_fingerprint"):
+        read_eval_dir(eval_dir)
+
+
+def test_an_encoder_with_no_rows_is_refused(tmp_path):
+    """A declared encoder must appear in the rows.
+
+    A whole encoder disappearing leaves no partial comparison for the
+    completeness checks to notice: every comparison that remains is complete.
+    """
+    import copy
+
+    eval_dir = tmp_path / "eval"
+    meta = copy.deepcopy(run_meta("room_0"))
+    meta["encoders"] = ["dinov2_vitb14", "vggt_1b"]
+    meta["cache_provenance"]["vggt_1b"] = dict(meta["cache_provenance"]["dinov2_vitb14"])
+    write_scene(eval_dir, population(scenes=1, pairs=4), meta)
+    with pytest.raises(ValueError, match="disappeared without leaving"):
+        read_eval_dir(eval_dir)
+
+
+def test_a_vanished_pair_is_refused_by_the_counter_reconciliation(tmp_path):
+    """Deleting a whole pair leaves no incomplete comparison behind.
+
+    The evaluator's per-path counters are the record of the population it
+    scored, so rows that hold fewer pairs than the counters declare are a
+    modified file, not a smaller run.
+    """
+    rows = population(scenes=1, pairs=4)
+    counters = scene_counters(rows)
+    assert counters["pairs_scored_per_point_only"] == 4
+    kept = [r for r in rows if r["context_frame_id"] != rows[0]["context_frame_id"]]
+
+    eval_dir = tmp_path / "eval"
+    write_scene(eval_dir, kept, {**run_meta("room_0"), **counters})
+    with pytest.raises(ValueError, match="added or removed"):
+        read_eval_dir(eval_dir)
+
+
+def test_a_file_holding_another_scenes_rows_is_refused(tmp_path):
+    """The filename, the record, and the rows must name one scene."""
+    rows = population(scenes=1, pairs=4)  # rows for room_0
+    eval_dir = tmp_path / "eval"
+    write_scene(eval_dir, rows, run_meta("room_1"))
+    with pytest.raises(ValueError, match="another scene's rows"):
+        read_eval_dir(eval_dir)

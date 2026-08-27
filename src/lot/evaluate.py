@@ -38,6 +38,7 @@ import math
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -324,7 +325,13 @@ def load_or_build_mean_vector(
     mean = dataset_mean_vector(cache_root, encoder, scenes)
     provenance = {**provenance, "vector_digest": vector_digest(mean.numpy())}
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = f".{os.getpid()}.partial"
+    # Node-unique, not merely process-unique. The documented run is an 18-task
+    # SLURM array across nodes, and process ids are unique per machine only, so
+    # two tasks on different nodes could claim one temporary name and one of
+    # them would rename a file the other had already moved. Duplicate builds
+    # remain possible and remain harmless, because the vector is a
+    # deterministic function of the cache; a shared temporary name is not.
+    stamp = f".{uuid.uuid4().hex}.partial"
     tmp = path.with_name(path.name + stamp)
     # Written through a handle: np.save appends .npy to any name that lacks it,
     # so passing the temporary path directly would create a file the rename
@@ -986,7 +993,8 @@ def evaluate_scene(
     rows: list[dict[str, Any]] = []
     dropped_unscorable = 0
     pairs_scored_both_paths = 0
-    pairs_scored_one_path = 0
+    pairs_scored_per_point_only = 0
+    pairs_scored_splat_only = 0
     neighbor_omitted = 0
     universe_size = 0
     try:
@@ -1036,13 +1044,20 @@ def evaluate_scene(
                 dropped_unscorable += 1
                 continue
             # A pair scorable on one path yields five rows, not ten, and the
-            # forensic population check needs that split recorded independently
-            # of the rows it audits: derived from the rows, a silently dropped
-            # pair shrank the expected and the observed count together.
-            if geometry.per_point_mask.any() and geometry.splat_mask.any():
+            # population checks need that split recorded independently of the
+            # rows they audit: derived from the rows, a silently dropped pair
+            # shrank the expected and the observed count together. The split is
+            # per path, not a combined one-path count, because a combined count
+            # cannot see a balanced error: losing a per-point comparison while
+            # gaining a spurious splat one leaves the sum where it was.
+            per_point_any = bool(geometry.per_point_mask.any())
+            splat_any = bool(geometry.splat_mask.any())
+            if per_point_any and splat_any:
                 pairs_scored_both_paths += 1
+            elif per_point_any:
+                pairs_scored_per_point_only += 1
             else:
-                pairs_scored_one_path += 1
+                pairs_scored_splat_only += 1
             base = pair.as_row()
             base["covisible_fraction"] = geometry.covisible_fraction
             base["parallax"] = geometry.parallax
@@ -1063,7 +1078,8 @@ def evaluate_scene(
         "pairs_considered": len(pairs),
         "pairs_dropped_unscorable": dropped_unscorable,
         "pairs_scored_both_paths": pairs_scored_both_paths,
-        "pairs_scored_one_path": pairs_scored_one_path,
+        "pairs_scored_per_point_only": pairs_scored_per_point_only,
+        "pairs_scored_splat_only": pairs_scored_splat_only,
         "neighbor_patch_omitted_records": neighbor_omitted,
         "universe_size": universe_size,
         "encoders": list(cfg.encoders),

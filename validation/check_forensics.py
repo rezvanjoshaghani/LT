@@ -161,7 +161,7 @@ def build_scene(root):
         "frame_count": len(features),
         "frame_ids": [f.frame_id for f in frames],
         "has_depth": False,
-        "weights_fingerprint": "validation-probe",
+        "weights_fingerprint": "b" * 32,
         "weights_revision": "2" * 40,
         "code_revision": "3" * 40,
         "features_digest": features_digest(features),
@@ -208,27 +208,51 @@ production, and the expectation is built from those.
     )
     pairs = {(r["context_frame_id"], r["target_frame_id"]) for r in rows}
     both = run_meta["pairs_scored_both_paths"]
-    one = run_meta["pairs_scored_one_path"]
+    pp_only = run_meta["pairs_scored_per_point_only"]
+    sp_only = run_meta["pairs_scored_splat_only"]
     expected_pairs = run_meta["pairs_considered"] - run_meta["pairs_dropped_unscorable"]
-    expected = (both * 10 + one * 5) * 1
-    record("4.1", "record count matches the metadata-derived population",
-           len(rows) == expected
+
+    # VALIDATION 4.1 requires the expected counts derived separately per path,
+    # and the combined equation both x 10 + one x 5 cannot satisfy that: a
+    # balanced error, losing a complete per-point comparison while gaining a
+    # spurious splat one, moves neither the sum of pairs nor the sum of rows.
+    # So each path gets its own pair-set and row-count equation, against
+    # counters the evaluator records independently of the rows being audited.
+    per_point_pairs = {
+        (r["context_frame_id"], r["target_frame_id"]) for r in rows if r["path"] == "per_point"
+    }
+    splat_pairs = {
+        (r["context_frame_id"], r["target_frame_id"]) for r in rows if r["path"] == "splat_pool"
+    }
+    per_point_rows = sum(1 for r in rows if r["path"] == "per_point")
+    splat_rows = sum(1 for r in rows if r["path"] == "splat_pool")
+    expected_pp = both + pp_only
+    expected_sp = both + sp_only
+    record("4.1", "record counts match the metadata-derived population, per path",
+           len(per_point_pairs) == expected_pp
+           and len(splat_pairs) == expected_sp
+           and per_point_rows == 5 * expected_pp
+           and splat_rows == 5 * expected_sp
            and len(pairs) == expected_pairs
-           and both + one == expected_pairs,
+           and both + pp_only + sp_only == expected_pairs,
            f"metadata: {run_meta['pairs_considered']} considered - "
            f"{run_meta['pairs_dropped_unscorable']} dropped = {expected_pairs} pairs "
-           f"({both} on both paths, {one} on one); {both} x 10 + {one} x 5 = "
-           f"{expected} expected rows. Observed: {len(pairs)} distinct pairs, "
-           f"{len(rows)} rows")
+           f"({both} both, {pp_only} per-point-only, {sp_only} splat-only). "
+           f"per_point: {len(per_point_pairs)} pairs / {per_point_rows} rows vs "
+           f"{expected_pp} / {5 * expected_pp} expected; splat_pool: "
+           f"{len(splat_pairs)} pairs / {splat_rows} rows vs "
+           f"{expected_sp} / {5 * expected_sp} expected")
     # The probe scene is built to contain both terms: viewpoint 1's striped
     # depth makes every one of its pairs splat-only by the sampler's own rules.
-    # If either count is zero the scene has stopped exercising half the
-    # arithmetic, and this check would be passing on the half it still sees.
+    # A natural per-point-only pair has no known construction in this scene, so
+    # zero is asserted for it rather than left unstated: if one appears, the
+    # geometry changed and the accounting deserves a fresh look.
     record("4.1c", "both population terms are exercised, not merely summed",
-           both >= 1 and one >= 1,
-           f"pairs on both paths: {both}; pairs on exactly one: {one}. A zero "
-           f"here means the probe scene regressed and the corresponding term "
-           f"of the expectation is vacuous.")
+           both >= 1 and sp_only >= 1 and pp_only == 0,
+           f"pairs on both paths: {both}; splat-only: {sp_only}; per-point-only: "
+           f"{pp_only} (expected exactly zero in this scene). A zero in the "
+           f"first two means the probe scene regressed and that term of the "
+           f"expectation is vacuous.")
 
     by_path = Counter((r["path"], r["variant"]) for r in rows)
     print("\n  variants actually present, by path:")

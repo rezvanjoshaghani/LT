@@ -178,7 +178,7 @@ def build_scene(root: Path, feature_mode: str = "smooth"):
         "frame_count": len(features),
         "frame_ids": [f.frame_id for f in frames],
         "has_depth": False,
-        "weights_fingerprint": "validation-probe",
+        "weights_fingerprint": "b" * 32,
         "weights_revision": "2" * 40,
         "code_revision": "3" * 40,
         "features_digest": features_digest(features),

@@ -129,7 +129,7 @@ def build_scene(root):
             "frame_count": len(features),
             "frame_ids": [f.frame_id for f in frames],
             "has_depth": False,
-            "weights_fingerprint": "one-path-test",
+            "weights_fingerprint": "a" * 32,
             "weights_revision": "0" * 40,
             "code_revision": "1" * 40,
             "features_digest": features_digest(features),
@@ -149,11 +149,15 @@ def test_a_one_path_pair_traverses_the_full_pipeline(tmp_path):
     mean = dataset_mean_vector(cfg.cache_root, "dinov2_vitb14", [SCENE])
     rows, metadata = evaluate_scene(cfg, SCENE, {"dinov2_vitb14": mean}, ANALYSIS)
 
-    # The metadata split and the row arithmetic, live rather than forced.
+    # The metadata split and the row arithmetic, live rather than forced. The
+    # split is per path: the striped viewpoint's pairs are splat-only, and a
+    # combined one-path count could not see a balanced path-specific error.
     both = metadata["pairs_scored_both_paths"]
-    one = metadata["pairs_scored_one_path"]
-    assert both >= 1 and one >= 1, "the scene must produce both population terms"
-    assert len(rows) == both * 10 + one * 5
+    pp_only = metadata["pairs_scored_per_point_only"]
+    sp_only = metadata["pairs_scored_splat_only"]
+    assert both >= 1 and sp_only >= 1, "the scene must produce both population terms"
+    assert pp_only == 0
+    assert len(rows) == both * 10 + (pp_only + sp_only) * 5
 
     # Every one-path pair belongs to the striped viewpoint, on the splat path:
     # the sampler rejected the candidates, nothing forced a mask.
@@ -190,7 +194,7 @@ def test_a_one_path_pair_traverses_the_full_pipeline(tmp_path):
 
     # Path agreement counts the one-path pairs instead of losing them.
     agreement = path_agreement(assign_bins(reread, ANALYSIS), ANALYSIS)
-    assert agreement["single_path_pairs"] == one
+    assert agreement["single_path_pairs"] == pp_only + sp_only
     assert agreement["comparisons"] == both
 
     # And the summary builds.

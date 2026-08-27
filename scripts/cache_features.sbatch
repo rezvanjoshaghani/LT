@@ -2,7 +2,7 @@
 # SLURM template for frozen feature caching (PLAN Phase 2). Account and
 # partition are never hard-coded; pass them at submit time:
 #
-#   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#   sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}" \
 #          --array 0-17 scripts/cache_features.sbatch configs/cache_features_all.yaml
 #
 # Rerunning the array is safe: --resume skips scenes that already have a cache,

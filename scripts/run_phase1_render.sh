@@ -10,8 +10,10 @@
 #   ./scripts/run_phase1_render.sh qc [config]        # regenerate QC sheets, no GPU
 #
 # Required for pilot, smoke, and all (never hard-coded, per CLAUDE.md):
-#   SLURM_ACCOUNT     SLURM account to charge
-#   SLURM_PARTITION   GPU partition name
+#   SLURM_ACCOUNT     SLURM account to charge. Defaults to SLURM_JOB_ACCOUNT,
+#                     which SLURM sets inside an allocation.
+#   SLURM_PARTITION   GPU partition name. Defaults to SLURM_JOB_PARTITION,
+#                     likewise.
 # Optional:
 #   LOT_ENV           micromamba env name       (default lot-render)
 #   MAMBA_ROOT_PREFIX micromamba root           (default $HOME/micromamba)
@@ -44,22 +46,37 @@ PILOT_CONFIG=configs/render_replica_pilot.yaml
 ALL_CONFIG=configs/render_replica_all.yaml
 PILOT_MANIFEST="$REPO_ROOT/data/replica_renders_pilot/room_0/manifest.json"
 
+# Account and partition are read from the environment, never hard-coded. Two
+# spellings are accepted, and the fallback is the useful one: SLURM sets
+# SLURM_JOB_ACCOUNT and SLURM_JOB_PARTITION inside every allocation, so
+# submitting from a compute node needs no export at all and cannot name an
+# account the session is not already charging. SLURM_ACCOUNT and
+# SLURM_PARTITION take precedence, for submitting from a login node or
+# charging a different account on purpose.
+ACCOUNT="${SLURM_ACCOUNT:-${SLURM_JOB_ACCOUNT:-}}"
+PARTITION="${SLURM_PARTITION:-${SLURM_JOB_PARTITION:-}}"
+
 require_slurm_env() {
-    if [ -z "${SLURM_ACCOUNT:-}" ] || [ -z "${SLURM_PARTITION:-}" ]; then
+    if [ -z "$ACCOUNT" ] || [ -z "$PARTITION" ]; then
         cat >&2 <<'EOF'
-Set the SLURM account and GPU partition first, with the real names:
+No SLURM account or GPU partition in the environment.
+
+Inside an allocation, SLURM sets these for you and nothing more is needed:
+  echo "$SLURM_JOB_ACCOUNT $SLURM_JOB_PARTITION"
+
+From a login node, set them explicitly, with the real names:
   export SLURM_ACCOUNT=myaccount SLURM_PARTITION=gpu
 To find them:
-  inside a running job:  echo "$SLURM_JOB_ACCOUNT $SLURM_JOB_PARTITION"
-  your accounts:         sacctmgr -nP show assoc user=$USER format=account
-  gpu partitions:        sinfo -o "%P %G" | grep -i gpu
+  your accounts:    sacctmgr -nP show assoc user=$USER format=account
+  gpu partitions:   sinfo -o "%P %G" | grep -i gpu
 EOF
         exit 1
     fi
+    echo "submitting to account $ACCOUNT, partition $PARTITION"
 }
 
 submit() {
-    sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+    sbatch --account "$ACCOUNT" --partition "$PARTITION" \
         --gres "${LOT_GPU_GRES:-gpu:1}" \
         --export "ALL,LOT_ENV=$LOT_ENV,MAMBA_ROOT_PREFIX=$MAMBA_ROOT_PREFIX,MAMBA_EXE=$MM" \
         "$@"

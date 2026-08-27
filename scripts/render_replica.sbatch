@@ -3,9 +3,9 @@
 # Normally submitted by scripts/run_phase1_render.sh. Account and partition
 # are never hard-coded; pass them at submit time:
 #
-#   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#   sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}" \
 #          scripts/render_replica.sbatch configs/render_replica_pilot.yaml
-#   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#   sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}" \
 #          --array 0-17 scripts/render_replica.sbatch configs/render_replica_all.yaml
 #
 # Environment (defaults match scripts/setup_borah.sh):

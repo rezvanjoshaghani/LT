@@ -2,7 +2,7 @@
 # SLURM template for Experiment Zero (PLAN Phase 3). Account and partition are
 # never hard-coded; pass them at submit time:
 #
-#   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#   sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}" \
 #          --array 0-17 scripts/experiment_zero.sbatch configs/experiment_zero.yaml
 #
 # Rerunning the array is safe: --resume skips scenes that already have results,

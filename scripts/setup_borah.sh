@@ -168,5 +168,6 @@ if [ "$EFFECTIVE_ROOT" != "$LINK" ]; then
 fi
 
 step "done"
-echo "next: export SLURM_ACCOUNT=... SLURM_PARTITION=... and run"
+echo "next: from a login node, export SLURM_ACCOUNT=... SLURM_PARTITION=..."
+echo "      inside an allocation SLURM provides them; then run"
 echo "  ./scripts/run_phase1_render.sh pilot"

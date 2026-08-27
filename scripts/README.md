@@ -41,6 +41,7 @@ recorded as `metadata.navmesh: recomputed` in the manifest.
 ## 2. Pilot: one scene end to end (Phase 1 acceptance, first half)
 
 ```bash
+# Inside an allocation SLURM already provides these and this is unnecessary.
 export SLURM_ACCOUNT=<account> SLURM_PARTITION=<gpu partition>
 ./scripts/run_phase1_render.sh pilot
 ```
@@ -76,7 +77,11 @@ are never overwritten; delete a scene directory manually to re-render it.
 
 ## Knobs (environment variables, nothing hard-coded)
 
-- `SLURM_ACCOUNT`, `SLURM_PARTITION`: required to submit.
+- `SLURM_ACCOUNT`, `SLURM_PARTITION`: required to submit from a login node.
+  Inside an allocation SLURM sets `SLURM_JOB_ACCOUNT` and
+  `SLURM_JOB_PARTITION`, which the scripts fall back to, so submitting from
+  a compute node needs neither export and cannot name an account the
+  session is not already charging.
 - `LOT_GPU_GRES`: gres string if the cluster needs a typed request
   (default `gpu:1`).
 - `LOT_MODULES`: modules to load inside jobs, space separated, if EGL
@@ -127,6 +132,7 @@ TORCH_HOME=$PWD/cache/torch micromamba run -n lot-encode \
 ## 2. Pilot, then the batch
 
 ```bash
+# Inside an allocation SLURM already provides these and this is unnecessary.
 export SLURM_ACCOUNT=<account> SLURM_PARTITION=<gpu partition>
 ./scripts/run_phase2_cache.sh pilot
 ./scripts/run_phase2_cache.sh all       # refuses to run before the pilot
@@ -203,7 +209,7 @@ All 18 scenes run in one process, or as an array if you prefer:
 
 ```bash
 python -m lot.evaluate --config configs/experiment_zero.yaml --resume
-sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}" \
        --array 0-17 scripts/experiment_zero.sbatch configs/experiment_zero.yaml
 ```
 
@@ -272,11 +278,11 @@ mv cache/features cache/features_v1
 ```
 
 ```bash
-sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION"        --array 0-17 scripts/cache_features.sbatch configs/cache_features_all.yaml
+sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}"        --array 0-17 scripts/cache_features.sbatch configs/cache_features_all.yaml
 ```
 
 ```bash
-sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION"        --array 0-17 scripts/cache_features.sbatch configs/cache_features_vggt.yaml
+sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}"        --array 0-17 scripts/cache_features.sbatch configs/cache_features_vggt.yaml
 ```
 
 These jobs hold the GPU, so they are where PROTOCOL 3.1's permanent encoder
@@ -308,7 +314,7 @@ mv outputs/experiment_zero outputs/experiment_zero_precorrection
 Then the run itself, as an array or in one process.
 
 ```bash
-sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+sbatch --account "${SLURM_ACCOUNT:-$SLURM_JOB_ACCOUNT}" --partition "${SLURM_PARTITION:-$SLURM_JOB_PARTITION}" \
        --array 0-17 scripts/experiment_zero.sbatch configs/experiment_zero.yaml
 ```
 

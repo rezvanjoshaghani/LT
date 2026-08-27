@@ -163,10 +163,31 @@ rather than a branch, since the same state dict run through different code
 produces different features. All three are recorded in every cache and travel
 into the evaluation run record.
 
-Concrete values are not written here yet. They are resolved on the cluster
-immediately before the caching jobs, and recording a value that has not been
-used would be a claim rather than a record. The entry is completed when the
-caches are rebuilt.
+Resolved on Borah on 2026-08-26 and exported for the caching jobs:
+
+    LOT_DINOV2_REVISION  7764ea0f912e53c92e82eb78a2a1631e92725fc8
+    LOT_VGGT_REVISION    860abec7937da0a4c03c41d3c269c366e82abdf9
+    vggt implementation  a288dd0f14786c93483e45524328726ab7b1b4ce
+
+DINOv2's checkpoint bytes have no fourth value because they cannot have one:
+dl.fbaipublicfiles.com serves an unversioned file, the hub ref above pins only
+the loader that chooses its URL, and the recorded fingerprint is the whole of
+the evidence that those bytes did not move. That is a limitation of the
+distribution, stated rather than papered over.
+
+The VGGT weights revision was read from the Hugging Face cache on Borah, which
+records the commit that main resolved to when the weights were first
+downloaded. It is therefore the revision the withdrawn Phase 3 run also used,
+and re-caching under it reproduces those weights. The two code revisions carry
+no such guarantee: both were installed from a branch before this repair, so
+whether they match what the withdrawn run used is not knowable after the fact.
+This is the asymmetry the pins exist to end, and it ends with the caches built
+under this entry.
+
+These values are the intent. Each cache's meta.json records what was actually
+loaded, and the evaluation run record carries it forward per scene, so the
+claim here and the artifacts can be checked against each other rather than
+taken on trust.
 
 ### 2026-08-26: the analysis config has a measurement identity and a reporting identity
 

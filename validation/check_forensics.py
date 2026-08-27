@@ -142,8 +142,8 @@ def build_scene(root):
         "frame_ids": [f.frame_id for f in frames],
         "has_depth": False,
         "weights_fingerprint": "validation-probe",
-        "weights_revision": "validation-probe",
-        "code_revision": "validation-probe",
+        "weights_revision": "2" * 40,
+        "code_revision": "3" * 40,
         "features_digest": features_digest(features),
         "depth_digest": None,
     }, indent=1), encoding="utf-8")
@@ -171,29 +171,35 @@ def main():
     print("""
 One record = one (pair, encoder, path, variant). `metric` is NOT a row
 dimension: each row carries wide metric COLUMNS. Every variant exists on both
-paths, per PROTOCOL 3.6, so a fully scorable pair yields 5 variants x 2 paths
-= 10 rows per encoder.
+paths, per PROTOCOL 3.6, so a pair scorable on both paths yields 5 x 2 = 10
+rows per encoder, and a pair scorable on exactly one path, which is valid and
+deliberately kept, yields 5.
 
-The expected pair count comes from the run metadata, never from the rows being
+The expected counts come from the run metadata, never from the rows being
 checked. An earlier version derived n_pairs from the produced rows, and a pair
-dropped entirely then shrank the expected and the observed count by ten
-together, so the check was an identity: it compared the rows against
-themselves. pairs_considered and pairs_dropped_unscorable are recorded by the
-evaluator before and independent of row production.
+dropped entirely then shrank the expected and the observed count together, so
+the check was an identity. A later version took the pair count from metadata
+but assumed ten rows for every pair, which a one-path pair falsifies; the
+evaluator now records the both-paths and one-path splits independently of row
+production, and the expectation is built from those.
 """)
     rows, run_meta = evaluate_scene(
         cfg, SCENE, {"dinov2_vitb14": mean_vector}, load_analysis_config()
     )
     pairs = {(r["context_frame_id"], r["target_frame_id"]) for r in rows}
+    both = run_meta["pairs_scored_both_paths"]
+    one = run_meta["pairs_scored_one_path"]
     expected_pairs = run_meta["pairs_considered"] - run_meta["pairs_dropped_unscorable"]
-    # Five variants on each of two paths.
-    expected = expected_pairs * 1 * 10
+    expected = (both * 10 + one * 5) * 1
     record("4.1", "record count matches the metadata-derived population",
-           len(rows) == expected and len(pairs) == expected_pairs,
+           len(rows) == expected
+           and len(pairs) == expected_pairs
+           and both + one == expected_pairs,
            f"metadata: {run_meta['pairs_considered']} considered - "
-           f"{run_meta['pairs_dropped_unscorable']} dropped = {expected_pairs} pairs; "
-           f"x 1 encoder x 10 = {expected} expected rows. Observed: "
-           f"{len(pairs)} distinct pairs, {len(rows)} rows")
+           f"{run_meta['pairs_dropped_unscorable']} dropped = {expected_pairs} pairs "
+           f"({both} on both paths, {one} on one); {both} x 10 + {one} x 5 = "
+           f"{expected} expected rows. Observed: {len(pairs)} distinct pairs, "
+           f"{len(rows)} rows")
 
     by_path = Counter((r["path"], r["variant"]) for r in rows)
     print("\n  variants actually present, by path:")

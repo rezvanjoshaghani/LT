@@ -538,12 +538,17 @@ def test_an_extra_feature_array_is_refused_because_the_mean_would_average_it(tmp
 
     with np.load(directory / "features.npz") as archive:
         arrays = {name: archive[name] for name in archive.files}
-    honest = dataset_mean_vector(cache_root, "stub", [manifest.scene])
+    dataset_mean_vector(cache_root, "stub", [manifest.scene])
     shape = next(iter(arrays.values())).shape
     arrays["not_a_frame"] = np.full(shape, 50.0, dtype=np.float16)
     np.savez(directory / "features.npz", **arrays)
 
-    assert not torch.allclose(dataset_mean_vector(cache_root, "stub", [manifest.scene]), honest)
+    # An earlier version of this test demonstrated the poisoned mean, asserting
+    # the stray key moved it. The mean builder now verifies the bytes it
+    # consumes against the digest recorded at write time, so the demonstration
+    # is no longer reachable: the build refuses before any mean exists.
+    with pytest.raises(ValueError, match="rebuilt or modified in place"):
+        dataset_mean_vector(cache_root, "stub", [manifest.scene])
     with pytest.raises(ValueError, match="the manifest does not name"):
         validate_feature_cache(cache_root, "stub", manifest)
 

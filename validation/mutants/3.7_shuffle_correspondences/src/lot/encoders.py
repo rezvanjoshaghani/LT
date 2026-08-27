@@ -370,6 +370,8 @@ class DinoV2Encoder(FrozenEncoder):
         # the ref under weights_revision, which an earlier version did, told a
         # reader the checkpoint was retrievable when only the loader was.
         revision = os.environ.get("LOT_DINOV2_REVISION")
+        if revision:
+            require_full_sha(revision, "LOT_DINOV2_REVISION")
         repo = f"{self.HUB_REPO}:{revision}" if revision else self.HUB_REPO
         self.code_revision = revision or "unpinned"
         self.revision = "unpinnable: torch.hub checkpoint URL is unversioned"
@@ -419,6 +421,8 @@ class VggtEncoder(FrozenEncoder):
             ) from e
         # LOT_VGGT_REVISION pins the Hugging Face revision, for the same reason.
         revision = os.environ.get("LOT_VGGT_REVISION")
+        if revision:
+            require_full_sha(revision, "LOT_VGGT_REVISION")
         self.revision = revision or "unpinned"
         # And the implementation that will run those weights, which the runbook
         # installs from a git branch and which decides what the features are.
@@ -631,6 +635,25 @@ def cache_scene_features(
         _write_npz(out_dir / DEPTH_NAME, depths)
     meta_path.write_text(json.dumps(meta, indent=1), encoding="utf-8")
     return meta
+
+
+def require_full_sha(value: str, variable: str) -> str:
+    """Refuse a revision that is not a full commit hash, before it is used.
+
+    A branch name loads successfully and records successfully, and everything
+    downstream then carries a moving ref labelled as a pin. Failing here, at
+    the moment the environment variable is read, is the cheapest place: no
+    download has happened and no cache exists to rebuild.
+    """
+    import re
+
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise ValueError(
+            f"{variable}={value!r} is not a full 40-hex commit hash. A branch "
+            "or tag name is a moving ref, not a pin; resolve the commit with "
+            "scripts/pin_encoder_revisions.py"
+        )
+    return value
 
 
 def package_revision(name: str) -> str:

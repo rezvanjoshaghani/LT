@@ -241,12 +241,18 @@ def test_mean_feature_prediction_is_one_global_vector_on_both_paths():
 def test_dataset_mean_vector_is_a_vector_over_frames_and_positions(tmp_path):
     from lot.encoders import cache_dir
 
+    from lot.encoders import CACHE_VERSION, features_digest
+
     directory = cache_dir(tmp_path, "dinov2_vitb14", "room_0")
     directory.mkdir(parents=True)
-    np.savez(
-        directory / "features.npz",
-        a=np.zeros((3, 2, 2), dtype=np.float16),
-        b=np.full((3, 2, 2), 2.0, dtype=np.float16),
+    arrays = {
+        "a": np.zeros((3, 2, 2), dtype=np.float16),
+        "b": np.full((3, 2, 2), 2.0, dtype=np.float16),
+    }
+    np.savez(directory / "features.npz", **arrays)
+    (directory / "meta.json").write_text(
+        json.dumps({"cache_version": CACHE_VERSION, "features_digest": features_digest(arrays)}),
+        encoding="utf-8",
     )
     mean = dataset_mean_vector(tmp_path, "dinov2_vitb14", ["room_0"])
     assert mean.shape == (3,)
@@ -498,6 +504,18 @@ def test_a_pair_scorable_on_one_path_is_not_discarded():
     assert {r["path"] for r in rows} == {PER_POINT}
     assert len(rows) == len(VARIANTS)
 
+    # The row-count arithmetic the forensic population check builds its
+    # expectation from: five rows for a one-path pair, ten for a both-path
+    # pair. The validator's synthetic scene happens to produce only both-path
+    # pairs, so this identity is pinned here where a one-path geometry can be
+    # forced, rather than trusted to a fixture that never exercises it.
+    both_geometry, both_features = identity_pair()
+    both_rows = evaluate_pair_for_encoder(
+        both_geometry, both_features, both_features, torch.zeros(both_features.shape[0])
+    )
+    assert len(both_rows) == 2 * len(VARIANTS)
+    assert len(rows) == len(VARIANTS)
+
     geometry.per_point_mask[:] = False
     geometry.splat_mask[:] = False
     assert not geometry.scorable
@@ -676,3 +694,65 @@ def test_evaluation_verifies_the_bytes_it_consumes(tmp_path):
     np.savez(path, **tampered)
     with pytest.raises(ValueError, match="features digest"):
         _SceneCache(root, cache_root, ["stub"], manifest.scene, manifest)
+
+
+def test_a_poisoned_feature_cache_cannot_produce_a_mean(tmp_path):
+    """The digest is verified against the bytes the mean consumes.
+
+    mean_vector_cache_digest reads only the metadata, so a features archive
+    rebuilt in place with the same shapes produced a poisoned mean whose
+    provenance repeated the stale digest as if it described these bytes.
+    """
+    from lot.encoders import CACHE_VERSION, cache_dir, features_digest
+    from lot.evaluate import dataset_mean_vector
+
+    directory = cache_dir(tmp_path, "dinov2_vitb14", "room_0")
+    directory.mkdir(parents=True)
+    arrays = {"a": np.full((4, 2, 2), 3.0, dtype=np.float16)}
+    np.savez(directory / "features.npz", **arrays)
+    (directory / "meta.json").write_text(
+        json.dumps({"cache_version": CACHE_VERSION, "features_digest": features_digest(arrays)}),
+        encoding="utf-8",
+    )
+    assert torch.allclose(
+        dataset_mean_vector(tmp_path, "dinov2_vitb14", ["room_0"]), torch.full((4,), 3.0)
+    )
+    # Rebuild the archive alone: same keys, same shapes, other values.
+    np.savez(directory / "features.npz", a=np.full((4, 2, 2), 9.0, dtype=np.float16))
+    with pytest.raises(ValueError, match="rebuilt or modified in place"):
+        dataset_mean_vector(tmp_path, "dinov2_vitb14", ["room_0"])
+
+
+def test_a_replaced_mean_vector_file_is_refused(tmp_path):
+    """Provenance over the inputs cannot see the output replaced in place.
+
+    A same-shape overwrite of the .npy beside an intact .json was accepted, and
+    the floor and the centering statistic moved silently. The record now binds
+    the vector's own bytes.
+    """
+    from lot.encoders import CACHE_VERSION, cache_dir, features_digest
+    from lot.evaluate import load_or_build_mean_vector
+
+    directory = cache_dir(tmp_path / "cache", "dinov2_vitb14", "room_0")
+    directory.mkdir(parents=True)
+    arrays = {"a": np.full((4, 2, 2), 3.0, dtype=np.float16)}
+    np.savez(directory / "features.npz", **arrays)
+    (directory / "meta.json").write_text(
+        json.dumps(
+            {
+                "cache_version": CACHE_VERSION,
+                "features_digest": features_digest(arrays),
+                "weights_fingerprint": "abc",
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    first = load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)
+    # Overwrite the vector with one of the same shape and dtype.
+    poisoned = first.numpy().copy()
+    poisoned[:] = 99.0
+    with open(out / "mean_vector_dinov2_vitb14.npy", "wb") as handle:
+        np.save(handle, poisoned)
+    with pytest.raises(ValueError, match="has been replaced"):
+        load_or_build_mean_vector(tmp_path / "cache", "dinov2_vitb14", ["room_0"], out)

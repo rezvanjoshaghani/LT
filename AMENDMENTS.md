@@ -225,6 +225,17 @@ checkpoint bytes are served from an unversioned URL and its loader records
 weights_revision as "unpinnable: ..." while pinning the hub ref it can pin.
 A declared impossibility is provenance; an unset variable is not.
 
+Tightened the same day: a pin is a full 40-hex commit hash, validated
+positively at every gate, the encoder loaders, the caching job, and the
+reporting layer. The first version listed the bad strings instead, and a
+blocklist accepts everything it did not think of: "main" passed it, and a
+branch name is a moving ref, the opposite of a pin wearing the shape of one.
+Each sidecar's provenance must also cover exactly the encoders its run
+declares, because an empty mapping exists, passes a presence check, and gates
+nothing. The mean vector's record now binds the vector's own bytes and its
+build verifies each archive against the digest recorded at write time, closing
+the two in-place replacements that input-side provenance cannot see.
+
 ---
 
 ## Post-freeze

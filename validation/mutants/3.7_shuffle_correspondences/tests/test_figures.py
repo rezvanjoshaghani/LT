@@ -873,3 +873,44 @@ def test_unpinned_provenance_refuses_the_report(tmp_path):
     clean_dir = tmp_path / "eval_clean"
     write_rows(clean_dir / "room_0.parquet", population(scenes=1, pairs=4), run_meta("room_0"))
     assert read_eval_dir(clean_dir)
+
+
+def test_a_branch_name_is_not_a_pin(tmp_path):
+    """'main' passed the blocklist, and a branch name is a moving ref.
+
+    The rule is positive now: a pin is a full commit hash, or for weights alone
+    the explicit unpinnable declaration. A blocklist accepts everything it did
+    not think of, which is the opposite of what a gate is for.
+    """
+    import copy
+
+    eval_dir = tmp_path / "eval"
+    meta = copy.deepcopy(run_meta("room_0"))
+    meta["cache_provenance"]["dinov2_vitb14"]["code_revision"] = "main"
+    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), meta)
+    with pytest.raises(ValueError, match="without a full pin"):
+        read_eval_dir(eval_dir)
+
+
+def test_provenance_must_cover_the_run(tmp_path):
+    """An empty mapping exists, so the presence check passed it.
+
+    Every downstream loop then iterated nothing and refused nothing: a sidecar
+    with cache_provenance {} sailed past the whole pin apparatus.
+    """
+    import copy
+
+    eval_dir = tmp_path / "eval"
+    meta = copy.deepcopy(run_meta("room_0"))
+    meta["cache_provenance"] = {}
+    write_rows(eval_dir / "room_0.parquet", population(scenes=1, pairs=4), meta)
+    with pytest.raises(ValueError, match="gates nothing"):
+        read_eval_dir(eval_dir)
+
+    # And provenance for a different encoder set than the run declares.
+    partial_dir = tmp_path / "eval_partial"
+    meta = copy.deepcopy(run_meta("room_0"))
+    meta["encoders"] = ["dinov2_vitb14", "vggt_1b"]
+    write_rows(partial_dir / "room_0.parquet", population(scenes=1, pairs=4), meta)
+    with pytest.raises(ValueError, match="gates nothing"):
+        read_eval_dir(partial_dir)

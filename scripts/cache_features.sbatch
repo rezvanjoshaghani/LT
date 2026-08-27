@@ -72,9 +72,16 @@ mkdir -p "$TORCH_HOME" "$HF_HOME"
 # anyway. Failing before the GPU allocation does any work is the cheap place.
 # scripts/pin_encoder_revisions.py resolves both values.
 for VAR in LOT_DINOV2_REVISION LOT_VGGT_REVISION; do
-    if [ -z "${!VAR:-}" ]; then
+    VALUE="${!VAR:-}"
+    if [ -z "$VALUE" ]; then
         echo "$VAR is not set. PROTOCOL locks the encoders; resolve the pins" >&2
         echo "first with: python scripts/pin_encoder_revisions.py" >&2
+        exit 1
+    fi
+    if ! [[ "$VALUE" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "$VAR='$VALUE' is not a full 40-hex commit hash. A branch or tag" >&2
+        echo "name is a moving ref, not a pin; resolve the commit with" >&2
+        echo "  python scripts/pin_encoder_revisions.py" >&2
         exit 1
     fi
 done

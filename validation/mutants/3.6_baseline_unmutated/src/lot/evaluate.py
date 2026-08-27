@@ -201,13 +201,33 @@ def dataset_mean_vector(
     total: Tensor | None = None
     count = 0
     for scene in sorted(scenes):
+        # The digest is verified against the bytes actually consumed, in the
+        # same pass that consumes them. mean_vector_cache_digest reads only the
+        # metadata, so a features archive rebuilt in place with the same shapes
+        # would have produced a poisoned mean whose provenance record repeated
+        # the stale digest as if it described these bytes. The floor and the
+        # centering statistic would then both have moved in silence, which is
+        # the exact failure the digest exists to catch.
+        meta = load_cache_meta(cache_root, encoder, scene)
         path = cache_dir(cache_root, encoder, scene) / "features.npz"
+        digest = hashlib.blake2b(digest_size=16)
         with np.load(path) as archive:
             for name in sorted(archive.files):
-                values = torch.from_numpy(archive[name]).to(torch.float32)
+                raw = archive[name]
+                digest.update(name.encode("utf-8"))
+                digest.update(np.ascontiguousarray(raw).tobytes())
+                values = torch.from_numpy(raw).to(torch.float32)
                 per_frame = values.reshape(values.shape[0], -1).mean(dim=1)
                 total = per_frame if total is None else total + per_frame
                 count += 1
+        if digest.hexdigest() != meta.get("features_digest"):
+            raise ValueError(
+                f"{encoder} / {scene}: features digest {digest.hexdigest()} does "
+                f"not match the {meta.get('features_digest')} recorded when the "
+                "cache was written; the archive has been rebuilt or modified in "
+                "place, and a mean built from it would move the Mean-Feature "
+                "floor and the centering statistic together"
+            )
     if total is None or count == 0:
         raise ValueError(f"no cached features for {encoder} in {list(scenes)}")
     return total / count
@@ -241,6 +261,15 @@ def mean_vector_cache_digest(cache_root: Path, encoder: str, scenes: Sequence[st
     return digest.hexdigest()
 
 
+def vector_digest(array: np.ndarray) -> str:
+    """Content hash of the stored mean vector: dtype, shape, then bytes."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(array.dtype).encode("utf-8"))
+    digest.update(str(array.shape).encode("utf-8"))
+    digest.update(np.ascontiguousarray(array).tobytes())
+    return digest.hexdigest()
+
+
 def load_or_build_mean_vector(
     cache_root: Path, encoder: str, scenes: Sequence[str], out_dir: Path
 ) -> Tensor:
@@ -270,16 +299,30 @@ def load_or_build_mean_vector(
     }
     if path.exists() and record.exists():
         stored = json.loads(record.read_text(encoding="utf-8"))
+        expected_digest = stored.pop("vector_digest", None)
         if stored != provenance:
             raise ValueError(
                 f"{path} was built for {stored}, this run needs {provenance}; "
                 "delete it rather than reusing a floor built from other frames"
             )
-        vector = torch.from_numpy(np.load(path)).to(torch.float32)
+        loaded = np.load(path)
+        vector = torch.from_numpy(loaded).to(torch.float32)
         if vector.dim() != 1 or vector.numel() == 0:
             raise ValueError(f"{path} is not a [C] vector, got {tuple(vector.shape)}")
+        # The record binds the vector's own bytes, not only what it was built
+        # from. Provenance over the inputs cannot see the output file replaced
+        # in place: a same-shape overwrite of the .npy beside an intact .json
+        # was accepted, and the floor and centering statistic moved silently.
+        found = vector_digest(loaded)
+        if expected_digest != found:
+            raise ValueError(
+                f"{path} holds a vector whose digest {found} does not match the "
+                f"{expected_digest} recorded when it was built; the file has "
+                "been replaced. Delete both it and its provenance record"
+            )
         return vector
     mean = dataset_mean_vector(cache_root, encoder, scenes)
+    provenance = {**provenance, "vector_digest": vector_digest(mean.numpy())}
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = f".{os.getpid()}.partial"
     tmp = path.with_name(path.name + stamp)
@@ -942,6 +985,8 @@ def evaluate_scene(
     cache = _SceneCache(scene_root, cfg.cache_root, cfg.encoders, scene, manifest)
     rows: list[dict[str, Any]] = []
     dropped_unscorable = 0
+    pairs_scored_both_paths = 0
+    pairs_scored_one_path = 0
     neighbor_omitted = 0
     universe_size = 0
     try:
@@ -990,6 +1035,14 @@ def evaluate_scene(
                 # it is dropped and counted here instead.
                 dropped_unscorable += 1
                 continue
+            # A pair scorable on one path yields five rows, not ten, and the
+            # forensic population check needs that split recorded independently
+            # of the rows it audits: derived from the rows, a silently dropped
+            # pair shrank the expected and the observed count together.
+            if geometry.per_point_mask.any() and geometry.splat_mask.any():
+                pairs_scored_both_paths += 1
+            else:
+                pairs_scored_one_path += 1
             base = pair.as_row()
             base["covisible_fraction"] = geometry.covisible_fraction
             base["parallax"] = geometry.parallax
@@ -1009,6 +1062,8 @@ def evaluate_scene(
         "pairs_available": len(all_pairs),
         "pairs_considered": len(pairs),
         "pairs_dropped_unscorable": dropped_unscorable,
+        "pairs_scored_both_paths": pairs_scored_both_paths,
+        "pairs_scored_one_path": pairs_scored_one_path,
         "neighbor_patch_omitted_records": neighbor_omitted,
         "universe_size": universe_size,
         "encoders": list(cfg.encoders),

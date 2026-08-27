@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -174,6 +175,27 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
             f"content ({any_meta.get('analysis_config_digest')}), so an edit to it "
             "cannot hide here, but source edits are not covered"
         )
+    # Provenance must cover the run before its contents can mean anything.
+    # The required-fields check above asks that cache_provenance exists, and an
+    # empty mapping exists: every loop below would then iterate nothing and
+    # refuse nothing, so a sidecar with cache_provenance: {} sailed past the
+    # whole pin apparatus. Each sidecar must name exactly the encoders its run
+    # declares, no more, no fewer.
+    for stem, meta in sidecars.items():
+        declared = set(meta.get("encoders") or ())
+        if not declared:
+            raise ValueError(
+                f"{eval_dir}: {stem} declares no encoders; an empty run cannot "
+                "be shown to be the run the directory claims"
+            )
+        covered = set((meta.get("cache_provenance") or {}))
+        if covered != declared:
+            raise ValueError(
+                f"{eval_dir}: {stem} carries cache provenance for "
+                f"{sorted(covered) or 'no encoders'} but the run declares "
+                f"{sorted(declared)}. Provenance that does not cover the run "
+                "gates nothing"
+            )
     # Every scene must have been evaluated from the same encoder, and an
     # encoder's identity is the whole triple: the weight bytes, the recorded
     # weights revision, and the inference implementation. Comparing the
@@ -199,10 +221,12 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
             "of these is a mixture"
         )
     # PROTOCOL locks the encoders, so unpinned provenance refuses the report
-    # rather than annotating it. The distinction that matters: "unpinnable: ..."
-    # is a declaration that there is nothing to pin, made by a loader that
-    # pinned everything it could, and it is accepted; "unpinned" and "unknown"
-    # mean nobody pinned what could have been, and they are not.
+    # rather than annotating it. The rule is positive: a pin is a full commit
+    # hash, or for weights alone the explicit "unpinnable: ..." declaration of
+    # a loader that pinned everything it could. An earlier version listed the
+    # bad strings instead, and a blocklist accepts everything it did not think
+    # of: "main" passed it, and a branch name is a moving ref, which is the
+    # opposite of a pin wearing the shape of one.
     not_pinned = sorted(
         {
             f"{encoder} ({field}={value!r})"
@@ -212,7 +236,7 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
                 ("weights_revision", entry.get("weights_revision")),
                 ("code_revision", entry.get("code_revision")),
             )
-            if value in (None, "", "unpinned", "unknown", "n/a", "absent")
+            if not is_pinned_revision(field, value)
         }
     )
     if not_pinned:
@@ -220,10 +244,12 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
             "results were produced from encoders without a full pin: "
             + ", ".join(not_pinned)
             + ". PROTOCOL locks the encoders, so what a run used must be "
-            "retrievable before it can be reported. DINOv2's checkpoint bytes "
-            "are declared unpinnable and that declaration is accepted; its hub "
-            "ref and both VGGT revisions are pinnable and required. Resolve "
-            "them with scripts/pin_encoder_revisions.py and re-cache"
+            "retrievable before it can be reported. A pin is a full commit "
+            "hash; a branch or tag name is a moving ref and is not one. "
+            "DINOv2's checkpoint bytes are declared unpinnable and that "
+            "declaration is accepted; its hub ref and both VGGT revisions are "
+            "pinnable and required. Resolve them with "
+            "scripts/pin_encoder_revisions.py and re-cache"
         )
 
     # The config that reads a run must be the config that produced it, in every
@@ -263,6 +289,25 @@ def read_eval_dir(eval_dir: Path, config: AnalysisConfig | None = None) -> list[
     for stem in sorted(tables):
         rows.extend(tables[stem].to_pylist())
     return rows
+
+
+FULL_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def is_pinned_revision(field: str, value: Any) -> bool:
+    """Whether a recorded revision is actually a pin.
+
+    A pin is a full 40-hex commit hash: immutable, so the thing it names can be
+    retrieved. A branch or tag name resolves to something today and something
+    else after a push, which is the opposite property. weights_revision may
+    instead carry the "unpinnable: ..." declaration, made by a loader that
+    pinned everything it could about an unversioned checkpoint URL.
+    """
+    if not isinstance(value, str):
+        return False
+    if FULL_COMMIT_SHA.fullmatch(value):
+        return True
+    return field == "weights_revision" and value.startswith("unpinnable:")
 
 
 def neighbor_omitted_total(rows: Sequence[dict[str, Any]]) -> int:

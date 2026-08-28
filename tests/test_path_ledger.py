@@ -138,3 +138,27 @@ def test_spearman_on_known_orderings():
     assert spearman(x, x) == pytest.approx(1.0)
     assert spearman(x, -x) == pytest.approx(-1.0)
     assert abs(spearman(x, np.array([2.0, 1.0, 4.0, 3.0]))) < 1.0
+
+
+def test_the_preflight_verdict_table_states_what_was_checked(tmp_path):
+    """The preflight is reported as facts with how each was established.
+
+    A verdict nobody can read is a verdict nobody checked, and the distinction
+    that matters most is which lines are code facts and which are measurements.
+    """
+    from lot.path_ledger import preflight_verdict_table
+
+    config_path, _ = run_and_write(tmp_path)
+    out = tmp_path / "ledger"
+    ledger_scene(config_path, SCENE, out, ANALYSIS)
+    summary = report(out, ANALYSIS)
+    text = preflight_verdict_table(summary, ANALYSIS)
+
+    for line in ("atomic unit, per-point", "atomic unit, splat",
+                 "sum(a_j) = sum(b_j) = 1", "a_j equals b_j",
+                 "target vectors equal", "No-Warp source equal",
+                 "Random-Patch source equal", "common support by sample_id",
+                 "closure", "reconstruction"):
+        assert line in text, line
+    assert "[bit level]" in text and "[measured]" in text and "[code]" in text
+    assert f"{ANALYSIS.ledger_recon_tol:g}" in text

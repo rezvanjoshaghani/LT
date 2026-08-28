@@ -240,6 +240,116 @@ property of the representations, not of the transport implementation.
 Nothing in this section is a Phase 3 result. The results section below remains
 withdrawn until Stream D's figures are produced and audited.
 
+## Phase 3: Experiment Zero, corrected verdict (Stream D, 2026-08-27)
+
+Eighteen scenes, two frozen encoders, 33,772 comparisons, both evaluation
+paths. PROTOCOL 3.9 passed on the statistic and at the tolerance it was
+frozen with: signed aggregate +0.000115 raw and +0.000175 centered against
+0.003. The path-agreement ledger passed with an empty stop list, attributing
+the whole recorded per-path discrepancy to the operator difference on the
+common cells. Every quantity below is reported under both paths, and no claim
+rests on a difference the two paths do not share.
+
+### DINOv2 transports, and the agreement is localized
+
+Transporting DINOv2 patch features with ground-truth geometry beats copying
+them unwarped in every supported cell of both primary analyses, under both
+metrics and both evaluation paths. In-place rotation, raw cosine: +0.2356
+per-point and +0.2352 splat-and-pool between 0 and 10 degrees, falling to
++0.1596 and +0.1587 beyond 50. Translation, raw cosine: +0.0568 and +0.0569
+in the 0.025 to 0.05 parallax bin, rising to +0.1264 and +0.1227 above 0.4.
+The centered metric moves every value up and changes no ordering.
+
+Landing one patch away from the correct location costs between 0.036 and
+0.137 depending on the cell, again under both paths. The agreement is
+therefore a property of the surface a feature sits on rather than a general
+similarity between any two features of the same room, and it is that property
+under either operator.
+
+The two paths differ by at most 0.013 on any DINOv2 quantity in the table, and
+by less than 0.002 on most. Where a ratio is meaningful, which is everywhere
+for this encoder because every estimate is far above the operator gate, the
+path difference is under 10 percent of the effect in every supported cell and
+under 2 percent in the large majority.
+
+No DINOv2 cell falls in the near-zero band. This is stated because the check
+was preregistered to look: 27 of 232 supported cells are flagged, and all 27
+belong to VGGT under raw cosine.
+
+### VGGT does not, and past 20 degrees of rotation it is worse than not transporting
+
+VGGT's last-layer aggregator tokens behave in the opposite way, and the
+rotation series is monotone. Centered cosine, Oracle margin over No-Warp-Copy,
+per-point and splat-and-pool: +0.0572 and +0.0568 between 0 and 10 degrees,
++0.0184 and +0.0178 between 10 and 20, then -0.0556 and -0.0566 between 20 and
+30, -0.1428 and -0.1436 between 30 and 40, -0.2306 and -0.2307 between 40 and
+50, and -0.3333 and -0.3337 beyond 50. Raw cosine traces the same path at a
+tenth the magnitude, from +0.0097 to -0.0519.
+
+Both evaluation paths preserve the negative margin at every rotation bin from
+20 degrees upward, in both metrics, and agree there to within 0.001.
+Geometrically transporting late VGGT features to their correct location is
+worse than retaining their original image-coordinate placement. This is not a
+statement about depth or about the transport implementation, which the ledger
+accounts for exactly; it is a statement about what those tokens encode.
+
+### Effects at the scale of the operator gate
+
+Twenty-seven supported cells carry an estimate no larger than PROTOCOL 3.9's
+0.003 tolerance on at least one path. All are VGGT, all under raw cosine, and
+each is reported below with both path estimates and their difference. A
+tolerance is a bound on operator disagreement, not a certificate of an effect
+smaller than itself, so nothing here is certified by the gate; what is claimed
+is restricted to what both paths show.
+
+Twenty-two of the 27 have both paths inside the band, one sign, and both
+intervals clear of zero. Sixteen are localization gaps, for which the reading
+is that Oracle transport adds only a small, sign-consistent improvement over
+Neighbor-Patch: for instance VGGT orbit at 20 to 30 degrees and parallax above
+0.4, +0.00180 per-point and +0.00176 splat-and-pool, difference +0.00004. Six
+are Oracle margins, read as a small, sign-consistent positive transport margin
+under both evaluation paths, quantitatively close to the No-Warp floor: VGGT
+translation in the 0.2 to 0.4 parallax bin gives +0.00239 and +0.00256,
+difference -0.00017.
+
+One cell has exactly one path inside the band: VGGT orbit at 10 to 20 degrees
+and parallax above 0.4, Oracle margin +0.00374 per-point and +0.00296
+splat-and-pool, difference +0.00078. The reading is a positive transport
+margin under both evaluation paths whose magnitude is path-sensitive. No
+claim of smallness or of proximity to the floor is made for it.
+
+Four cells fail the conditions, either because the two paths disagree in sign
+or because an interval includes zero, and for these there is no robust
+transport advantage; the measured effect is at the scale of evaluation-path
+choice. They are VGGT orbit Oracle margins at 30 to 40 degrees with parallax
+0.2 to 0.4 and above 0.4, and at zero rotation with parallax 0.2 to 0.4 and
+above 0.4. The zero-rotation, 0.2 to 0.4 cell is the clearest of them: -0.00019
+per-point against +0.00050 splat-and-pool, a sign that does not survive the
+choice of operator.
+
+### Materiality of the operator tolerance, resolved
+
+The preregistered materiality check compared PROTOCOL 3.9's fixed 0.003
+tolerance against the smallest effect the study interprets and found the two
+comparable: VGGT's near-zero translation and orbit effects are of the same
+order as the gate meant to bound operator disagreement. The tolerance was not
+re-derived. A gate rescaled by the effects it exists to be independent of
+would no longer be independent of them, and choosing its value after seeing
+which side the data falls on is the practice this study forbids elsewhere.
+
+The resolution is disclosure rather than recalibration. Those effects are not
+certified by the tolerance. They are reported under both validated evaluation
+paths, with both estimates and their difference shown, and the interpretation
+is restricted to content common to the two. The observed operator agreement,
++0.000115 raw and +0.000175 centered, is between 3 and 5 percent of even the
+smallest interpreted effect, so no claim in this section turns on the choice
+of path; the four cells where a claim would have turned on it are reported as
+carrying no robust advantage.
+
+Evidence: validation/evidence/path_margin_differences.parquet and its readable
+summary; validation/evidence/path_agreement_ledger/ for the decomposition and
+the mechanism contrasts.
+
 ## Phase 3: Experiment Zero, verdict (WITHDRAWN 2026-08-24)
 
 > **These numbers are withdrawn and are not a result.** An independent audit

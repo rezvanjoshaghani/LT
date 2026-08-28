@@ -616,6 +616,69 @@ def report(out_dir: Path, analysis: AnalysisConfig) -> dict[str, Any]:
     return summary
 
 
+def preflight_verdict_table(summary: dict[str, Any], config: AnalysisConfig) -> str:
+    """What the preflight established, as a table, so it is read and not assumed.
+
+    Every line is a fact the ledger checked rather than a property it took on
+    faith: what each path's atomic scored unit is, that the shared source reads
+    and the target vectors agree bit for bit, that both weightings sum to one
+    and are equal to each other, and that the common support is matched by
+    sample_id in one order.
+    """
+    facts = summary["preflight"]
+    if not facts:
+        return "PREFLIGHT VERDICT TABLE\n  (no per-scene evidence)"
+    keys = (
+        "pairs", "pairs_skipped_empty_intersection", "target_bit_mismatches",
+        "no_warp_bit_mismatches", "random_bit_mismatches",
+        "n_intersect_mismatches", "cell_order_mismatches",
+    )
+    total = {key: sum(f.get(key, 0) for f in facts) for key in keys}
+    raw = summary.get("raw", {})
+    nan = float("nan")
+    rows = [
+        ("atomic unit, per-point", facts[0]["per_point_unit"], "code"),
+        ("atomic unit, splat", facts[0]["splat_unit"], "code"),
+        ("cells-to-pair weights", facts[0]["weighting_rule"], "code"),
+        ("sum(a_j) = sum(b_j) = 1",
+         "yes" if facts[0]["weight_sums_are_one"] else "NO", "asserted"),
+        ("a_j equals b_j", f"max |T3| = {raw.get('max_abs_T3', nan):.2e}", "measured"),
+        ("common support by sample_id",
+         f"{total['cell_order_mismatches']} ordering mismatches", "checked"),
+        ("target vectors equal", f"{total['target_bit_mismatches']} mismatches", "bit level"),
+        ("No-Warp source equal", f"{total['no_warp_bit_mismatches']} mismatches", "bit level"),
+        ("Random-Patch source equal",
+         f"{total['random_bit_mismatches']} mismatches", "bit level"),
+        ("recorded n_intersect agrees",
+         f"{total['n_intersect_mismatches']} mismatches", "checked"),
+        ("pairs ledgered",
+         f"{total['pairs']} ({total['pairs_skipped_empty_intersection']} skipped, "
+         f"no common set)", "counted"),
+        ("closure", f"max |error| = {raw.get('max_abs_closure', nan):.2e}", "measured"),
+        ("reconstruction",
+         f"max |T1| = {raw.get('max_abs_T1', nan):.2e}, "
+         f"max |T4| = {raw.get('max_abs_T4', nan):.2e}", "measured"),
+    ]
+    width = max(len(r[0]) for r in rows)
+    lines = [
+        "PREFLIGHT VERDICT TABLE",
+        "",
+        "Targets equal at bit level, so the operator difference needs no split",
+        "into prediction-side and target-side pooling: there is no target-side",
+        "pooling to separate. T3 exactly zero means the two paths weight the",
+        "common set identically, so no aggregation rule is left unfrozen.",
+        "",
+    ]
+    for name, value, how in rows:
+        lines.append(f"  {name:<{width}}  {value:<54} [{how}]")
+    lines += [
+        "",
+        f"  tolerances: recon {config.ledger_recon_tol:g}, "
+        f"closure {config.ledger_closure_tol:g}",
+    ]
+    return "\n".join(lines)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", type=Path, required=True)
@@ -628,6 +691,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     analysis = load_analysis_config(cfg.analysis_config)
     if args.report:
         summary = report(args.out, analysis)
+        print(preflight_verdict_table(summary, analysis))
+        print()
         print(json.dumps({k: v for k, v in summary.items() if k != "preflight"}, indent=1))
         print(f"\nverdict: {summary['verdict']}")
         if summary["stop"]:

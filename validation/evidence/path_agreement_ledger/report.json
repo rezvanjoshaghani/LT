@@ -1,0 +1,466 @@
+{
+ "stop": [],
+ "preflight": [
+  {
+   "scene": "apartment_0",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 930,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "apartment_1",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 956,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "apartment_2",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 962,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "frl_apartment_0",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 938,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "frl_apartment_1",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 940,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "frl_apartment_2",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 916,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "frl_apartment_3",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 1012,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "frl_apartment_4",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 897,
+   "pairs_skipped_empty_intersection": 6,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "frl_apartment_5",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 923,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "hotel_0",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 950,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "office_0",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 918,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "office_1",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 953,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "office_2",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 952,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "office_3",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 899,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "office_4",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 912,
+   "pairs_skipped_empty_intersection": 3,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "room_0",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 985,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "room_1",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 917,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  },
+  {
+   "scene": "room_2",
+   "per_point_unit": "one sample per eligible target patch center",
+   "splat_unit": "one pooled target cell",
+   "weighting_rule": "uniform 1/n over the common cell set, both paths",
+   "weight_sums_are_one": true,
+   "pairs": 926,
+   "pairs_skipped_empty_intersection": 0,
+   "target_bit_mismatches": 0,
+   "no_warp_bit_mismatches": 0,
+   "random_bit_mismatches": 0,
+   "n_intersect_mismatches": 0,
+   "cell_order_mismatches": 0
+  }
+ ],
+ "raw": {
+  "pairs": 33772,
+  "max_abs_T3": 0.0,
+  "max_abs_closure": 7.36464654451513e-16,
+  "signed_aggregate_T2": 0.00011504246060902725,
+  "mean_abs_T2": 0.003036729801900583,
+  "quantiles_abs_T2": {
+   "50": 0.000717042753602559,
+   "90": 0.011641518177353195,
+   "99": 0.02164752299453895
+  },
+  "max_abs_T1": 1.998187748597502e-07,
+  "max_abs_T4": 6.30880331087269e-07,
+  "by_rotation_bin": {
+   "0-10": {
+    "pairs": 7262,
+    "signed": 0.0004246960419256183,
+    "mean_abs": 0.003082147578534925
+   },
+   "10-20": {
+    "pairs": 5846,
+    "signed": -0.00016449784831260302,
+    "mean_abs": 0.0026456577169145555
+   },
+   "20-30": {
+    "pairs": 4386,
+    "signed": 4.827625217269895e-05,
+    "mean_abs": 0.002746247172843383
+   },
+   "30-40": {
+    "pairs": 3380,
+    "signed": 0.0004844575821904223,
+    "mean_abs": 0.0026588959308440005
+   },
+   "40-50": {
+    "pairs": 2052,
+    "signed": 0.000769485680879061,
+    "mean_abs": 0.002526205971568825
+   },
+   "50+": {
+    "pairs": 1212,
+    "signed": 0.0006238161412696279,
+    "mean_abs": 0.0008194885973568842
+   },
+   "zero": {
+    "pairs": 9634,
+    "signed": -0.0002513525332941666,
+    "mean_abs": 0.0038922840939779736
+   }
+  }
+ },
+ "centered": {
+  "pairs": 33772,
+  "max_abs_T3": 0.0,
+  "max_abs_closure": 6.634707431889264e-16,
+  "signed_aggregate_T2": 0.0001745653796424161,
+  "mean_abs_T2": 0.004174468494114982,
+  "quantiles_abs_T2": {
+   "50": 0.0013914360405878545,
+   "90": 0.012121183475411109,
+   "99": 0.027615778043216042
+  },
+  "max_abs_T1": 1.9121762739882087e-07,
+  "max_abs_T4": 2.3173056751257803e-07,
+  "by_rotation_bin": {
+   "0-10": {
+    "pairs": 7262,
+    "signed": 0.000506347767664883,
+    "mean_abs": 0.00419409615454141
+   },
+   "10-20": {
+    "pairs": 5846,
+    "signed": -0.00017095464832898012,
+    "mean_abs": 0.0036206315551842124
+   },
+   "20-30": {
+    "pairs": 4386,
+    "signed": 0.00016456336666361085,
+    "mean_abs": 0.0037682792658809455
+   },
+   "30-40": {
+    "pairs": 3380,
+    "signed": 0.0008738626652937273,
+    "mean_abs": 0.003856568061968056
+   },
+   "40-50": {
+    "pairs": 2052,
+    "signed": 0.001051019096120641,
+    "mean_abs": 0.003951993627948102
+   },
+   "50+": {
+    "pairs": 1212,
+    "signed": -9.444356681742121e-05,
+    "mean_abs": 0.0011353169260644228
+   },
+   "zero": {
+    "pairs": 9634,
+    "signed": -0.0002594904432742084,
+    "mean_abs": 0.005221926893172008
+   }
+  }
+ },
+ "mechanism": {
+  "dinov2_vitb14/raw": {
+   "boundary_contrast": {
+    "difference": 0.0014178141976437086,
+    "ci_low": 0.0008980556591400237,
+    "ci_high": 0.001986470123187206,
+    "replicates": 1000,
+    "n_group": 12825753,
+    "n_rest": 2063656,
+    "difference_over_level": 0.10924603703304485
+   },
+   "norm_q1_minus_q4": {
+    "difference": -5.6450225347710534e-05,
+    "ci_low": -0.0007249326288385105,
+    "ci_high": 0.0004579534612161554,
+    "replicates": 1000,
+    "n_group": 3722345,
+    "n_rest": 3722354,
+    "difference_over_level": -0.004349627348286328
+   },
+   "mean_abs_c": 0.012978175100437252,
+   "cells": 14889409,
+   "spearman_quartile_vs_scene_mean": -0.02092090946239317
+  },
+  "dinov2_vitb14/centered": {
+   "boundary_contrast": {
+    "difference": 0.0018275347143549576,
+    "ci_low": 0.0012491024380954408,
+    "ci_high": 0.002455769652629655,
+    "replicates": 1000,
+    "n_group": 12825753,
+    "n_rest": 2063656,
+    "difference_over_level": 0.12160234840804095
+   },
+   "norm_q1_minus_q4": {
+    "difference": 0.00013366980418322467,
+    "ci_low": -0.0005821890120292196,
+    "ci_high": 0.00070927502758846,
+    "replicates": 1000,
+    "n_group": 3722345,
+    "n_rest": 3722354,
+    "difference_over_level": 0.00889425627444799
+   },
+   "mean_abs_c": 0.015028778130358147,
+   "cells": 14889409,
+   "spearman_quartile_vs_scene_mean": -0.029289273247350436
+  },
+  "vggt_1b/raw": {
+   "boundary_contrast": {
+    "difference": 0.0005048399965860242,
+    "ci_low": 0.00037470705888759337,
+    "ci_high": 0.000654898027116665,
+    "replicates": 1000,
+    "n_group": 12825753,
+    "n_rest": 2063656,
+    "difference_over_level": 0.40553830243312144
+   },
+   "norm_q1_minus_q4": {
+    "difference": -0.0006691534340019312,
+    "ci_low": -0.0008498178729701643,
+    "ci_high": -0.0005192818235937053,
+    "replicates": 1000,
+    "n_group": 3722349,
+    "n_rest": 3722357,
+    "difference_over_level": -0.5375313951500597
+   },
+   "mean_abs_c": 0.0012448639094189602,
+   "cells": 14889409,
+   "spearman_quartile_vs_scene_mean": 0.5505187889961174
+  },
+  "vggt_1b/centered": {
+   "boundary_contrast": {
+    "difference": 0.002100875973081206,
+    "ci_low": 0.0014869912620166868,
+    "ci_high": 0.002835084327053584,
+    "replicates": 1000,
+    "n_group": 12825753,
+    "n_rest": 2063656,
+    "difference_over_level": 0.30503820409480276
+   },
+   "norm_q1_minus_q4": {
+    "difference": 0.0004025432714157848,
+    "ci_low": -0.0003699011305607107,
+    "ci_high": 0.0010325869498178947,
+    "replicates": 1000,
+    "n_group": 3722349,
+    "n_rest": 3722357,
+    "difference_over_level": 0.05844756099667738
+   },
+   "mean_abs_c": 0.006887255251569326,
+   "cells": 14889409,
+   "spearman_quartile_vs_scene_mean": -0.18589722408012216
+  }
+ },
+ "cutpoints": {
+  "dinov2_vitb14": [
+   38.613685607910156,
+   40.59421920776367,
+   42.80286407470703
+  ],
+  "vggt_1b": [
+   33.59745407104492,
+   37.87461471557617,
+   43.22406005859375
+  ]
+ },
+ "verdict": "PASS"
+}

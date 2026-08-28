@@ -1,5 +1,10 @@
 # Findings
 
+> Frozen at commit d4ed1017bd2daca2871da28900b5b4a6a7ff92b6. The four
+> normative artifacts and their sha256 values are recorded in FREEZE.md.
+> Everything before that commit is protocol formation and repair;
+> everything after it is execution against frozen rules.
+
 Running record of empirical findings, in phase order. Anomalies are results
 in this project. Each entry names the evidence trail.
 

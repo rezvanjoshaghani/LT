@@ -162,10 +162,83 @@ tolerances are frozen in configs/analysis.yaml. The materiality ratio is
 recomputed against the corrected margins when they exist and flagged for
 amendment if it exceeds roughly 10 percent.
 
-The ledger's attribution paragraph, naming the measured terms and any
-mechanism the preregistered contrasts support, is added here from the ledger's
-report once it passes on the corrected run. Nothing in this section is a
-result; the results section below remains withdrawn until Stream D reports.
+### Path agreement, attributed (ledger verdict PASS, 2026-08-27)
+
+The ledger ran over all 33,772 comparisons of the corrected run, both metrics,
+and its stop list is empty. Evidence, cut points, and the report are under
+validation/evidence/path_agreement_ledger/.
+
+The preflight established that the two paths score the same object. Every read
+that is a lookup into the same cached array agrees bit for bit across the
+paths: the targets, the No-Warp-Copy source, and the Random-Patch source. The
+targets being bit identical means the operator difference needs no split into
+prediction-side and target-side pooling, because there is no target-side
+pooling to separate. The per-point unit is one sample per eligible target patch
+centre and the splat unit is one pooled target cell, so the common set is in
+one-to-one correspondence and both paths average it uniformly at one over n.
+
+The decomposition is exact rather than approximate. The four-term identity
+closes to 7e-16, which is float64 epsilon. The weighting gap T3 is exactly
+zero, so there is no unfrozen aggregation rule to document. Reconstruction of
+the recorded scores from their own stored inputs is accurate to 2e-7 on the
+per-point path and 6e-7 on the splat path, five hundred times inside the frozen
+1e-4 tolerance, so the recorded numbers are what the recomputation says they
+are. The whole of the recorded discrepancy therefore falls on T2, the operator
+difference on the common cells.
+
+Signed bias at the aggregation level every reported number uses is negligible:
++0.000115 raw and +0.000175 centered, against a 0.003 tolerance. The two
+operators do not disagree about the answer. What they carry is dispersion:
+mean per-pair absolute difference 0.0030 raw and 0.0042 centered, median 0.0007
+and 0.0014, so the typical pair agrees several times better than the tolerance
+and a heavy tail lifts the mean. The dispersion falls as the common set grows,
+which is the signature of per-cell noise averaging down rather than of a
+systematic offset.
+
+Dispersion tracks occlusion, not rotation. Pairs at zero rotation, which are
+the translation programme at its full range of baselines, carry the largest
+dispersion at 0.0039 raw. Pairs beyond 50 degrees, which are in-place rotation
+with no baseline at all, carry the smallest at 0.0008. Rotation enters only
+where the orbit programme ties it to baseline.
+
+Two preregistered mechanism contrasts were run on the per-cell operator
+difference, with scene-level bootstrap intervals, and both are reported here
+whatever they showed.
+
+The boundary contrast is supported for both encoders and both metrics, with
+every interval excluding zero. Cells whose bilinear read taps context patches
+whose median depths differ by more than the co-visibility tolerance show a
+larger operator difference than cells whose read footprint is flat: 11 percent
+of the level for DINOv2 raw, 12 percent centered, 41 percent for VGGT raw and
+31 percent centered. The flag is loose by construction, since it fires on any
+depth variation across the four tapped patches and 86 percent of cells trip it
+in furnished rooms, so the statement it supports is that a read footprint
+spanning depth variation disagrees more than a flat one, not that sharp
+occlusion edges specifically do. The mechanism is nonetheless the expected one:
+the per-point read is bilinear over patch vectors with no depth test, while the
+pooled read composites only z-buffer survivors, so the two answer differently
+exactly where the footprint straddles surfaces.
+
+The norm contrast is absent for three of the four cases. DINOv2 raw, DINOv2
+centered, and VGGT centered all have intervals spanning zero, and the study
+claims no norm mechanism for them. It is present for VGGT raw alone, where the
+bottom quartile of centered target norm shows an operator difference 54 percent
+below the level, with a Spearman correlation of +0.55 between quartile index
+and scene-level mean. That asymmetry is consistent with the encoder finding
+already on record: VGGT's raw cosine is dominated by a shared direction, so
+cells whose target sits near the global mean give both paths the same nearly
+saturated value and leave nothing to disagree about, while cells with
+distinctive content do not. The contrast is absent under centering, which
+removes that shared direction, and absent for DINOv2, whose centered target
+norms are tightly concentrated and offer little to stratify on.
+
+The per-cell operator difference is an order of magnitude larger for DINOv2
+than for VGGT on the raw metric, 0.0130 against 0.0012, in proportion to how
+sharply each encoder's patch features differ from their neighbours. That is a
+property of the representations, not of the transport implementation.
+
+Nothing in this section is a Phase 3 result. The results section below remains
+withdrawn until Stream D's figures are produced and audited.
 
 ## Phase 3: Experiment Zero, verdict (WITHDRAWN 2026-08-24)
 

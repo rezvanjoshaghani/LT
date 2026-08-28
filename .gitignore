@@ -6,3 +6,9 @@ __pycache__/
 data/
 cache/
 outputs/
+
+# The path-agreement ledger's bulk evidence: about 1.5M cell rows per scene and
+# 384 MB over the run. The report and the cut points are the evidence that has
+# to travel with the repository; the per-scene parquets are regenerable from
+# the run and the committed code, like every other large artifact here.
+validation/evidence/path_agreement_ledger/*.parquet

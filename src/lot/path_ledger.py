@@ -201,9 +201,13 @@ def ledger_scene(
         "cell_order_mismatches": 0,
     }
     ledger_rows: list[dict[str, Any]] = []
+    # One row per common cell per encoder, so this is the largest artifact the
+    # ledger writes: about 1.5M rows per scene and 27M over the run. It carries
+    # only what the mechanism contrasts read. Pair identity, regime and
+    # rotation stay in the ledger file, one row per pair, where they cost
+    # nothing; at one row per cell they were 27M copies of a string each.
     cell_columns: dict[str, list] = {
-        "scene": [], "encoder": [], "context_frame_id": [], "target_frame_id": [],
-        "regime": [], "rotation_deg": [], "c_raw": [], "c_centered": [],
+        "scene": [], "encoder": [], "c_raw": [], "c_centered": [],
         "boundary": [], "centered_norm": [],
     }
 
@@ -325,12 +329,6 @@ def ledger_scene(
                     count = cells.size
                     cell_columns["scene"] += [scene] * count
                     cell_columns["encoder"] += [encoder] * count
-                    cell_columns["context_frame_id"] += [pair.context_frame_id] * count
-                    cell_columns["target_frame_id"] += [pair.target_frame_id] * count
-                    cell_columns["regime"] += [recorded[key_pp]["regime"]] * count
-                    cell_columns["rotation_deg"] += [
-                        float(recorded[key_pp]["rotation_deg"])
-                    ] * count
                     cell_columns["c_raw"] += (q_np - p_np).astype(np.float32).tolist()
                     cell_columns["boundary"] += boundary.astype(bool).tolist()
                     cell_columns["centered_norm"] += norms.astype(np.float32).tolist()
@@ -372,43 +370,81 @@ def spearman(x: np.ndarray, y: np.ndarray) -> float:
 
 
 def scene_bootstrap_contrast(
-    scenes: np.ndarray,
-    values: np.ndarray,
-    in_group: np.ndarray,
-    config: AnalysisConfig,
+    aggregates: dict[str, tuple[float, int, float, int]], config: AnalysisConfig
 ) -> dict[str, float]:
-    """E[values | group] - E[values | not group], with a scene-level interval."""
-    unique = sorted(set(scenes.tolist()))
-    if not in_group.any() or in_group.all():
+    """E[|c| | group] - E[|c| | rest], resampling scenes, from per-scene sums.
+
+    aggregates maps a scene to (sum_in, n_in, sum_rest, n_rest). A replicate
+    draws scenes with replacement and pools their sums, which is exactly the
+    difference of pooled means over the resampled cells that a cell-level
+    implementation would compute, without holding 27M cells in memory.
+    """
+    scenes = sorted(aggregates)
+    sum_in = np.array([aggregates[s][0] for s in scenes], dtype=np.float64)
+    n_in = np.array([aggregates[s][1] for s in scenes], dtype=np.float64)
+    sum_rest = np.array([aggregates[s][2] for s in scenes], dtype=np.float64)
+    n_rest = np.array([aggregates[s][3] for s in scenes], dtype=np.float64)
+    total_in, total_rest = n_in.sum(), n_rest.sum()
+    if total_in == 0 or total_rest == 0:
         # One empty side is a fact about the population, reported as such
         # rather than as a NaN with a warning attached.
         return {
-            "difference": float("nan"),
-            "ci_low": float("nan"),
-            "ci_high": float("nan"),
-            "replicates": 0,
-            "n_group": int(in_group.sum()),
-            "n_rest": int((~in_group).sum()),
+            "difference": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
+            "replicates": 0, "n_group": int(total_in), "n_rest": int(total_rest),
         }
-    point = float(values[in_group].mean() - values[~in_group].mean())
+    point = float(sum_in.sum() / total_in - sum_rest.sum() / total_rest)
     rng = np.random.default_rng(config.bootstrap_seed)
     draws = []
-    index_by_scene = {s: np.flatnonzero(scenes == s) for s in unique}
     for _ in range(config.bootstrap_resamples):
-        chosen = rng.integers(0, len(unique), size=len(unique))
-        idx = np.concatenate([index_by_scene[unique[c]] for c in chosen])
-        g = in_group[idx]
-        if g.any() and (~g).any():
-            draws.append(float(values[idx][g].mean() - values[idx][~g].mean()))
+        pick = rng.integers(0, len(scenes), size=len(scenes))
+        a, b = n_in[pick].sum(), n_rest[pick].sum()
+        if a > 0 and b > 0:
+            draws.append(float(sum_in[pick].sum() / a - sum_rest[pick].sum() / b))
     tail = (1.0 - config.bootstrap_confidence) / 2.0
     return {
         "difference": point,
         "ci_low": float(np.quantile(draws, tail)) if draws else float("nan"),
         "ci_high": float(np.quantile(draws, 1.0 - tail)) if draws else float("nan"),
         "replicates": len(draws),
-        "n_group": int(in_group.sum()),
-        "n_rest": int((~in_group).sum()),
+        "n_group": int(total_in),
+        "n_rest": int(total_rest),
     }
+
+
+def _codes(table: Any, name: str) -> tuple[np.ndarray, list[str]]:
+    """Integer codes and their labels for a string column, without str objects."""
+    encoded = table[name].combine_chunks().dictionary_encode()
+    return (
+        encoded.indices.to_numpy(zero_copy_only=False).astype(np.int32),
+        encoded.dictionary.to_pylist(),
+    )
+
+
+def norm_cutpoints(out_dir: Path) -> dict[str, list[float]]:
+    """Global quartile cut points per encoder, from the norms alone.
+
+    Computed before any contrast is viewed and stored; an existing file is
+    reused, never recomputed, so a rerun cannot move the split. Only the norm
+    and encoder columns are read, so this pass is bounded by one float32 array.
+    """
+    import pyarrow.parquet as pq
+
+    cut_path = Path(out_dir) / CUTPOINTS_NAME
+    if cut_path.exists():
+        return json.loads(cut_path.read_text(encoding="utf-8"))
+    by_encoder: dict[str, list[np.ndarray]] = {}
+    for path in sorted(Path(out_dir).glob("cells_*.parquet")):
+        table = pq.read_table(path, columns=["encoder", "centered_norm"])
+        codes, labels = _codes(table, "encoder")
+        norms = table["centered_norm"].to_numpy(zero_copy_only=False)
+        for index, label in enumerate(labels):
+            by_encoder.setdefault(label, []).append(norms[codes == index])
+    cutpoints = {
+        label: [float(q) for q in np.quantile(np.concatenate(parts), (0.25, 0.5, 0.75))]
+        for label, parts in sorted(by_encoder.items())
+    }
+    cut_path.write_text(json.dumps(cutpoints, indent=1), encoding="utf-8")
+    return cutpoints
 
 
 def report(out_dir: Path, analysis: AnalysisConfig) -> dict[str, Any]:
@@ -489,58 +525,71 @@ def report(out_dir: Path, analysis: AnalysisConfig) -> dict[str, Any]:
             for label, values in sorted(by_bin.items())
         }
 
-    # Mechanism test. Cut points are computed from the norms alone and stored
-    # before any contrast is viewed; an existing file is reused, never
-    # recomputed, so the preregistration survives reruns.
-    cells = {}
+    # Mechanism test. Cut points first, from the norms alone, so the split is
+    # fixed before any content difference is viewed. Then one streaming pass
+    # that reduces each file to per-scene sums and counts per group: the same
+    # estimator as a cell-level implementation, bounded by the number of
+    # scenes rather than by the 27M cells the run produces.
+    cutpoints = norm_cutpoints(out_dir)
+    groups = ["boundary", "q1_vs_q4"]
+    agg: dict[tuple, dict[str, list[float]]] = {}
     for path in sorted(out_dir.glob("cells_*.parquet")):
         table = pq.read_table(path)
-        for name in table.column_names:
-            cells.setdefault(name, []).append(table[name].to_numpy(zero_copy_only=False))
-    cells = {name: np.concatenate(parts) for name, parts in cells.items()}
-    cut_path = out_dir / CUTPOINTS_NAME
-    if cut_path.exists():
-        cutpoints = json.loads(cut_path.read_text(encoding="utf-8"))
-    else:
-        cutpoints = {
-            encoder: [
-                float(np.quantile(cells["centered_norm"][cells["encoder"] == encoder], q))
-                for q in (0.25, 0.5, 0.75)
-            ]
-            for encoder in sorted(set(cells["encoder"].tolist()))
+        scene_codes, scene_labels = _codes(table, "scene")
+        enc_codes, enc_labels = _codes(table, "encoder")
+        boundary = table["boundary"].to_numpy(zero_copy_only=False).astype(bool)
+        norms = table["centered_norm"].to_numpy(zero_copy_only=False)
+        columns = {
+            "raw": np.abs(table["c_raw"].to_numpy(zero_copy_only=False).astype(np.float64)),
+            "centered": np.abs(
+                table["c_centered"].to_numpy(zero_copy_only=False).astype(np.float64)
+            ),
         }
-        cut_path.write_text(json.dumps(cutpoints, indent=1), encoding="utf-8")
+        for e_index, encoder in enumerate(enc_labels):
+            cuts = cutpoints[encoder]
+            for s_index, scene_name in enumerate(scene_labels):
+                mask = (enc_codes == e_index) & (scene_codes == s_index)
+                if not mask.any():
+                    continue
+                quartile = np.digitize(norms[mask], cuts)
+                selectors = {
+                    "boundary": (boundary[mask], ~boundary[mask]),
+                    "q1_vs_q4": (quartile == 0, quartile == 3),
+                }
+                for metric, values in columns.items():
+                    v = values[mask]
+                    for group in groups:
+                        inside, rest = selectors[group]
+                        entry = agg.setdefault((encoder, metric, group), {})
+                        entry[scene_name] = (
+                            float(v[inside].sum()), int(inside.sum()),
+                            float(v[rest].sum()), int(rest.sum()),
+                        )
+                    per_quartile = agg.setdefault((encoder, metric, "quartile_means"), {})
+                    per_quartile[scene_name] = [
+                        float(v[quartile == q].mean()) if (quartile == q).any() else float("nan")
+                        for q in range(4)
+                    ]
 
     mechanism: dict[str, Any] = {}
-    for encoder in sorted(set(cells["encoder"].tolist())):
-        mask = cells["encoder"] == encoder
-        scenes = cells["scene"][mask]
-        boundary = cells["boundary"][mask].astype(bool)
-        norms = cells["centered_norm"][mask]
-        cuts = cutpoints[encoder]
-        quartile = np.digitize(norms, cuts)  # 0..3
-        for metric, column in (("raw", "c_raw"), ("centered", "c_centered")):
-            c = np.abs(cells[column][mask].astype(np.float64))
-            entry: dict[str, Any] = {
-                "boundary_contrast": scene_bootstrap_contrast(
-                    scenes, c, boundary, analysis
-                ),
-                "norm_q1_minus_q4": scene_bootstrap_contrast(
-                    scenes[np.isin(quartile, (0, 3))],
-                    c[np.isin(quartile, (0, 3))],
-                    quartile[np.isin(quartile, (0, 3))] == 0,
-                    analysis,
-                ),
-            }
-            per = []
-            for s in sorted(set(scenes.tolist())):
-                for qi in range(4):
-                    m = (scenes == s) & (quartile == qi)
-                    if m.any():
-                        per.append((qi, float(c[m].mean())))
-            entry["spearman_quartile_vs_scene_mean"] = spearman(
-                np.array([p[0] for p in per], dtype=np.float64),
-                np.array([p[1] for p in per], dtype=np.float64),
+    for encoder in sorted(cutpoints):
+        for metric in METRICS:
+            entry: dict[str, Any] = {}
+            for group, label in (
+                ("boundary", "boundary_contrast"), ("q1_vs_q4", "norm_q1_minus_q4")
+            ):
+                entry[label] = scene_bootstrap_contrast(
+                    agg.get((encoder, metric, group), {}), analysis
+                )
+            per_scene = agg.get((encoder, metric, "quartile_means"), {})
+            xs, ys = [], []
+            for means in per_scene.values():
+                for index, value in enumerate(means):
+                    if np.isfinite(value):
+                        xs.append(float(index))
+                        ys.append(value)
+            entry["spearman_quartile_vs_scene_mean"] = (
+                spearman(np.array(xs), np.array(ys)) if len(xs) > 2 else float("nan")
             )
             mechanism[f"{encoder}/{metric}"] = entry
     summary["mechanism"] = mechanism

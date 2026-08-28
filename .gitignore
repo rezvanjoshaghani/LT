@@ -12,3 +12,8 @@ outputs/
 # to travel with the repository; the per-scene parquets are regenerable from
 # the run and the committed code, like every other large artifact here.
 validation/evidence/path_agreement_ledger/*.parquet
+
+# SLURM job logs. Regenerable, and the provenance they carry is recorded
+# authoritatively elsewhere: the pins each caching job echoed are in every
+# cache's meta.json, and the run records are inside the evaluation parquets.
+slurm-*.out

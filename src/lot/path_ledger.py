@@ -496,6 +496,8 @@ def report(out_dir: Path, analysis: AnalysisConfig) -> dict[str, Any]:
         t2 = np.array([r["T2"] for r in rows])
         summary[metric] = {
             "pairs": len(rows),
+            "max_abs_T3": float(np.array([abs(r["T3"]) for r in rows]).max()),
+            "max_abs_closure": float(np.array([abs(r["closure"]) for r in rows]).max()),
             "signed_aggregate_T2": float(t2.mean()),
             "mean_abs_T2": float(np.abs(t2).mean()),
             "quantiles_abs_T2": {
@@ -565,6 +567,8 @@ def report(out_dir: Path, analysis: AnalysisConfig) -> dict[str, Any]:
                             float(v[inside].sum()), int(inside.sum()),
                             float(v[rest].sum()), int(rest.sum()),
                         )
+                    level = agg.setdefault((encoder, metric, "level"), {})
+                    level[scene_name] = (float(v.sum()), int(v.size), 0.0, 0)
                     per_quartile = agg.setdefault((encoder, metric, "quartile_means"), {})
                     per_quartile[scene_name] = [
                         float(v[quartile == q].mean()) if (quartile == q).any() else float("nan")
@@ -580,6 +584,17 @@ def report(out_dir: Path, analysis: AnalysisConfig) -> dict[str, Any]:
             ):
                 entry[label] = scene_bootstrap_contrast(
                     agg.get((encoder, metric, group), {}), analysis
+                )
+            level = agg.get((encoder, metric, "level"), {})
+            total = sum(v[1] for v in level.values())
+            entry["mean_abs_c"] = (
+                sum(v[0] for v in level.values()) / total if total else float("nan")
+            )
+            entry["cells"] = int(total)
+            for label in ("boundary_contrast", "norm_q1_minus_q4"):
+                difference = entry[label]["difference"]
+                entry[label]["difference_over_level"] = (
+                    difference / entry["mean_abs_c"] if total else float("nan")
                 )
             per_scene = agg.get((encoder, metric, "quartile_means"), {})
             xs, ys = [], []

@@ -1452,6 +1452,31 @@ def summary_table(
     return table
 
 
+# The columns a counts view must never consult. PROTOCOL 3.4 allows support
+# thresholds to be set from realized counts and never from outcome values, so
+# the view asserts the separation rather than relying on the reader's restraint.
+OUTCOME_COLUMNS = (
+    "value", "margin", "cosine_mean", "cosine_centered_mean",
+    "l2_mean", "l2_centered_mean",
+    "cosine_intersect_mean", "cosine_centered_intersect_mean",
+)
+
+
+def assert_no_outcome_columns(table: Sequence[dict[str, Any]]) -> str:
+    """Check a counts table carries no outcome column, and say so for the record."""
+    present = sorted({c for row in table for c in row if c in OUTCOME_COLUMNS})
+    if present:
+        raise ValueError(
+            f"the counts view carries outcome columns {present}; PROTOCOL 3.4 "
+            "permits a support threshold to be set from counts alone"
+        )
+    return (
+        "attestation: this counts view carries no metric or outcome column. "
+        f"Checked against {len(OUTCOME_COLUMNS)} names; none present in "
+        f"{len(table)} rows."
+    )
+
+
 def counts_table(
     records: Sequence[dict[str, Any]], config: AnalysisConfig
 ) -> list[dict[str, Any]]:
@@ -1525,6 +1550,8 @@ def format_counts(table: Sequence[dict[str, Any]], config: AnalysisConfig) -> st
         "Both paths are listed. A pair can be scorable on one path and not the "
         "other, so per-bin counts differ by path, and a threshold chosen from "
         "the per-point counts alone can leave splat cells unsupported unseen.",
+        "No metric or outcome column is loaded into this view; the attestation "
+        "below is checked, not asserted.",
         f"current thresholds: scenes >= {config.support_min_scenes}, "
         f"camera pairs >= {config.support_min_camera_pairs}",
         "",
@@ -1603,7 +1630,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.counts_only:
         table = counts_table(records, config)
+        attestation = assert_no_outcome_columns(table)
         print(format_counts(table, config))
+        print()
+        print(attestation)
         # Rewritten every time, unlike the results table. The runbook has the
         # user read counts, edit the support thresholds, and read them again,
         # so a write-once artifact would keep the supported_at_current_threshold

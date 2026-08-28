@@ -102,6 +102,13 @@ ledger-report)
     run_lot python -m lot.path_ledger --config "$CONFIG" --report \
         --out validation/evidence/path_agreement_ledger
     ;;
+margins)
+    # Interpreted quantities under both paths, paired by sample_id, with the
+    # near-zero classification and the wording each case licenses. Reads the
+    # evaluation parquet only; it neither re-runs nor re-derives support.
+    run_lot python -m lot.path_margins --eval-dir "$EVAL_DIR" \
+        --out validation/evidence
+    ;;
 counts)
     run_lot python -m lot.figures --eval-dir "$EVAL_DIR" --counts-only
     ;;
@@ -109,7 +116,7 @@ figures)
     run_lot python -m lot.figures --eval-dir "$EVAL_DIR"
     ;;
 *)
-    echo "unknown mode '$MODE'; use check, evaluate, ledger, ledger-report, counts, or figures" >&2
+    echo "unknown mode '$MODE'; use check, evaluate, ledger, ledger-report, margins, counts, or figures" >&2
     exit 1
     ;;
 esac

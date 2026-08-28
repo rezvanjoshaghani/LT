@@ -1101,3 +1101,22 @@ def test_the_grouped_bootstrap_is_bit_identical_to_the_naive_one():
         assert set(fast) == set(slow)
         for key in fast:
             assert fast[key] == slow[key], f"{unit} {key}: {fast[key]} != {slow[key]}"
+
+
+def test_the_counts_view_carries_no_outcome_column():
+    """PROTOCOL 3.4 sets thresholds from counts alone, so the view proves it.
+
+    The attestation is a check, not a promise: it looks for every metric and
+    outcome name in the produced rows and refuses if one is there.
+    """
+    from lot.figures import OUTCOME_COLUMNS, assert_no_outcome_columns, counts_table
+
+    table = counts_table(full_records(), ANALYSIS)
+    assert table
+    message = assert_no_outcome_columns(table)
+    assert "no metric or outcome column" in message
+
+    leaky = [dict(row, margin=0.1) for row in table]
+    with pytest.raises(ValueError, match="outcome columns"):
+        assert_no_outcome_columns(leaky)
+    assert "margin" in OUTCOME_COLUMNS

@@ -679,18 +679,32 @@ def bootstrap_cells(
     """
     if not records:
         return {}
-    by_unit: dict[Any, list[dict[str, Any]]] = {}
+    # Group by unit and by cell once, before the replicate loop. Which cell a
+    # record belongs to does not change between replicates, so building its key
+    # tuple and hashing it inside the loop repeated the same work
+    # bootstrap_resamples times over the same records: at Stream D's size that
+    # was 216 million tuple constructions per call, and ten such calls produce
+    # the table and the four figures.
+    #
+    # The replicate still calls the same statistic on the same list of record
+    # dicts, in the same order, so every returned value is bit identical to the
+    # straightforward version. A test asserts that against a reference
+    # implementation rather than leaving it to argument.
+    by_unit: dict[Any, dict[tuple, list[dict[str, Any]]]] = {}
     for record in records:
-        by_unit.setdefault(record[unit], []).append(record)
+        cell = tuple(record[k] for k in keys)
+        by_unit.setdefault(record[unit], {}).setdefault(cell, []).append(record)
     units = sorted(by_unit, key=repr)
     rng = np.random.default_rng(config.bootstrap_seed)
     collected: dict[tuple, list[float]] = {}
     for _ in range(config.bootstrap_resamples):
         drawn = rng.integers(0, len(units), size=len(units))
-        sample: list[dict[str, Any]] = []
+        pooled: dict[tuple, list[dict[str, Any]]] = {}
         for position in drawn:
-            sample.extend(by_unit[units[position]])
-        for key, value in cell_estimates(sample, keys, statistic).items():
+            for cell, cell_records in by_unit[units[position]].items():
+                pooled.setdefault(cell, []).extend(cell_records)
+        for key, cell_records in pooled.items():
+            value = statistic(cell_records)
             if math.isfinite(value):
                 collected.setdefault(key, []).append(value)
     # The replicate count travels with the interval. A cell whose statistic is

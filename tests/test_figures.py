@@ -1050,3 +1050,54 @@ def test_a_file_holding_another_scenes_rows_is_refused(tmp_path):
     write_scene(eval_dir, rows, run_meta("room_1"))
     with pytest.raises(ValueError, match="another scene's rows"):
         read_eval_dir(eval_dir)
+
+
+def test_the_grouped_bootstrap_is_bit_identical_to_the_naive_one():
+    """The speedup must not move a single interval endpoint.
+
+    bootstrap_cells groups by unit and cell once instead of per replicate. The
+    replicate still calls the same statistic on the same list of record dicts
+    in the same order, so every value should be bit identical, not merely
+    close. This asserts that against a reference implementation written the
+    straightforward way, since an interval that shifts in the last digit is
+    still an interval nobody chose.
+    """
+    import math as _math
+
+    from lot.figures import bootstrap_cells, cell_estimates, group_by
+
+    def reference(records, keys, statistic, config, unit):
+        by_unit = {}
+        for record in records:
+            by_unit.setdefault(record[unit], []).append(record)
+            units = sorted(by_unit, key=repr)
+        rng = np.random.default_rng(config.bootstrap_seed)
+        collected = {}
+        for _ in range(config.bootstrap_resamples):
+            drawn = rng.integers(0, len(units), size=len(units))
+            sample = []
+            for position in drawn:
+                sample.extend(by_unit[units[position]])
+            for key, value in cell_estimates(sample, keys, statistic).items():
+                if _math.isfinite(value):
+                    collected.setdefault(key, []).append(value)
+        tail = (1.0 - config.bootstrap_confidence) / 2.0
+        return {
+            key: (float(np.quantile(v, tail)), float(np.quantile(v, 1.0 - tail)), len(v))
+            for key, v in collected.items() if v
+        }
+
+    import dataclasses
+
+    config = dataclasses.replace(ANALYSIS, bootstrap_resamples=60)
+    rows = []
+    for parallax in (0.03, 0.08, 0.3):
+        rows += population(scenes=5, pairs=7, parallax=parallax)
+    records, _ = paired_records(assign_bins(rows, ANALYSIS))
+    keys = ("encoder", "parallax_bin", "variant")
+    for unit in ("scene", "camera_pair"):
+        fast = bootstrap_cells(records, keys, mean_margin, config, unit=unit)
+        slow = reference(records, keys, mean_margin, config, unit)
+        assert set(fast) == set(slow)
+        for key in fast:
+            assert fast[key] == slow[key], f"{unit} {key}: {fast[key]} != {slow[key]}"

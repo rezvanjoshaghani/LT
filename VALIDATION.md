@@ -4,13 +4,21 @@ Instructions for an independent audit of this repository's implementation agains
 
 ## Ground rules for the validator
 
-1. Read CLAUDE.md, PLAN.md, PROTOCOL.md, and AMENDMENTS.md first. PROTOCOL.md as amended by AMENDMENTS.md is the referee; where the two differ, AMENDMENTS.md controls. Where code and protocol disagree, the disagreement is a finding; do not decide who is right.
+1. Read CLAUDE.md, PLAN.md, FREEZE.md, PROTOCOL.md, and AMENDMENTS.md first. PROTOCOL.md as amended by AMENDMENTS.md is the referee; where the two differ, AMENDMENTS.md controls. AMENDMENTS.md holds only post-freeze changes, so a header with no entries means the protocol stands exactly as frozen; passages in PROTOCOL.md marked "Adopted before the freeze commit" are protocol text settled during formation, not amendments, and the dated record of how each was reached is in the git history the freeze commit closes. Where code and protocol disagree, the disagreement is a finding; do not decide who is right.
 2. src/ and tests/ are read-only for this audit. All validator code goes under validation/, all mutated copies under validation/mutants/. Never edit, fix, or improve the implementation, even for obvious bugs. Findings go in the report.
 3. Write VALIDATION_REPORT.md as you go. Every check gets: check id, what was verified, the exact command run, the evidence (output snippet or file/line reference), and a severity: blocker, major, minor, or note. Blockers halt Phase 4 until resolved.
 4. Independent means independent. Where these instructions say to re-derive something, write the re-derivation from the PROTOCOL.md text alone, without importing the corresponding lot module. Importing lot code to check lot code only proves the code agrees with itself. Loading cached data (features, manifests, parquet) through lot readers is allowed; recomputing the quantity under test through lot math is not.
 5. Ambiguity is a finding. If the protocol underdetermines something the code had to decide, record the decision the code made and mark it "protocol gap, minor" so it can later be recorded in AMENDMENTS.md; PROTOCOL.md itself is frozen and is never edited.
 
 Prerequisite before the audit starts: at kickoff, record the git commit hash for each normative artifact, PROTOCOL.md, AMENDMENTS.md, configs/analysis.yaml, and VALIDATION.md, and record whether the working tree is dirty. A missing, uncommitted, or dirty normative artifact is the first blocker: an audit against a target that can drift mid-run proves nothing. Every evidence entry in the report cites that recorded commit.
+
+The validator's first action is to verify the four normative files against the sha256 values recorded in FREEZE.md, which also names the freeze commit and the Stream D closure commits that precede it. A mismatch is a blocker before any other work begins. The freeze commit is the normative boundary: everything before it is protocol formation and repair, everything after it is execution against frozen rules.
+
+Kickoff also records content hashes of the data artifacts the audit depends on, because those are untracked and a commit hash says nothing about them. This closes a gap the earlier audit found and could not close: VALIDATION.md did not say where evaluation artifacts reside or how to pin ones that git does not track, so an audit could be reproducible in its code and unpinned in its inputs. The artifacts are the rendered scenes under data/, the frozen feature cache under cache/, and the evaluation outputs under outputs/.
+
+Hashes are computed canonically so the validator can reproduce every one independently. For the feature cache, either the sha256 of a manifest that itself records each cached object's sha256, or a deterministic aggregate hash over the files. In both cases files are visited in sorted-path order, paths are relative to the repository root, and the ordering rule is recorded in the kickoff note alongside the hashes. The manifest set is hashed under the same sorted-path canonical ordering. Any other ordering produces a different aggregate and is therefore not a reproduction.
+
+The validator's first dated note records this artifact-location gap and states that the kickoff content hashes are its resolution.
 
 ## Part 1: Static conformance audit
 
@@ -87,4 +95,4 @@ VALIDATION_REPORT.md ends with a verdict: pass, pass with minor findings, or fai
 
 Start a fresh Claude Code session in the repo root and paste:
 
-"You are the validator for this repository, not the implementer. Read CLAUDE.md, PLAN.md, PROTOCOL.md, AMENDMENTS.md, and VALIDATION.md, then execute VALIDATION.md exactly. src/ and tests/ are read-only for you; your code goes under validation/ and mutated copies under validation/mutants/. Where these instructions say independent, write the check from the protocol text without importing the module under test. Record every check in VALIDATION_REPORT.md with command, evidence, and severity, and finish with the verdict. Do not fix anything you find."
+"You are the validator for this repository, not the implementer. Read CLAUDE.md, PLAN.md, FREEZE.md, PROTOCOL.md, AMENDMENTS.md, and VALIDATION.md, then execute VALIDATION.md exactly. Your first action is to verify the four normative files against the sha256 values in FREEZE.md. src/ and tests/ are read-only for you; your code goes under validation/ and mutated copies under validation/mutants/. Where these instructions say independent, write the check from the protocol text without importing the module under test. Record every check in VALIDATION_REPORT.md with command, evidence, and severity, and finish with the verdict. Do not fix anything you find."

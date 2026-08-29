@@ -104,3 +104,34 @@ VGGT estimate is estimator output, not ground truth, and all alignment levels
 remain oracle calibration diagnostics. Under pure rotation the correspondence
 is depth-free, so this choice is invisible to the 4.5 gate, which is the
 property that makes the gate a pure correctness control.
+
+### A5, 2026-08-29. Operationalization of the 4.8 localization masks.
+
+PROTOCOL 4.8 names the masks and puts their thresholds in the config but
+does not fix the measure. Frozen here, before any Phase 4 outcome is viewed,
+implemented in lot.phase4:
+
+- Depth boundary: the central-difference gradient magnitude of ground-truth
+  target depth exceeds depth_boundary_gradient_threshold times the local
+  depth. The threshold is relative because depth spans an order of magnitude
+  across the scenes and the co-visibility tolerance is relative for the same
+  reason. Pixels bordering invalid depth count as boundary. The mask is
+  dilated by depth_boundary_dilation_px. A patch is a boundary patch when it
+  contains any dilated boundary pixel; the dilation radius, not a majority
+  rule, controls the band width.
+- Texture: grayscale is the RGB channel mean scaled to [0, 1]; the statistic
+  is the mean central-difference gradient magnitude over each 14 px patch;
+  low texture means the statistic falls below texture_gradient_threshold.
+- Both masks come from ground truth and the rendered RGB only. Estimated
+  depth never defines a category, per PROTOCOL 4.9.
+
+Also frozen here, from the same underdetermination family: the per-point
+scored set (validity 5d) requires the estimated warp to land, meaning
+positive depth in the context camera and a location inside the context
+sampling box; the transported fraction reported per 4.4 is the scored
+fraction of the ground-truth co-visible set per path; and the 4.4 identity
+of surviving sets across the multiplicative levels is asserted on the
+transport-validity notion (finite and positive depth), which is the notion
+positive scaling provably cannot change. Landing can change with scale when
+translation is nonzero, so the scored sets are reported as coverage, never
+asserted equal.

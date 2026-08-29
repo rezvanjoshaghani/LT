@@ -53,6 +53,16 @@ class AnalysisConfig:
     ledger_recon_tol: float
     ledger_closure_tol: float
 
+    # Phase 4 execution constants, Amendment A3. The confidence rule decides
+    # Phase 4 validity and enters the Phase 4 measurement identity computed in
+    # lot.phase4; the gate tolerances are reporting-side per PROTOCOL 3.12.
+    # None of them join MEASUREMENT_FIELDS, so the Phase 3 measurement digest
+    # and the corrected Phase 3 parquet's readability are untouched.
+    vggt_confidence_threshold: float | None
+    rotation_gate_score_tol: float
+    rotation_gate_forced_tol: float
+    rotation_gate_coord_tol_px: float
+
     rotation_position_bound_m: float
     translation_rotation_bound_deg: float
 
@@ -85,22 +95,13 @@ class AnalysisConfig:
     # the support thresholds set from realized counts after the run, which is a
     # reporting edit by construction. Collapsing the two would either forbid the
     # documented workflow or bind nothing.
-    # Values PROTOCOL names that no phase implemented so far consumes. The
-    # config file already says as much in a comment; this is the same statement
-    # in a form a test can check, because a comment cannot notice when the set
-    # changes. A field outside this tuple that nothing reads fails that test,
-    # and a field inside it that something does read fails it too, so the
-    # exemption cannot be used to park a live constant.
-    #
-    # Until Phase 4 consumes them, editing any of these changes the config
-    # digest, which invalidates an existing run, and changes no behaviour.
-    RESERVED_FOR_LATER_PHASES = (
-        "epsilon_margin",
-        "depth_boundary_dilation_px",
-        "depth_boundary_gradient_threshold",
-        "texture_gradient_threshold",
-        "depth_convention_slope_threshold",
-    )
+    # Values PROTOCOL names that no implemented phase consumes. A field outside
+    # this tuple that nothing reads fails the enforcement test, and a field
+    # inside it that something does read fails it too, so the exemption cannot
+    # park a live constant. Phase 4 consumed the last five occupants
+    # (epsilon_margin and the boundary, texture, and depth-convention
+    # thresholds), so the tuple is empty until a later phase declares ahead.
+    RESERVED_FOR_LATER_PHASES = ()
 
     MEASUREMENT_FIELDS = (
         "assert_translation_parallax_floor",
@@ -248,6 +249,9 @@ def load_analysis_config(path: Path | None = None) -> AnalysisConfig:
     missing = sorted(fields - set(raw))
     if missing:
         raise ValueError(f"analysis config missing keys: {missing}")
+    # vggt_confidence_threshold: null is the frozen no-gating rule and loads
+    # as None; a number is a real threshold. Nothing to normalize, but the key
+    # must exist, which the missing-keys check above already enforces.
     # "all" and null both mean exhaustive. Stored as None so a caller cannot
     # mistake a sentinel integer for a real cap.
     if isinstance(raw["points_per_pair"], str):

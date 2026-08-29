@@ -111,9 +111,25 @@ rotation_position_bound_m: 1.0e-6
 # zero-rotation bin that PROTOCOL 3.3 puts its whole regime in.
 translation_rotation_bound_deg: 1.0e-7
 
-# --- PROTOCOL 4.x, reserved for Phase 4 ------------------------------------
-# Declared now because PROTOCOL 3.4 requires the config be committed before any
-# Phase 4 result exists. Structurally not applicable until Phase 4 runs.
+# --- PROTOCOL 4.x, Phase 4 execution constants (Amendment A3) ---------------
+# Committed before any Phase 4 result exists. The two gate tolerances are
+# transcribed from PROTOCOL 4.5's prose; the coordinate bound and the
+# confidence rule are defined by Amendment A3.
+# PROTOCOL 4.4's validity rule, frozen: null means no confidence gating, so
+# Phase 4 validity is finite and positive depth alone. The exported confidence
+# maps travel in evidence and gate nothing.
+vggt_confidence_threshold: null
+# PROTOCOL 4.5: per-point scores under pure rotation agree within this.
+rotation_gate_score_tol: 1.0e-5
+# PROTOCOL 4.5: the forced-collision-order splat gate holds within this.
+rotation_gate_forced_tol: 1.0e-3
+# Floating-point residue bound for the 4.5 coordinate identity. The geometry
+# is exact; under pure rotation the lifted depth cancels algebraically, so
+# only rounding survives. Set from float32 pixel arithmetic at the 518 px
+# frame size, far above the observed residue and far below one pixel.
+rotation_gate_coord_tol_px: 1.0e-3
+
+# --- PROTOCOL 4.x ------------------------------------------------------------
 epsilon_margin: 0.02
 depth_boundary_dilation_px: 3
 depth_boundary_gradient_threshold: 0.05

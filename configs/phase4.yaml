@@ -1,0 +1,40 @@
+# PLAN Phase 4: the estimated-geometry tax. PROTOCOL 4.1 through 4.10.
+# Oracle-Transport's ground-truth depth is replaced by VGGT estimated depth
+# under the alignment ladder; everything else is frozen from Phase 3.
+#
+# Order on the cluster, each mode gated on a clean worktree:
+#   ./scripts/run_phase4.sh check       # pins, hashes, amendments, suite
+#   ./scripts/run_phase4.sh convention  # PROTOCOL 4.1 depth-convention report
+#   ./scripts/run_phase4.sh gates       # PROTOCOL 4.5 pure-rotation gates
+#   sbatch --array 0-17 scripts/phase4.sbatch configs/phase4.yaml
+#   ./scripts/run_phase4.sh figures     # ladder table and the four figures
+experiment_name: phase4_rung1
+renders_root: data/replica_renders
+cache_root: cache/features
+output_root: outputs
+feature_encoder: dinov2_vitb14
+depth_encoder: vggt_1b
+# The Phase 3 run directory whose provenance-validated global mean vector is
+# reused, so the floors and the centering statistic are identical to Phase 3.
+mean_vector_dir: outputs/experiment_zero
+scenes:
+  - apartment_0
+  - apartment_1
+  - apartment_2
+  - frl_apartment_0
+  - frl_apartment_1
+  - frl_apartment_2
+  - frl_apartment_3
+  - frl_apartment_4
+  - frl_apartment_5
+  - hotel_0
+  - office_0
+  - office_1
+  - office_2
+  - office_3
+  - office_4
+  - room_0
+  - room_1
+  - room_2
+seed: 0
+analysis_config: configs/analysis.yaml

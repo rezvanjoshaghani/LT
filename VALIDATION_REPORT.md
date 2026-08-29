@@ -1,541 +1,767 @@
 # VALIDATION_REPORT.md
 
-Independent audit of this repository's implementation against PROTOCOL.md, executed per
-VALIDATION.md. The validator did not write, fix, or modify anything under `src/` or
-`tests/`. All validator code is under `validation/`; all mutated copies are under
-`validation/mutants/`. Raw evidence is under `validation/evidence/`.
+Re-audit of this repository against the frozen protocol, executed per the frozen
+VALIDATION.md. This report supersedes, and does not modify, the previous audit
+report (verdict FAIL at commit `c5e50f9`), which is preserved in git history:
+its final revision is the blob with sha256
+`4a9666208689d30036d6262c86710fb6d24541865c56e9ef3c1e30fcda5d7221`, last touched
+at commit `3420e4e`. The validator did not write, fix, or modify anything under
+`src/` or `tests/`. New validator code from this audit is under `validation/`
+with the `reaudit_` prefix; new mutated copies under `validation/mutants/ra_*`;
+raw evidence under `validation/evidence/reaudit/`. Pre-existing files under
+`validation/` are the previous audit's artifacts and the implementation's
+committed evidence (the path-agreement ledger and path-margin tables); none were
+modified.
 
-**Verdict: FAIL.** 4 blockers, 15 majors. Details in the sign-off section.
-
-> **Status at ff13285.** This report audits commit `c5e50f9` and is a historical
-> record of that commit, not of the current tree. The repair is on
-> `repair/validation-streams-abc`: the four blockers and the majors are
-> addressed, and three further reviews of the repair found and fixed additional
-> defects, several of them introduced by the repair itself. See AMENDMENTS.md
-> for every normative change made since.
->
-> The repair is **not** an acceptance. Acceptance requires the corrected Phase 3
-> run (Stream D), which has not been executed, followed by a re-audit against
-> this document. Until then the Phase 3 numbers in FINDINGS.md stand withdrawn
-> and this repository has no accepted Phase 3 result.
+**Verdict: recorded at the end of this report after all checks.**
 
 ---
 
-## 0. Kickoff record and audit scope
+## 0. Kickoff record
 
-VALIDATION.md requires, before the audit starts, the commit hash of each normative
-artifact and the working-tree state. That record is the first finding.
+### K1. Normative artifact verification against FREEZE.md — PASS
+
+First action, per VALIDATION.md and FREEZE.md. Hashes are of the file content
+as git stores it.
 
 ```bash
-git status --porcelain=v1 && git rev-parse HEAD && git log --all --oneline -- configs/analysis.yaml AMENDMENTS.md
+for f in PROTOCOL.md AMENDMENTS.md configs/analysis.yaml VALIDATION.md; do
+  git show d4ed1017bd2daca2871da28900b5b4a6a7ff92b6:$f | sha256sum
+  git show HEAD:$f | sha256sum
+done
 ```
 
-| Normative artifact | On disk | Tracked in git | Commit |
+| file | FREEZE.md sha256 | frozen blob | HEAD blob |
 |---|---|---|---|
-| PROTOCOL.md | yes, sha256 `b0b4d9c6…8c3703` | **no, untracked** | none |
-| AMENDMENTS.md | **absent** | **no, never committed on any branch** | none |
-| configs/analysis.yaml | **absent** | **no, never committed on any branch** | none |
-| VALIDATION.md | yes, sha256 `520bffbe…ecf38b6` | **no, untracked** | none |
+| PROTOCOL.md | `517cc492…73eee4` | match | match |
+| AMENDMENTS.md | `bddd31e9…bb4493` | match | match |
+| configs/analysis.yaml | `91f3a82f…b440e6` | match | match |
+| VALIDATION.md | `6e4897ff…7c452e` | match | match |
 
-Working tree at kickoff: **dirty** (`?? PROTOCOL.md`, `?? VALIDATION.md`).
-HEAD is `c5e50f991e2d471989a6eddb287da3feaff121ac`, dated 2026-08-22, subject
-"Phase 3: geometry's value is a hump, and an earlier reading was wrong".
+All four match FREEZE.md exactly, at the freeze commit and at HEAD. No blocker
+at the gate. AMENDMENTS.md is a header with no entries, so per FREEZE.md the
+protocol stands exactly as frozen.
 
-Because no normative artifact is committed, no evidence entry in this report can cite a
-commit for its target, contrary to VALIDATION.md's instruction that "every evidence entry
-in the report cites that recorded commit". Evidence below therefore cites content hashes
-and HEAD, and every finding against PROTOCOL.md is a finding against an **untracked file
-that can change without trace**. This is BLOCKER-1.
+### K2. Git state at kickoff
 
-### What could not be executed at all
+- HEAD: `4729e3abf9ab9dbcb6bdd55efb7a45795a401ff5` (the bookkeeping commit
+  FREEZE.md names), branch `repair/validation-streams-abc`.
+- Working tree at kickoff: **clean** (`git status --porcelain=v1` empty).
+- Freeze commit `d4ed101` is an ancestor of HEAD; the four normative files are
+  identical at the freeze commit and at HEAD.
+- FREEZE.md's claim that no source, test, evaluation, evidence-generation, or
+  analysis code changed between the Stream D closure commits and the freeze was
+  verified: `git diff --stat 2acbfbd d4ed101 -- src/ tests/ configs/` is empty.
+- Every evidence entry below cites HEAD `4729e3a` unless stated otherwise.
 
-`data/`, `cache/`, and `outputs/` do not exist. There is no manifest, no rendered frame,
-no cached feature array, and no evaluation parquet anywhere in the repository or on this
-machine (`.gitignore` excludes all three; `Borah_results/` holds three QC PNGs only).
+### K3. Data-artifact pinning (the kickoff content hashes)
 
-Consequently the following are **unverified, not passed**:
+VALIDATION.md requires content hashes of the rendered scenes under `data/`, the
+frozen feature cache under `cache/`, and the evaluation outputs under
+`outputs/`, because git does not track them.
 
-- **2.3, the audit's designated centerpiece** — one-scene row-by-row reproduction of
-  apartment_0. No cached features, no manifest, no parquet. Cannot be run.
-- **2.4** — aggregate reproduction against either the historical or the corrected parquet.
-  Neither exists.
-- **4.1, 4.2, 4.3 against the shipped table** — no shipped table.
-- **Part 5 in its entirety** — 95 quantitative claims inventoried, 0 executable.
-- The cluster-gated batch-equality test against the real VGGT weights.
+**Ordering rule** (recorded per VALIDATION.md): files are visited in sorted-path
+order; paths are relative to the repository root with forward slashes; each
+file's sha256 is computed over its raw bytes; the aggregate is the sha256 of
+the concatenation of `"<hex-digest><2 spaces><relative-path>\n"` lines in that
+same sorted order. Any other ordering is not a reproduction.
 
-Where a check could be executed on a **surrogate** — synthetic cameras, synthetic scenes,
-or a parquet generated by driving the real pipeline — it was, and every such result is
-labelled a surrogate below. A surrogate establishes that an implementation is
-self-consistent and convention-correct; it establishes nothing about the shipped numbers.
+- **outputs/** (42 files, the complete Stream D evaluation outputs, figures and
+  tables): aggregate sha256
+  `7de0ae525087806c7a7c1e147691934d67f57e7bb9dbedf61e596ee6fd6bc9a6`.
+  Per-file digests: `validation/evidence/reaudit/outputs_pin.txt`.
+- **data/ and cache/ are not present on this machine.** They reside on the
+  Borah cluster, which is not reachable non-interactively from this audit
+  session (ssh requires interactive authentication; verified refused in
+  BatchMode). Consequences and the partial substitute are in K5 and the
+  Unverified list. The feature cache is pinned indirectly and per scene: every
+  evaluation run record carries, per encoder, the cache `features_digest` (a
+  content hash over the stored arrays computed when the cache was written and
+  re-verified against the bytes at evaluation time by
+  `_SceneCache`/`validate_feature_cache(check_digest=True)`), the
+  `weights_fingerprint`, `weights_revision`, and `code_revision`. All 36
+  (scene, encoder) digests are recorded in the run records inside the pinned
+  outputs above, so the cache identity the run consumed is pinned even though
+  the cache bytes are not locally hashable.
+
+### K4. Run provenance of the artifacts under audit
+
+All 18 per-scene run records agree on: `eval_version: 4`, `seed: 0`,
+`git_commit: 61c9e99e3f7ad027bc79c64302e87e8283a1c117-dirty`,
+`analysis_config_digest: ca4da48246e3c01b6cade9c42b328a94`,
+`analysis_measurement_digest: 27244e6481d521159e513f2ea8799482`,
+`analysis_reporting_digest: a497a98e44359e73e3a9cabb3cb481f5`, one weights
+fingerprint per encoder (`1159bd1e…` DINOv2, `b9e29c09…` VGGT), one weights
+revision per encoder (DINOv2: the explicit `unpinnable: torch.hub checkpoint
+URL is unversioned` declaration PROTOCOL 3.12 permits, with hub `code_revision`
+`7764ea0f…`; VGGT: `860abec7…` with code revision `a288dd0f…`). One encoder
+identity across all scenes, as 3.12 requires.
+
+Three provenance facts require explicit treatment:
+
+1. **The run commit is an ancestor of the freeze, and the row-producing code is
+   frozen unchanged.** `git diff 61c9e99 d4ed101 -- src/` touches only
+   `analysis_config.py` (+2 field declarations), `figures.py`,
+   `path_ledger.py` (new), `path_margins.py` (new), and tests.
+   `evaluate.py`, `correspondence.py`, `transport.py`, `geometry.py`,
+   `visibility.py`, `encoders.py`, `datasets.py`, `sample_identity.py` are
+   byte-identical between the run commit and the freeze commit. The parquet
+   under audit was therefore produced by exactly the frozen row-producing code.
+   The post-run code (ledger, margins, figures changes) produced the post-run
+   evidence and the shipped figures/tables, and stabilized at `d4f9679`, before
+   the closure commits; nothing changed after them (K2).
+2. **The `-dirty` marker.** `lot.evaluate.git_commit()` appends `-dirty`
+   whenever `git status --porcelain` prints anything, which includes untracked
+   files. At run time (2026-08-27, before commit `4787937` added `slurm-*.out`
+   to .gitignore) the cluster worktree necessarily carried untracked SLURM logs,
+   which alone triggers the marker. That is the benign explanation; it cannot
+   be proven from here what else, if anything, was dirty on the cluster
+   checkout, and the marker cannot distinguish untracked logs from tracked
+   modifications. The analysis config is bound by content digest (below), so a
+   config edit could not hide; source edits are not covered by any digest.
+   `lot.figures.read_eval_dir` prints exactly this caveat when analysing the
+   run. Recorded as **FINDING R-1 (major)** — see Findings.
+3. **Config digest linkage.** The frozen `configs/analysis.yaml`'s measurement
+   digest, computed by the frozen reader, is
+   `27244e6481d521159e513f2ea8799482` — **exactly equal** to the measurement
+   digest all 18 run records carry. The run's measurement identity is the
+   frozen config's measurement identity, which is what PROTOCOL 3.12 requires
+   for a report to be built from the run. The full-config digest differs
+   (`f7595c5c…` now vs `ca4da482…` recorded) and the reporting digest differs
+   (`24ade4ef…` vs `a497a98e…`), both explained exactly by the two
+   ledger-tolerance keys (`ledger_recon_tol`, `ledger_closure_tol`) added
+   post-run and pre-freeze at `d4f9679`, which sit outside `MEASUREMENT_FIELDS`.
+   A textual diff (`git diff 61c9e99 d4ed101 -- configs/analysis.yaml`) confirms
+   no measurement-side value changed. PROTOCOL 3.4/3.12 permit reporting-side
+   changes; `read_eval_dir` gates on the measurement digest and notes the
+   reporting difference. Consistent.
+
+Timeline consistency (file mtimes and commits): support counts 08-27 14:50
+(counts step precedes any outcome view per the runbook), ledger evidence
+08-28 03:27, figures 03:55–03:57, results table 04:02, margins evidence 14:29,
+closure and freeze commits 14:33–14:36. Consistent with the documented order.
+
+### K5. What cannot be executed from this machine
+
+`data/` (renders: RGB, depth, manifests, frame stats) and `cache/` (frozen
+features) exist only on the cluster; interactive-only authentication blocks a
+remote audit session. Everything below that requires them is listed as
+unverified, not passed, in the sign-off. Checks that could run on a surrogate
+(synthetic scenes driven through the real pipeline) were run and are labelled
+surrogate. The evaluation parquet, figures, tables, ledger report, cut points,
+and margins evidence are all local and were audited directly.
+
+### Dated notes (VALIDATION.md instructs the validator to record these)
+
+**Note 1, 2026-08-28 — artifact location.** VALIDATION.md's own first-note
+requirement: the artifact-location gap the earlier audit found is resolved by
+the kickoff content hashes of K3 for `outputs/`, and by the per-scene cache
+digests carried in the pinned run records for `cache/`. For `data/` no local
+pin is possible; the manifests' content is pinned only transitively (the run
+records do not hash the renders). This residual gap is recorded here rather
+than silently absorbed.
+
+**Note 2, 2026-08-28 — where dated notes live.** VALIDATION.md says its own
+ambiguity notes are "recorded as dated notes at the bottom" of itself, but
+FREEZE.md freezes VALIDATION.md by content hash and any edit would break K1.
+Resolution: dated notes are recorded in this report instead; VALIDATION.md is
+left byte-identical to its frozen hash. Ambiguity recorded as a protocol-gap
+note (minor).
+
+**Note 3, 2026-08-28 — rotation angle formula.** VALIDATION.md 1.2 and 3.5
+check for "arccos of (trace−1)/2 with the argument clamped" and a
+clamp-removal mutant. PROTOCOL 3.2 states the arccos-with-clamp definition, but
+PROTOCOL 3.12 (adopted before the freeze) states "Rotation magnitude is
+computed from the skew term against the trace term, not from the trace alone",
+and the implementation follows 3.12 (`atan2` of skew magnitude vs trace term,
+`geometry.py:206-231`). The two frozen texts describe the same mathematical
+quantity with different numerics; 3.12 is the more specific and later-settled
+text and controls. Consequences: 1.2 is audited as "the 3.12 formula, correctly
+implemented, with no domain-error exposure"; mutant 3.5 is executed against the
+bug class the clamp guards (arccos domain overshoot) by mutating
+`rotation_angle_deg` to an unclamped `acos((trace−1)/2)`. Both deviations from
+VALIDATION.md's letter are recorded here as required by its own ground rule 5.
 
 ---
 
 ## Part 1: Static conformance audit
 
+Audited at HEAD `4729e3a`; `src/` is byte-identical to the freeze commit.
+
 ### 1.1 Pose convention — PASS
 
-`relative_pose` is defined once, at [geometry.py:140](src/lot/geometry.py:140), and returns
-`invert_se3(T_world_from_target) @ T_world_from_context` ([geometry.py:146](src/lot/geometry.py:146)).
+`relative_pose` is defined once, [geometry.py:140](src/lot/geometry.py:140):
+`invert_se3(T_world_from_target) @ T_world_from_context`, with the docstring
+"This is the only place the formula is written."
 
 ```bash
-grep -rn "invert_se3\|linalg.inv\|relative_pose" src/lot/*.py | grep -v geometry.py
+grep -n "invert_se3\|linalg.inv\|relative_pose" src/lot/*.py | grep -v geometry.py
 ```
 
-Every other module imports it ([datasets.py:33](src/lot/datasets.py:33),
-[evaluate.py:53](src/lot/evaluate.py:53)). The two other `invert_se3` call sites,
-[correspondence.py:176](src/lot/correspondence.py:176) and
-[visibility.py:82](src/lot/visibility.py:82), invert an *already-computed relative
-transform* to obtain `T_context_from_target`. That is not a second implementation of the
-relative-pose formula from world poses. **No duplicate exists.**
+Every consumer imports it: [datasets.py:190](src/lot/datasets.py:190),
+[evaluate.py:1030](src/lot/evaluate.py:1030),
+[path_ledger.py:217](src/lot/path_ledger.py:217). The two other `invert_se3`
+call sites ([correspondence.py:240](src/lot/correspondence.py:240),
+[visibility.py:91](src/lot/visibility.py:91)) invert an already-computed
+relative transform to get `T_context_from_target`; neither re-derives the
+relative pose from world poses. The only `linalg.inv` is the intrinsics inverse
+inside `rotation_homography` ([geometry.py:158](src/lot/geometry.py:158)), not a
+pose inverse. **No duplicate.**
 
-### 1.2 Rotation angle — PASS
+### 1.2 Rotation angle — PASS under PROTOCOL 3.12 (see dated note 3)
 
-[geometry.py:216](src/lot/geometry.py:216): `math.degrees(math.acos(max(-1.0, min(1.0, cosine))))`,
-computed from `(trace(R) - 1) / 2` in float64. The clamp is present, and datasets.py
-computes it from `T_target_from_context[:3, :3]` ([datasets.py:177](src/lot/datasets.py:177)).
-
-Independently re-derived and confirmed at 0, 7.5, 33, 179 degrees to 1e-9, and the clamp
-was confirmed live: an argument of `1.0000000000001499` returns `0.0` rather than NaN.
-Evidence: `validation/evidence/check_geometry.txt`, checks 1.2 and 1.2b.
+[geometry.py:206](src/lot/geometry.py:206) `rotation_angle_deg`: float64,
+`sine = ‖R − Rᵀ‖_F / (2√2)`, `cosine = (trace(R) − 1)/2`,
+`degrees(atan2(sine, cosine))`. This is exactly PROTOCOL 3.12's "skew term
+against the trace term". It is total on its domain (no arccos domain error to
+clamp), agrees with the 3.2 geodesic definition mathematically on [0, 180],
+resolves small angles to full precision (which 3.12 requires so the
+zero-rotation bin is a statement about the camera, not arithmetic), and
+`datasets.pair_quantities` computes it from `T_target_from_context[:3, :3]`
+([datasets.py:196](src/lot/datasets.py:196)). Independent numeric check in
+2.1's harness: agreement with an independent implementation at 0, 1e-7, 7.5,
+33, 179 degrees, and finite output on a near-identity rotation scaled by
+(1 + 1e-13). Mutation coverage of the arccos-overshoot bug class: Part 3, 3.5.
 
 ### 1.3 Pixel-to-patch mapping — PASS
 
-Defined once at [encoders.py:49](src/lot/encoders.py:49) as `(uv_px + 0.5) / patch_size - 0.5`,
-with the inverse beside it. `sample_features_bilinear`
-([encoders.py:129](src/lot/encoders.py:129)) routes through it. `correspondence._patch_center_px`
-explicitly calls `patch_to_pixel_coords` rather than re-deriving the constant
-([correspondence.py:63](src/lot/correspondence.py:63)).
-
-```bash
-grep -rn "align_corners" src/ tests/      # no hits
-```
-
-No `align_corners` anywhere. Independent re-derivation agrees to 0.0 over 50 random
-coordinates and bilinear feature sampling agrees to 0.0 over 30 random locations.
+Defined once at [encoders.py:45](src/lot/encoders.py:45)
+(`(uv_px + 0.5) / patch_size − 0.5`), inverse beside it at
+[encoders.py:74](src/lot/encoders.py:74). `sample_features_bilinear`
+([encoders.py:142](src/lot/encoders.py:142)) routes through it;
+`patch_cell_index` ([encoders.py:53](src/lot/encoders.py:53)) rounds the same
+mapping, and its docstring records that the earlier inline rewrites in
+correspondence.py and evaluate.py were removed. Grep for a second copy of the
+constant found none. `align_corners` appears nowhere in `src/`; the single hit
+in `tests/test_one_path_pipeline.py:103` uses `F.interpolate(...,
+align_corners=True)` to synthesize a smooth random test fixture, not to sample
+features — not a violation of "no align_corners in feature sampling"; noted.
 
 ### 1.4 Transport — PASS
 
-[transport.py:77](src/lot/transport.py:77) `transport_plan`: splat is computed at pixel
-resolution (`pixel_grid(height, width)`), the z-buffer resolves occlusion at pixel level
-(`scatter_reduce_(..., reduce="amin")`, [transport.py:135](src/lot/transport.py:135)),
-pooling to patches happens afterwards, and coverage is
-`hits_per_patch / (patch_size * patch_size)` — the supported-pixel fraction per target
-patch. The vectorised weight-matrix form was verified to reproduce a from-scratch
-per-pixel splat exactly (below, 2.3).
+[transport.py:77](src/lot/transport.py:77) `transport_plan`: splat at pixel
+resolution over the full `pixel_grid`; z-buffer `scatter_reduce_(amin)` at
+pixel level ([transport.py:135](src/lot/transport.py:135)) with deterministic
+tie-averaging within a 1e-6 relative epsilon; pooling to patches afterwards;
+coverage = supported-pixel fraction per target patch
+([transport.py:168](src/lot/transport.py:168)); rows of the weight matrix sum
+to one where anything landed and zero in holes, so empty patches stay zero.
+Disoccluded locations are not scored: the splat record set is
+`covisible_per_patch >= min_covisible_fraction` AND `coverage > 0`
+([evaluate.py:552-555](src/lot/evaluate.py:552)). The weight-matrix form vs
+per-pixel splat equivalence is asserted by
+`test_weighted_form_matches_the_pixel_level_splat` and re-verified
+independently in Part 2 (surrogate).
 
-Disoccluded locations are left empty and **are not scored**:
-[evaluate.py:268](src/lot/evaluate.py:268) restricts the splat path to
-`(covisible_per_patch >= min_covisible_fraction) & (plan.coverage > 0)`.
-
-### 1.5 Nulls — PASS on the blocker condition, MAJOR on two others
+### 1.5 Nulls — PASS (the blocker condition does not fire)
 
 All three location controls read from the same context feature map
-([correspondence.py:240](src/lot/correspondence.py:240)), and No-Warp-Copy reads at the
-same image coordinate as the target location (`uv_context_no_warp=uv_target.clone()`,
-[correspondence.py:221](src/lot/correspondence.py:221)).
+([correspondence.py:324-351](src/lot/correspondence.py:324)) and differ only in
+read location:
 
-**Neighbor-Patch reads one patch from the correct correspondence location, not from the
-same image coordinate** ([correspondence.py:191](src/lot/correspondence.py:191):
-`neighbor_options = uv_warp[:, None, :] + offsets[None, :, :]`). VALIDATION 1.5 names the
-other reading as a blocker; that blocker **does not fire**.
+- **Neighbor-Patch reads one patch away from the correct correspondence
+  location** (`options = uv_warp[:, None, :] + offsets`,
+  [correspondence.py:255](src/lot/correspondence.py:255)) and is transported
+  identically on the splat path (same plan weights applied to a one-patch
+  shifted source, [evaluate.py:691](src/lot/evaluate.py:691)). VALIDATION 1.5's
+  blocker (the other reading, one patch from the same image coordinate) does
+  **not** fire. The direction is drawn hash-deterministically from the
+  record's `sample_id` among the in-bounds axis-aligned unit offsets
+  ([correspondence.py:73-90](src/lot/correspondence.py:73), salt
+  `NEIGHBOR_PATCH_SALT`), matching the frozen 3.6 text (which superseded the
+  fixed-direction wording pre-freeze). Border records with no in-bounds offset
+  are omitted and counted (`neighbor_omitted`). The admissible set is the
+  intersection of both paths' rules so one record has one direction on both
+  paths ([correspondence.py:257-272](src/lot/correspondence.py:257),
+  [evaluate.py:544-546](src/lot/evaluate.py:544)).
+- **No-Warp-Copy** reads at the same image coordinate as the target location
+  (`uv_context_no_warp=uv_target.clone()`,
+  [correspondence.py:316](src/lot/correspondence.py:316)).
+- **Random-Patch** is an integer patch of the same context image, never across
+  scenes (`derived_draw(ids, RANDOM_PATCH_SALT, ctx_patches_h * ctx_patches_w)`
+  over the context grid, [correspondence.py:307](src/lot/correspondence.py:307);
+  indexed, never interpolated, [correspondence.py:350](src/lot/correspondence.py:350)),
+  hash-deterministic per record per the frozen 3.6.
+- `sample_id` (PROTOCOL 3.2) exists and is load-bearing:
+  [sample_identity.py](src/lot/sample_identity.py) derives a 64-bit id from
+  scene, context frame, target frame, and half-pixel-quantized target
+  coordinates via full-width blake2b + SplitMix64; uniqueness asserted per pair
+  ([evaluate.py:352](src/lot/evaluate.py:352)); both paths index one universe
+  (target patch grid) so records intersect by construction
+  ([evaluate.py:378](src/lot/evaluate.py:378)); rows persist the validity
+  bitmask (`sample_mask`) as 3.2 permits for pair-aggregated storage.
 
-Two separate divergences do fire — see MAJOR-5 and MAJOR-6.
+### 1.6 Masks — PASS
 
-### 1.6 Masks — PASS on provenance, MINOR on the config
+`visibility_masks` takes only ground-truth depth of both views
+([visibility.py:71](src/lot/visibility.py:71)); grep for
+estimated/vggt/predicted depth in the module: no hits. The co-visibility
+tolerance is read lazily from the normative config
+([visibility.py:51](src/lot/visibility.py:51)), not hard-coded; callers pass
+`config.covisible_relative_depth_tol` explicitly
+([evaluate.py:485](src/lot/evaluate.py:485)). The context depth map is read
+with nearest sampling with the documented z-buffer rationale. The blocker
+condition of VALIDATION 1.6 does not fire, and the prior audit's MINOR-1
+(hard-coded tolerance) is repaired.
 
-`visibility_masks` takes `depth_target` and `depth_context` and nothing else
-([visibility.py:65](src/lot/visibility.py:65)). Callers pass rendered ground-truth depth
-([evaluate.py:473](src/lot/evaluate.py:473)). There is **no code path in the visibility
-module that touches estimated depth**. The blocker of 1.6 does not fire.
+### 1.7 Metrics — PASS
 
-The tolerance is `DEFAULT_RELATIVE_DEPTH_TOL = 0.015` hard-coded at
-[visibility.py:48](src/lot/visibility.py:48), not read from a config, because
-`configs/analysis.yaml` does not exist. Recorded as MINOR-1.
+`agreement_metrics` ([evaluate.py:159](src/lot/evaluate.py:159)) computes raw
+cosine and centered cosine (plus L2 companions) for every record. "Centered"
+subtracts **the encoder's global mean vector** — the same object as the
+Mean-Feature floor — from both vectors immediately before unit-normalization
+and cosine ([evaluate.py:151-156](src/lot/evaluate.py:151)), which is exactly
+PROTOCOL 3.7's output-level definition. The vector is built by
+`dataset_mean_vector` ([evaluate.py:188](src/lot/evaluate.py:188)): one global
+[C] vector per encoder, averaged over all frames and positions of the
+**training split** (`mean_vector_scenes` defaults to the train split,
+[evaluate.py:906-912](src/lot/evaluate.py:906)), never a position-conditioned
+map — matching 3.6/3.7 as frozen. The same vector is the Mean-Feature
+prediction on both paths ([evaluate.py:792](src/lot/evaluate.py:792),
+[evaluate.py:837](src/lot/evaluate.py:837)). Centered Mean-Feature is recorded
+nonfinite, no epsilon-regularized substitute
+([evaluate.py:159-181](src/lot/evaluate.py:159)). Margins are never baked into
+rows; `figures.paired_records` computes them at analysis time and verifies the
+variant and floor share the same persisted `sample_mask` before subtracting
+([figures.py:484-587](src/lot/figures.py:484)). All five variants are scored on
+the path's common valid record set (per-point: the sampler's selected set;
+splat: the splat mask), so differences are paired by construction with the mask
+as proof ([evaluate.py:764-864](src/lot/evaluate.py:764)). The prior audit's
+BLOCKER-2 and MAJOR-1 are repaired. The mean vector's provenance is bound by
+digest of inputs and of its own bytes
+([evaluate.py:274-345](src/lot/evaluate.py:274)).
 
-### 1.7 Metrics — MAJOR
+### 1.8 Schema — PASS (wide-metric form as frozen in 3.2)
 
-Both raw and centered cosine are computed for every record
-([evaluate.py:118](src/lot/evaluate.py:118) `agreement_metrics`). Margins are **not** baked
-into rows: floors are stored as ordinary rows and figures subtract them
-([figures.py:102](src/lot/figures.py:102)). That part conforms.
+Confirmed on the shipped parquet (Part 4): rows are long in variant and path,
+wide in metric, and carry scene_id, context/target frame ids, camera regime,
+variant, path, continuous `rotation_deg`, continuous `parallax`, contributing
+count `n`, and the named metric columns — exactly the fields PROTOCOL 3.2
+enumerates, plus the intersection columns and persisted `sample_mask` that 3.2's
+pairing identity requires. **No bin labels in rows** (`parquet` columns contain
+no `*_bin`; `figures.assign_bins` refuses rows that already carry labels,
+[figures.py:437-453](src/lot/figures.py:437)). Bin edges live only in the
+committed config; `datasets.py` reads the same config for sampling strata
+(deliberately separate stratum edges, 3.4-adopted). The per-pair parallax is
+computed as PROTOCOL 3.2 defines: median of baseline over ground-truth depth
+across the pair's co-visible point set — implemented as
+`baseline / median(depth_target[covisible])`
+([evaluate.py:449-462](src/lot/evaluate.py:449)), with the documented
+equivalence (baseline constant per pair) and the correct population (the
+co-visible set, not the whole frame; MAJOR-4 repaired). The whole-frame proxy
+survives only as a sampling covariate that never reaches rows
+([datasets.py:14-20](src/lot/datasets.py:14)); run records document this.
+Protocol gap (minor): 3.2 does not name which view's depth enters the median;
+the implementation uses the target-view depth of each co-visible point. See
+Findings (G-1).
 
-What "centered" subtracts, precisely: `center = mean_feature_map.to(torch.float32).mean(dim=(1, 2))`
-([evaluate.py:294](src/lot/evaluate.py:294)) — a global `[C]` vector obtained by averaging
-the mean feature *map* over positions. The map itself is averaged over
-`mean_feature_scenes`, which defaults to the **train** split
-([evaluate.py:385](src/lot/evaluate.py:385)); PROTOCOL 3.6 specifies "all
-**evaluation-split** frames". See MAJOR-1.
+### 1.9 Encoders — PASS
 
-### 1.8 Schema — MAJOR
-
-Rows are long in `variant` and `path` but **wide in metric**: each row carries four metric
-columns (`cosine_mean`, `l2_mean`, `cosine_centered_mean`, `l2_centered_mean`), not a
-`metric name` / `metric value` pair as PROTOCOL 3.2 specifies. Confirmed on a real parquet
-produced by the real writer:
-
-```
-columns: ['baseline_m', 'context_frame_id', 'context_median_depth_m', 'cosine_centered_mean',
- 'cosine_mean', 'coverage_mean', 'covisible_fraction', 'encoder', 'l2_centered_mean',
- 'l2_mean', 'n', 'parallax', 'parallax_bin', 'path', 'regime', 'rotation_bin',
- 'rotation_deg', 'scene', 'split', 'target_frame_id', 'variant', 'viewpoint']
-```
-
-`rotation_deg` and `parallax` are stored continuously — conformant. But `parallax_bin` and
-`rotation_bin` are **also** in the rows (MAJOR-3), and the per-pair parallax statistic does
-not match the protocol's definition (MAJOR-4).
-
-### 1.9 Encoders — PASS with one MAJOR
-
-- DINOv2 normalization is ImageNet mean/std ([encoders.py:150](src/lot/encoders.py:150)),
-  applied in `preprocess_images` ([encoders.py:228](src/lot/encoders.py:228)). No resize and
-  no crop: the code asserts whole-patch divisibility on the native render size instead
-  ([encoders.py:228](src/lot/encoders.py:228)), with the documented rationale that a resize
-  would invalidate every warp computed against the manifest intrinsics. Defensible, and
-  recorded as a deliberate deviation from the letter of "matches the official … resize".
-- Models run in `eval()` with `requires_grad_(False)` and every call under
-  `torch.inference_mode()` ([encoders.py:265](src/lot/encoders.py:265),
-  [encoders.py:279](src/lot/encoders.py:279)).
-- The VGGT wrapper builds a **length-one sequence axis**: `views = x[:, None]`
-  ([encoders.py:366](src/lot/encoders.py:366)), and the suite asserts it ungated —
-  `test_vggt_sees_one_frame_at_a_time` asserts `count == 3 and sequence == 1`
-  ([test_encoder_cache.py:452](tests/test_encoder_cache.py:452)). **This runs on every
-  invocation.**
-- The batch-equality test against the real model exists
-  ([test_encoder_cache.py:459](tests/test_encoder_cache.py:459)) but is gated. See MAJOR-15.
+- DINOv2 preprocessing: ImageNet mean/std ([encoders.py:172](src/lot/encoders.py:172),
+  applied at [encoders.py:257-260](src/lot/encoders.py:257)); no resize or crop
+  by design, with the documented rationale that the renders are whole-patch
+  sized and a resize would invalidate the manifest intrinsics (deliberate,
+  documented deviation from the letter of "official resize"; carried over as a
+  note from the prior audit).
+- Frozen: `model.eval()`, `requires_grad_(False)` on load
+  ([encoders.py:311-318](src/lot/encoders.py:311)); every call under
+  `torch.inference_mode()` ([encoders.py:326-331](src/lot/encoders.py:326)).
+- VGGT builds a length-one sequence axis: `views = x[:, None]`
+  ([encoders.py:438](src/lot/encoders.py:438)); tokens captured from the
+  aggregator by forward hook; `_squeeze_view_and_channel` asserts the view axis
+  is length one ([encoders.py:485-496](src/lot/encoders.py:485)).
+- The single-frame test runs ungated (`test_vggt_sees_one_frame_at_a_time`,
+  [test_encoder_cache.py:450](tests/test_encoder_cache.py:450), asserts one
+  aggregator call with sequence length 1). The batch-equality and
+  grid-orientation tests are gated on `LOT_ENCODER_SMOKE`
+  ([test_encoder_cache.py:376](tests/test_encoder_cache.py:376),
+  [test_encoder_cache.py:465](tests/test_encoder_cache.py:465)) and the gate is
+  now wired: `scripts/cache_features.sbatch:91-92` exports the variable and runs
+  exactly those tests **before** caching, under `set -euo pipefail`, so a
+  caching job that produced the caches this run consumed can only have run with
+  those tests passing (they cannot skip: the variable is set). This repairs the
+  prior MAJOR-15. Direct cluster logs are not in the repository (slurm logs
+  untracked); the pass is therefore evidenced indirectly (caches exist whose
+  meta records the pins this job requires) and the direct confirmation is
+  listed as unverified-from-here (Part 5).
+- Provenance: fingerprints hash every parameter
+  ([encoders.py:264](src/lot/encoders.py:264)); revisions must be full 40-hex
+  SHAs (`require_full_sha`, [encoders.py:640](src/lot/encoders.py:640));
+  DINOv2's checkpoint unpinnability is declared explicitly per 3.12.
 
 ### 1.10 Reproducibility — PASS
 
-Seeds come from config (`cfg.seed`, [evaluate.py:481](src/lot/evaluate.py:481); per-pair
-generator `torch.Generator().manual_seed(cfg.seed * 1_000_003 + index)`). `write_rows`
-refuses to overwrite ([evaluate.py:505](src/lot/evaluate.py:505)) — confirmed live, a second
-write raised `FileExistsError`. Configs for the completed runs are committed
-(`configs/experiment_zero.yaml`).
+Seeds from config (`cfg.seed` threads into stratified subsampling,
+[evaluate.py:1014](src/lot/evaluate.py:1014); the correspondence layer is
+hash-deterministic and consumes no RNG at all,
+[correspondence.py:26-29](src/lot/correspondence.py:26); bootstrap seed in the
+analysis config). Configs for the completed runs are committed
+(`configs/experiment_zero.yaml`, `configs/cache_features_*.yaml`). Outputs are
+never overwritten: `write_rows` refuses ([evaluate.py:1228](src/lot/evaluate.py:1228));
+resume validates the stored run record against this run and refuses a mismatch
+([evaluate.py:1319-1342](src/lot/evaluate.py:1319)); figures/table refuse
+existing outputs and stage atomically ([figures.py:1707-1798](src/lot/figures.py:1707));
+the one `replace=True` is the counts view, with the documented rationale, and
+the results table is never replaced. Re-verified live on the synthetic
+determinism run (Part 4.3).
+
+Part 1 verdict: no blocker fires; every prior Part-1 blocker/major (BLOCKER-1,
+BLOCKER-2, BLOCKER-3 schema half, MAJOR-1..15) is verifiably repaired in the
+frozen source. Findings from Part 1: R-1 (run made from a dirty worktree,
+K4), G-1 (parallax depth-view gap), plus notes.
 
 ---
 
 ## Part 2: Independent numerical re-derivation
 
-Independent implementation: `validation/independent.py`, written from the PROTOCOL.md and
-CLAUDE.md convention text, importing nothing from `lot`. Driver:
-`validation/check_geometry.py`. Full output: `validation/evidence/check_geometry.txt`.
+Independent implementation: `validation/independent.py` (written from the
+protocol text by the previous audit, committed, imports no `lot`; re-used and
+re-run unmodified) driven by `validation/check_geometry.py`, plus the new
+`validation/reaudit_forensics.py` and `validation/reaudit_claims.py` (pure
+pandas/numpy/yaml, no `lot` imports). Full output:
+`validation/evidence/reaudit/check_geometry_rerun.txt`, `forensics.json`,
+`claims.json`.
+
+### 2.1 Geometry cross-check — PASS (surrogate; real-data case unverifiable here)
 
 ```bash
-python validation/check_geometry.py
+python validation/check_geometry.py > validation/evidence/reaudit/check_geometry_rerun.txt
 # 27 passed, 0 failed, of 27 checks
 ```
 
-### 2.1 Geometry cross-check — PASS (surrogate)
-
-No manifests exist, so three synthetic pairs were built, one per regime shape, with
-**deliberately different context and target intrinsics**. 20 random pixels per regime were
-unprojected with depth, transformed, and projected, independently and through `lot`.
-
-| regime | max pixel disagreement | tolerance |
-|---|---|---|
-| rotation | 1.42e-14 px | 0.1 px |
-| translation | 0.00e+00 px | 0.1 px |
-| orbit | 2.84e-14 px | 0.1 px |
-
-The relative-pose matrices agree to 2.2e-16. **The test is not vacuous**: reversing the
-relative pose direction separates the two answers by 55.998 px, far outside tolerance.
+No manifests are on this machine, so the three pairs are synthetic, one per
+regime shape, with deliberately different context and target intrinsics; 20
+random pixels each are unprojected/transformed/projected independently and
+through `lot`. Max disagreement: rotation 1.4e-14 px, translation 0.0 px,
+orbit 2.8e-14 px, against the 0.1 px tolerance; the relative-pose matrices
+agree to 2.2e-16, and reversing the pose direction moves the answer by 56 px,
+so the check is not vacuous. No systematic offset. The same-check on real
+manifest pairs requires `data/` and is listed unverified.
 
 ### 2.2 Homography check — PASS (surrogate)
 
-For the pure-rotation pair, `H = K_target @ R_target_from_context @ inv(K_context)` was
-computed independently **in the general two-intrinsics form**, then compared against lot's
-full depth-based reprojection over the entire 98×98 pixel grid at three unrelated depths
-(0.7 m, 3.3 m, 42.0 m).
+The general two-intrinsics homography `K_tgt @ R @ inv(K_ctx)` was computed
+independently and compared against the full depth-based reprojection over the
+whole pixel grid at three unrelated depths: max disagreement 5.7e-14 px, exact
+zero translation, and the single-K shortcut would have been wrong by 2.9 px,
+which is why the general form is used. Real-data case: unverifiable here.
 
-- Max disagreement across all three depths: **5.68e-14 px**. Depth independence confirmed
-  end to end.
-- The rotation pair's translation is **exactly** 0.0.
-- The single-K shortcut would have been wrong here by **2.881 px**, which is why 2.2
-  insists on the general form; assuming `K_ctx == K_tgt` would have hidden that.
+### 2.3 One-scene reproduction — the centerpiece is UNVERIFIED (inputs on the cluster); surrogate PASS; aggregate-layer substitute PASS
 
-### 2.3 One-scene reproduction — UNVERIFIED (blocker input missing); surrogate PASS
+The designated centerpiece — recompute every Experiment Zero row for
+apartment_0 from the frozen caches and manifests — cannot run on this machine:
+`cache/` and `data/` exist only on Borah (K5). What was done instead, and what
+it does and does not establish:
 
-The designated centerpiece cannot run: apartment_0's cached features, manifest, and parquet
-do not exist. What was done instead is a full independent reimplementation of the pipeline's
-geometry, co-visibility, splat, z-buffer, pooling, coverage, and scoring
-(`validation/independent.py`), compared against `lot` on synthetic two-plane scenes across
-all three regime shapes.
+1. **Surrogate re-derivation (PASS).** The independent implementation of
+   geometry, co-visibility, splat, z-buffer, pooling, coverage, and scoring was
+   re-run against the frozen `lot` on synthetic two-plane scenes across all
+   three regime shapes: co-visible masks agree on all 9604 pixels in every
+   regime, transported features to 1.8e-07, coverage to float32 epsilon, with
+   exact-zero and exact-one coverage present and no NaNs. This establishes
+   convention-correctness of the machinery, not the shipped numbers.
+2. **Row-derived aggregate reproduction on the real parquet (PASS, see 2.4 and
+   Part 5).** Everything computable from the shipped rows was recomputed
+   independently and matches exactly, including the entire shipped results
+   table bit-for-bit. This validates every layer from the persisted rows up.
+   The step it cannot validate is rows-from-pixels on the real scenes — that
+   remains cluster-bound, partially covered by the implementation's own
+   committed ledger evidence (reconstruction of recorded scores from stored
+   inputs to 2e-7/6e-7 over all 33,772 comparisons; report.json, committed),
+   which is implementation self-evidence, not an independent rederivation.
 
-| check | rotation | translation | orbit |
-|---|---|---|---|
-| co-visible mask, pixels differing | 0 / 9604 | 0 / 9604 | 0 / 9604 |
-| transported features, max abs diff | 1.73e-07 | 1.44e-07 | 1.82e-07 |
-| coverage, max abs diff | 2.92e-08 | 2.55e-08 | 1.83e-08 |
+### 2.4 Aggregate reproduction — PASS on the corrected run; historical side impossible
 
-Coverage differences sit at float32 epsilon; lot returns coverage as float32. Coverage stays
-in [0, 1] with both exact-0 and exact-1 patches present, and no NaNs — the CLAUDE.md
-coverage contract holds.
+Which definitions produced the parquet under audit: the frozen ones —
+`eval_version: 4` rows produced by code byte-identical to the freeze commit
+(K4), under the frozen measurement identity (digest match, K4). The
+**normative check** therefore ran against the corrected parquet: with
+independent pandas code (`reaudit_claims.py`), every quantitative value claimed
+in FINDINGS' corrected sections and in the shipped tables was recomputed.
+Results in Part 5; headline: the shipped
+`outputs/experiment_zero/tables/experiment_zero.parquet` (436 rows) reproduces
+**exactly** — every numeric column including all bootstrap intervals is
+bit-equal to my regeneration from the frozen code, and my fully independent
+recomputation of every value/margin estimate in the primary analyses matches to
+float precision (396 rows compared, 0 mismatches). `support_counts.parquet`
+reproduces exactly (124 rows).
 
-**This establishes that the transport and visibility machinery is convention-correct and
-independently reproducible. It establishes nothing about the shipped Phase 3 numbers.**
+The historical (pre-correction) parquet does not exist in this repository or on
+this machine — it was never synced (prior audit, BLOCKER-4) and was superseded.
+Reproducing its aggregates under its own definitions is therefore impossible
+here; its numbers (+0.140 etc., 29,196 / 233,536) remain historical
+observations exactly as 2.4 instructs, and no bridge recomputations were
+needed: the corrected-run consistency was established directly. Listed as
+unverifiable, not assumed.
 
-### 2.4 Aggregate reproduction — UNVERIFIED
+### 2.5 Floors — PASS on everything locally checkable
 
-Neither the historical parquet nor the corrected re-run exists. PROTOCOL 3.7 states plainly
-that "the Phase 3 aggregates must be re-run under the frozen definitions before Phase 4".
-**No such re-run exists in this repository.** See BLOCKER-4.
+The centered Mean-Feature scores are nonfinite for all 67,544 Mean-Feature
+rows (both paths, both centered columns, and the centered intersect column);
+**zero finite centered Mean-Feature values exist** — the pre-correction
+signature is absent (`forensics.json: hygiene`). Raw Mean-Feature is present on
+both paths as the same single global vector by construction
+([evaluate.py:792](src/lot/evaluate.py:792), [evaluate.py:837](src/lot/evaluate.py:837)),
+and the row-absence-vs-NA representation is exactly one representation, used
+consistently (rows present, centered columns NaN — the 3.2-frozen choice).
+Recomputing the global mean vector itself requires the caches (unverified
+here); its provenance chain is pinned (input digests + vector digest,
+[evaluate.py:274-345](src/lot/evaluate.py:274)).
 
-### 2.5 Floors — MAJOR (finding confirmed empirically)
-
-VALIDATION 2.5 instructs: "reject any finite centered Mean-Feature score as a major
-finding; a finite value there is the signature of the known pre-correction divergence."
-
-Driving the real pipeline over a synthetic scene and reading the real parquet
-(`validation/check_forensics.py`):
-
-```
-[FLAG] 2.5a  68 of 68 populated Mean-Feature rows carry a FINITE centered cosine.
-             centered Mean-Feature per_point  mean = -0.0176
-             centered Mean-Feature splat_pool mean = +0.1831
-[FLAG] 2.5b  Mean-Feature raw: per_point -0.0190 vs splat_pool +0.1847, difference 0.2037
-```
-
-A single global mean vector compared through both paths **cannot** differ by path. The
-divergence is diagnosed exactly in MAJOR-1. The signature PROTOCOL 3.7's verification note
-predicted is present and reproduced.
-
-### 2.6 Depth conventions — PASS on the renderer, UNVERIFIED on VGGT
-
-Driver `validation/check_depth_convention.py`; output
-`validation/evidence/check_depth_convention.txt`.
-
-**(a) The renderer's classifier.** `classify_depth_convention`
-([render_replica.py:279](src/lot/render_replica.py:279)) was re-run on synthetic depth whose
-convention is known by construction, in four combinations:
-
-| surface | stored as | verdict | spread_planar | spread_euclidean |
-|---|---|---|---|---|
-| fronto-parallel | planar_z | `planar_z` ✓ | 5.9e-16 | 2.9e-02 |
-| fronto-parallel | euclidean_ray | `euclidean_ray` ✓ | 2.9e-02 | 0.0 |
-| tilted 6° | planar_z | `planar_z` ✓ | 3.2e-04 | 2.8e-02 |
-| tilted 6° | euclidean_ray | `euclidean_ray` ✓ | 3.0e-02 | 3.2e-04 |
-
-Correct in all four. The outcome is recorded in manifest metadata and enforced:
-`validate_manifest` rejects a manifest whose `depth_convention` is missing, unresolved, or
-whose `stored_depth` is not `planar_z` ([render_replica.py:608](src/lot/render_replica.py:608)).
-FINDINGS' Phase 1 claim that all 18 scenes probed `planar_z` is **not verifiable** — no
-manifests exist.
-
-**(b) PROTOCOL 4.1's VGGT secant regression.** Implemented independently from the protocol
-text and demonstrated correct on synthetic depth of both conventions (planar: slope −0.0000;
-ray distance: slope +0.8300, exactly the scale factor, as the algebra requires). **There is
-no implementation in `src/` to compare it against**, and no VGGT depth to run it on. Nor is
-there any resampling code at all, so PROTOCOL 4.1's nearest-neighbor requirement is so far
-neither obeyed nor broken. Recorded as NOTE-3, since Phase 4 has not begun.
-
----
-
-## Part 3: Mutation tests
-
-Harness: `validation/mutate.py`, `validation/run_one.py`. Evidence:
-`validation/evidence/mutation_report.json`.
-
-**Isolation was non-trivial and is worth recording.** `tests/conftest.py:5` inserts
-`parents[1]/"src"` at `sys.path[0]`. Placing a mutant on `PYTHONPATH` would therefore have
-been **silently shadowed by the real package**, making every kill meaningless — exactly the
-hazard VALIDATION Part 3 names. Each mutant is instead a self-contained mini-repository
-(`src/lot` + `tests` + `configs` copied), so that same conftest line resolves to the
-mutant's own src. `run_one.py` imports `lot` first, prints the resolved `lot.__file__`,
-refuses to proceed unless it lies inside the mutant directory, and only then calls
-`pytest.main()` in the same process.
-
-**Every run below carries its provenance line and all resolved inside the mutant directory.**
+### 2.6 Depth conventions — PASS on the classifier and the independent 4.1 procedure; manifest metadata unverifiable here
 
 ```bash
-python validation/mutate.py
+python validation/check_depth_convention.py > validation/evidence/reaudit/check_depth_convention_rerun.txt
+# 7 conformant, 2 flagged (both Phase-4 readiness), of 9
 ```
 
-| id | mutation | targeted result | verdict |
-|---|---|---|---|
-| 3.0 | none (control) | 147 passed, 3 skipped | **GREEN**, identical to the repo baseline |
-| 3.1 | `relative_pose` returns context-from-target | 18 failed, 59 passed | **KILLED** |
-| 3.2 | pixel-to-patch mapping shifted +0.5 patch | 6 failed, 34 passed | **KILLED** |
-| 3.3 | z-buffer bypassed, last splat wins | 1 failed, 25 passed | **KILLED** |
-| 3.4 | `unproject` treats depth as ray distance | 18 failed, 36 passed | **KILLED** |
-| 3.5 | arccos clamp removed | 15 failed, 18 passed | **KILLED** |
-| 3.5v | arccos clamp removed, validator test | 2 failed | **KILLED** |
-| 3.5c | control + validator test | 2 passed | **GREEN** |
-
-The control was red on the first attempt (3 failures) purely because `configs/` had not been
-copied and three tests load shipped yaml by repo-relative path. That was fixed before any
-kill was recorded; a red control makes every kill meaningless.
-
-**3.1** killed by `test_composing_two_transforms_equals_direct`,
-`test_disoccluded_strip_matches_analytic_within_one_patch`,
-`test_oracle_transport_is_exact_on_the_analytic_scene`, and 15 others — the round-trip and
-two-plane tests fail as VALIDATION 3.1 requires.
-
-**3.2** killed by `test_pixel_to_patch_mapping_formula`,
-`test_feature_sampling_at_patch_centers_is_exact`, `test_value_pairs_on_the_analytic_scene`,
-and the splat placement tests, as required.
-
-**3.4** killed by `test_project_unproject_identity`,
-`test_pure_rotation_equals_homography_warp`, and the reprojection tests, as required.
-
-**3.5** — VALIDATION 3.5 predicts this mutant survives on clean inputs. **It does not.** 15
-tests in `tests/test_datasets.py` raise `ValueError: math domain error`, so ordinary pose
-arithmetic in the suite already overshoots the arccos domain. The validator-defined
-overshoot test (`validation/validator_test_clamp.py`, constructing the trigger exactly as
-VALIDATION 3.5 specifies: identity scaled by `1 + 1e-13`, giving an argument of
-`1.0000000000001499`) also kills it, and passes on the control. The clamp is load-bearing
-and exercised.
-
-### 3.3 is a kill, but not by the test VALIDATION names — MINOR
-
-VALIDATION 3.3 states "The occlusion test must fail." It did not.
-`test_two_plane_zbuffer_prefers_the_front_surface` **passed** under the disabled z-buffer;
-the kill came from `test_pure_rotation_equals_homography_warp`, which trips on tie-averaging
-rather than on occlusion. Two supplementary mutants localise why:
-
-| mutant | failing tests |
-|---|---|
-| 3.3 last-write-wins (features) | `test_pure_rotation_equals_homography_warp` only |
-| 3.3b farthest-wins (features), zbuffer output untouched | + `test_two_plane_transport_lands_exactly`, `test_oracle_transport_is_exact_on_the_analytic_scene`, `test_weighted_form_matches_the_pixel_level_splat` |
-| 3.3c farthest-wins including the returned zbuffer | + `test_two_plane_zbuffer_prefers_the_front_surface` |
-
-The named occlusion test asserts only on the returned `zbuffer` **diagnostic**, so it fires
-only when that array is inverted, never when the wrong splat wins a pixel's feature. And
-the analytic scene cannot see last-write-wins at all. Measured directly:
-
-```
-target pixels receiving >1 splat: 6272 of 37632 hit
-contested pixels where last-write != nearest-depth: 0 of 6272
-```
-
-In **every** contested pixel of the analytic two-plane scene, the last-written splat is
-already the nearest one, so the two policies coincide exactly. Feature-level occlusion *is*
-covered (3.3b dies), so this is a coverage gap, not an uncovered bug class. Recorded as
-MINOR-6.
-
-### 3.6 Target leak — PASS
-
-Control: `out["warp"] = out["target"]` injected into `gather_value_pairs`. Run through the
-real pipeline on a probe scene with **surface-attached** features. Driver
-`validation/check_semantic.py`; evidence `validation/evidence/semantic_controls.json`.
-
-| metric | baseline | leaked | min over pairs | signature |
-|---|---|---|---|---|
-| cosine_mean | +0.950631 | **+1.000000** | +1.000000000 | PRESENT |
-| cosine_centered_mean | +0.946878 | **+1.000000** | +1.000000000 | PRESENT |
-
-Exactly 1 within 1e-6 in raw and in centered, unambiguously, with no partial inflation.
-**The shipped per-point path is not quietly leaking the target.**
-
-### 3.7 Correspondence shuffle — PASS
-
-Control: warp locations permuted within each pair, so the *set* of read locations is
-unchanged and only the pairing changes.
-
-A first attempt with spatially smooth but geometry-unrelated features was **inconclusive,
-not failed**: the baseline Oracle-over-No-Warp-Copy margin was −0.008, so there was no
-margin for the shuffle to destroy. Reporting that as a failure would have described the
-probe scene, not the pipeline. The probe was rebuilt with **surface-attached** features —
-each patch lifted to a world point through its own depth and pose, valued by a fixed
-function of that point — which produces a real, correctly ordered ladder
-(Random 0.147 < Mean 0.323 < Neighbor 0.526 < No-Warp 0.921 < Oracle 0.950).
-
-| metric | baseline margin (95% CI) | shuffled margin (95% CI) | destroyed | disjoint |
-|---|---|---|---|---|
-| cosine_mean | +0.1471 [+0.0831, +0.2152] | −0.6496 [−0.7096, −0.5867] | 541% | yes |
-| cosine_centered_mean | +0.1571 [+0.0887, +0.2292] | −0.7270 [−0.7913, −0.6603] | 563% | yes |
-
-Far more than half the margin is destroyed and the intervals are disjoint.
-**Correspondence identity is load-bearing, not decorative.** Uncertainty is pair-level
-bootstrap over 44 pairs; scene-level bootstrap is impossible on one scene, which VALIDATION
-3.7 explicitly anticipates.
+- The renderer's classifier is correct on synthetic raw output of known
+  convention in all four combinations (fronto-parallel and tilted, both
+  conventions), and its decision thresholds now defer to the committed config
+  (the prior MINOR-2 is repaired). Re-running it on real raw renders, and
+  confirming `metadata.depth_convention` across the 18 manifests, requires
+  `data/`: unverified here (the frozen `validate_manifest` refuses manifests
+  without a resolved planar-z conviction, so the evaluation run having passed
+  is indirect evidence).
+- PROTOCOL 4.1's VGGT secant regression was implemented independently from the
+  protocol text and classifies both synthetic conventions correctly (slope
+  −0.0000 vs +0.83). There is still no implementation in `src/` and no
+  resampling code — Phase 4 has not begun; both flags are readiness notes
+  (carried as N-1), not conformance failures. The VGGT-documentation route was
+  not resolvable offline and remains open for Phase 4.
 
 ---
 
 ## Part 4: Output forensics
 
-No shipped parquet exists. A real parquet was generated by driving the real
-`lot.evaluate.evaluate_scene` and the real `write_rows` over a synthetic scene, and that
-table was audited. Driver `validation/check_forensics.py`; output
-`validation/evidence/check_forensics.txt`.
+Driver: `validation/reaudit_forensics.py` (no `lot` imports); evidence
+`validation/evidence/reaudit/forensics.json`. All checks ran on the real
+Stream D parquet (18 scenes, pinned in K3).
 
-### 4.1 Record accounting — derivation stated first, then confirmed
+### 4.1 Record accounting — PASS, exact reconciliation
 
-Derived from the code path **before** observing any count:
+Derivation stated before observation (from PROTOCOL 3.2 plus one inspected
+file): one record is one (camera pair, encoder, path, variant); metric is a
+column dimension (wide), not a row dimension; five variants exist on **both**
+paths; centered Mean-Feature is present-with-NaN, not absent, so it adds no
+count term; Neighbor-Patch border cases drop samples inside a record, never
+records, so they add no term either (and the run counted 0 omissions); a pair
+scorable on one path contributes 5 rows instead of 10. Expected records =
+Σ_scenes Σ_encoders (10·both + 5·pp_only + 5·sp_only) with the counters taken
+from the run records, which are independent of the rows.
 
-> One record = one (pair, encoder, path, variant). `metric` is not a row dimension; each row
-> carries four metric columns. Variants per path, from `evaluate._VARIANT_NAMES` and
-> `evaluate_pair_for_encoder`: per_point = 5 (Oracle-Transport, No-Warp-Copy,
-> Neighbor-Patch, Random-Patch, Mean-Feature); splat_pool = 3 (Oracle-Transport,
-> No-Warp-Copy, Mean-Feature). Expected rows = n_pairs × n_encoders × 8, with **no**
-> structural omissions: Neighbor-Patch border candidates are dropped before sampling rather
-> than emitted as short rows, and centered Mean-Feature is not absent — it is emitted as a
-> finite column.
+Observed: **expected 337,720 = observed 337,720, exact**, with per-scene,
+per-encoder counter reconciliation exact for all 36 (scene, encoder) groups,
+every (pair, encoder, path) group carrying exactly the five frozen variants,
+and 67,544 groups = 2 paths × 33,772 (pair, encoder) comparisons =
+2 × (16,895 considered − 9 dropped-unscorable) × 2 encoders / 2. FINDINGS'
+33,772 is confirmed as the (pair, encoder) comparison count, every one scored
+on both paths. The historical 29,196 / 233,536 cannot be reconciled because
+that table no longer exists anywhere; per 2.4 they stay historical
+observations, and the corrected run reconciles exactly with **no** unexplained
+row difference (the earlier 32-row question is moot for the corrected schema:
+neighbor omissions were 0 and no structural omissions exist).
 
-Observed: **92 pairs × 1 encoder × 8 = 736 expected, 736 observed.** Exact.
+### 4.2 Population checks — PASS on everything the rows can answer
 
-Two of the five nulls exist on one path only:
+- Distinct scored pairs 16,886: orbit 9,188, rotation 4,108, translation 3,590.
+  Design-parameter cross-check against the render programs needs manifests
+  (unverified here); the stratum-cap invariant was checked instead: rebuilding
+  the sampling strata from the frozen stratum edges and the whole-frame proxy
+  (both recoverable from rows) gives 473 strata, max 40 pairs each — exactly
+  the frozen cap, never exceeded.
+- **Rotation-program pairs: baseline_m is exactly 0.0 and parallax exactly 0.0
+  for all 4,108 pairs** — the 3.3 construction claim holds literally in the
+  manifest read-backs, well inside `rotation_position_bound_m`, and every
+  rotation pair sits in the zero-parallax bin.
+- **Translation-program pairs: rotation_deg is exactly 0.0 for all 3,590
+  pairs** — inside `translation_rotation_bound_deg` (1e-7°) and the
+  zero-rotation bin. 0 pairs violate the manifest bound.
+- The forbidden interval (0, 0.025) contains **0 translation pairs** (the 3.4
+  assertion holds on the reported statistic); orbit pairs in that interval: 0
+  (legitimate but empty at the realized geometry).
+- Binning re-derived independently from the config text: every value lands in
+  a bin; the rotation regime appears only in the zero-parallax bin and the
+  translation regime only in the zero-rotation bin.
 
-```
-per_point   Mean-Feature 92 | Neighbor-Patch 92 | No-Warp-Copy 92 | Oracle-Transport 92 | Random-Patch 92
-splat_pool  Mean-Feature 92 | No-Warp-Copy 92 | Oracle-Transport 92
-```
+### 4.3 Hygiene — PASS
 
-The previously reported 29,196 comparisons / 233,536 records **cannot be reconciled**: the
-table they describe does not exist. Note for the record: 233,536 / 29,196 = 7.9989…, and
-29,196 × 8 = 233,568, which is 32 more than 233,536 — the same 32-row difference VALIDATION
-4.1 warns against presuming a cause for. With no table to inspect, the cause is
-**unidentified**, and this report does not guess.
-
-### 4.2 Population checks — UNVERIFIED
-
-Pair counts per regime, parallax-in-assigned-bin, and the translation program's rotation
-bound all require the manifests. None exist. Additionally, VALIDATION 4.2 refers to "the
-program's frozen rotation bound from the manifest and normative config" — **no such bound
-constant exists anywhere in the repository**, and the normative config does not exist.
-
-### 4.3 Hygiene — PASS on grain, determinism, and round trip
-
-- **Grain uniqueness**: at `(scene, context_frame_id, target_frame_id, encoder, path, variant)`,
-  736 distinct keys, **0 duplicates**.
-- **Determinism**: two `evaluate_scene` calls on the same config compared field by field —
-  **identical**. (A first run reported a false failure; the cause was my own comparison
-  treating `NaN != NaN` as a difference, not the pipeline. Fixed and re-run.)
-- **Round trip**: 736 rows written and read back through the real writer/reader.
-- **Overwrite refusal**: second write raised `FileExistsError`.
-- **Nonfinite values**: 0 among the 272 rows with `n > 0`. However 464 of 736 rows had
-  `n == 0` and carry NaN in all four metric columns. `value_agreement` returns `(nan, nan)`
-  for an empty selection by design ([evaluate.py:105](src/lot/evaluate.py:105)) and
-  `write_rows` accepts it, so a pair with no co-visible surface reaches the parquet as NaN
-  scores. VALIDATION 4.3 permits exactly one missing metric, centered Mean-Feature, and this
-  is a different one. The incidence here is a property of a deliberately hard synthetic
-  scene and is **not** evidence about the real run. Recorded as MINOR-4.
+- **Grain uniqueness:** 0 duplicates at
+  (scene, context_frame_id, target_frame_id, encoder, path, variant) over
+  337,720 rows.
+- **Nonfinite audit:** nonfinite scores exist in exactly the single permitted
+  representation — the centered columns (and centered-intersect column) of
+  Mean-Feature rows, all 67,544 of them, and nowhere else. Raw cosine/l2:
+  0 nonfinite. Intersect scores: 0 rows with empty intersection, 0 nonfinite
+  with support. `coverage_mean` is NaN on per-point rows (coverage is a
+  splat-path property, not a protocol-defined score; recorded as decided
+  reading G-2, minor protocol gap).
+- **Mask-level consistency (the 3.2 pairing identity, verifiable from rows
+  alone):** for all 67,544 (pair, encoder, path) groups the five variants carry
+  one identical persisted mask; popcount(mask) == n in all cases;
+  popcount(pp_mask AND splat_mask) == n_intersect for all 33,772 comparisons;
+  coverage_difference equals popcount(own AND NOT other) on every row.
+  0 violations.
+- **Determinism** (`validation/reaudit_determinism.py`): the real pipeline over
+  a synthetic scene, evaluated twice from the same inputs and once from a
+  freshly rebuilt scene directory: 450 rows, field-by-field identical
+  (NaN==NaN for the permitted representation) in both comparisons; `write_rows`
+  overwrite refusal confirmed live. Real-scene determinism requires the caches:
+  covered indirectly by the hash-deterministic sampler design (no RNG in the
+  correspondence layer) and listed unverified directly.
 
 ---
 
-## Part 5: Claim-by-claim verification — UNVERIFIED IN FULL
+## Part 5: Claim-by-claim verification
 
-95 quantitative claims were inventoried from FINDINGS.md, each paired with the single query
-that would prove it. The complete table is at `validation/evidence/claims_table.md`.
-**Zero are executable**: every one resolves against `outputs/eval/*.parquet`,
-`data/replica_renders/*/manifest.json`, or `cache/features/*`, none of which exist.
+Scope: FINDINGS' claim-bearing sections are the corrected (Stream D) sections —
+"Methods notes, corrected Phase 3", "Path agreement, attributed", and
+"Phase 3: Experiment Zero, corrected verdict". The 2026-08-24 verdict section
+is explicitly withdrawn and non-citable ("Nothing here may be cited"), so its
+numbers are audited only as what the withdrawal notice says they are. Phase 1
+and Phase 2 sections are claims about artifacts on the cluster; what the rows
+can corroborate was checked, the rest is inventoried unverifiable-from-here.
 
-This includes every headline number the Phase 3 verdict rests on: the DINOv2 margin
-+0.1516, VGGT's −0.0001, the one-patch-off cost 0.072, the rotation-angle table
-(+0.2818 / +0.3319 / +0.2796 / +0.1896 against VGGT's +0.0553 / +0.0184 / −0.0920 / −0.2788),
-the ceiling decay 0.80 → 0.54, the path agreement 0.6642 vs 0.6647, VGGT's raw 0.967 beside
-its 0.964 floor, the norm concentrations 0.9095 and 0.4226, and the frame counts 5136 /
-5078 / 1381 / 1790 / 1907.
+Driver: `validation/reaudit_claims.py`; evidence
+`validation/evidence/reaudit/claims.json`. 48 checks; 45 pass; the 3 failures
+are Findings F-1, F-2, F-3 below. Highlights, every one recomputed
+independently from the parquet and config alone:
 
-Per VALIDATION Part 5, "any sentence without a passing query is a major finding." Applying
-that literally would produce 95 majors. It is more useful to record it once, as BLOCKER-4:
-**no claim in FINDINGS.md is currently reproducible from this repository.**
+- **3.9 gate:** signed aggregate **+0.000115 raw, +0.000175 centered** over
+  33,772 comparisons vs the frozen 0.003 — exact match to FINDINGS, to the
+  ledger's signed T2, and to the frozen pipeline's own printed gate output
+  (regeneration log). Dispersion diagnostics: mean |d| 0.00304 / 0.00417,
+  median 0.00072 / 0.00139 — match.
+- **Dispersion structure:** by rotation bin, zero-rotation 0.00389 (claim
+  0.0039), 50-plus 0.00082 (claim 0.0008); dispersion falls as the common set
+  grows (Spearman −0.157). Composition note N-4: the zero-rotation pool is
+  3,590 translation + 1,227 orbit pairs, so "which are the translation
+  programme" is imprecise prose; the number is right.
+- **DINOv2 headline series** (cross-path common-set basis, which is FINDINGS'
+  stated dual-path methodology): rotation raw margins 0-10°
+  +0.23556/+0.23517 and 50+ +0.15965/+0.15866; translation raw 0.025-0.05
+  +0.05677/+0.05690 and 0.4+ +0.12645/+0.12271 — all match the quoted
+  +0.2356/+0.2352, +0.1596/+0.1587, +0.0568/+0.0569, +0.1264/+0.1227.
+- **DINOv2 beats No-Warp-Copy in every supported cell of both primary
+  analyses, both metrics, both paths** — confirmed, zero failures. Centered
+  moves every DINOv2 primary-cell margin up — confirmed. "Changes no
+  ordering" — fails for exactly one near-tied adjacent pair on the splat path
+  (F-2).
+- **VGGT rotation series, centered:** all six bins, both paths, match the
+  quoted values exactly; monotone decreasing; raw traces the same path at a
+  tenth the magnitude (+0.0097 → −0.0519); the margin is negative from 20°
+  upward on both paths and both metrics, with max path disagreement 0.00101
+  (the claim "within 0.001" holds at its own printed precision; strictly
+  exceeded by 1.4e-5 in one bin — noted, N-5).
+- **Near-zero machinery:** 232 supported cells; 27 flagged; all 27 VGGT raw
+  (no DINOv2 cell in the band — confirmed); cases 22 / 1 / 4; the four
+  not-robust cells are exactly the four named orbit oracle cells; the four
+  individually quoted cells match to 5 decimals with the right case labels.
+  **My fully independent margins table (point estimates, scene-bootstrap
+  intervals with the frozen seed, and case labels) equals the shipped
+  `path_margin_differences.parquet` on all 248 rows with max value difference
+  0.0 and zero case disagreements** — but the FINDINGS sentence splitting the
+  22 as "sixteen localization gaps, six Oracle margins" contradicts both my
+  table and the shipped table, which say 18 and 4 (F-1).
+- **One-patch cost range:** supported DINOv2 cells span [0.0351, 0.1370]
+  (per-point [0.0355, 0.1370]); the claim "between 0.036 and 0.137" verifies at
+  rounding precision.
+- **Path differences on DINOv2 quantities:** max 0.0066 (claim ≤ 0.013 ✓),
+  81.8% below 0.002 ("less than 0.002 on most" ✓), max ratio 4.2% of the
+  effect ("under 10 percent in every supported cell" ✓), 68.2% under 2% ("the
+  large majority" ✓).
+- **Materiality sentence:** fails under the inclusive reading (F-3).
+- **Ledger claims** (verified against the committed
+  `path_agreement_ledger/report.json`; the underlying 27M per-cell rows are
+  cluster-only): verdict PASS with empty stop list over 33,772 comparisons per
+  metric; closure 7.4e-16 / 6.6e-16 ("7e-16" ✓); T3 exactly 0.0; reconstruction
+  max |T1| 2.0e-7, max |T4| 6.3e-7 vs the frozen 1e-4 (claim "2e-7 and 6e-7"
+  ✓; the "five hundred times inside" phrase is exact for T1 and generous for
+  T4 at 158× — N-6); preflight bit-mismatches all zero; boundary contrast
+  10.9%/12.2%/40.6%/30.5% (claims 11/12/41/31 ✓) with every interval excluding
+  zero and 86.1% of cells tripping the flag (claim 86% ✓); norm contrast absent
+  for three of four (intervals straddle zero) and present for VGGT raw at
+  −53.8% of level (claim −54% ✓) with Spearman +0.55 ✓; per-cell |c| 0.01298
+  DINOv2 vs 0.00124 VGGT raw (claim 0.0130 vs 0.0012 ✓).
+- **Methods-note calibration sentence:** "less than 4 percent of ... the 0.072
+  one-patch localization cost" — 0.003/0.072 = 4.17%, strictly not less than
+  4% (F-4, minor). The same note's governing re-check ("flagged for amendment
+  if it exceeds roughly 10 percent") holds against the corrected margins:
+  0.003 / 0.0351 = 8.5% < 10%.
+- **Scoping claims:** the length-one sequence axis is asserted by an ungated
+  test that runs and passes in the baseline suite
+  ([test_encoder_cache.py:450](tests/test_encoder_cache.py:450)); the
+  batch-equality test against real weights is wired to run, ungated, before
+  every caching job under `set -e` (`scripts/cache_features.sbatch:91-92`), so
+  the caches this run consumed are indirect evidence it passed on the cluster;
+  the direct cluster log is not in the repository — listed unverified.
+- **Corrected analogs of frozen illustrative observations** (not pass/fail
+  targets): PROTOCOL 3.7's motivating example (withdrawn-run 0.967 vs 0.964)
+  reads 0.9528 vs 0.9536 pooled in the corrected run — the saturated-scale
+  story stands, the constants are stale (N-2). PROTOCOL 3.8's "roughly 0.80 to
+  0.54" ceiling decay reads 0.807 → 0.515 corrected — monotone decay confirmed,
+  endpoint constant stale (N-2).
+- **Row-level corroborations of Phase 1/2 claims:** 18 scenes (13 train,
+  5 test) ✓; 107 viewpoints = 17×6 + frl_apartment_2's 5 ✓; 5,001 distinct
+  frames used, consistent with 5,078 usable of 5,136 ✓ (the totals themselves
+  need manifests). The remaining Phase 1/2 quantities (48 frames per
+  viewpoint, navmesh recomputation, depth-convention metadata per scene,
+  throughput, norm-concentration diagnostics 0.9095/0.4226, cache shapes and
+  channel counts) resolve against manifests and caches on the cluster:
+  inventoried **unverifiable from this machine**, not assumed.
+- The historical first-run section's numbers (7,300 pairs, the saturated VGGT
+  band, 0.265 vs 0.2518, and every value in the withdrawn verdict) are
+  historical-run claims whose artifacts no longer exist; the withdrawal notice
+  and 2.4's governing paragraph make them non-normative. Not verifiable,
+  and not required to be.
 
-Two scoping claims were partially checkable:
+---
 
-- "The wrapper builds a sequence of length one" — **CONFIRMED**, asserted ungated by
-  `test_vggt_sees_one_frame_at_a_time` ([test_encoder_cache.py:452](tests/test_encoder_cache.py:452)),
-  which passes in the baseline run.
-- "with a cluster-gated companion that checks the real model's batch axis" — the test
-  exists but **could not be run** (no VGGT weights, no GPU, no cluster). See MAJOR-15.
+## Part 3: Mutation tests
+
+Harness: `validation/reaudit_mutate.py` + `validation/reaudit_run_one.py`;
+validator-defined test `validation/reaudit_test_overshoot.py`; evidence
+`validation/evidence/reaudit/mutation_report.json`. Each mutant is a **fresh
+copy of the current frozen `src/lot`, `tests`, and `configs`** under
+`validation/mutants/ra_*` (the pre-existing mutant directories are the previous
+audit's committed artifacts and were not touched). Each runs in its own
+subprocess; the driver imports `lot` first, prints `lot.__file__`, and
+hard-exits with code 97 unless it resolves inside that mutant's directory — no
+run returned 97, and the control's provenance line is in the stored evidence,
+so every kill below was measured on the mutant's own code. `--maxfail=25`
+truncates the failure list for heavily-failing mutants; a kill needs one.
+
+| id | mutation | result | verdict |
+|---|---|---|---|
+| ra_control | none | **244 passed, 3 skipped** (242 baseline + the 2 validator overshoot tests; skips are the three documented gates) | **GREEN** |
+| ra_3.1 | `relative_pose` returns context-from-target | 16 failed, incl. `test_relative_pose_definition_and_identity`, `test_composing_two_transforms_equals_direct`, the two-plane and correspondence tests | **KILLED**, by the tests 3.1 names |
+| ra_3.2 | pixel-to-patch mapping shifted +0.5 patch | 25 failed, incl. `test_pixel_to_patch_mapping_formula`, `test_feature_sampling_at_patch_centers_is_exact`, splat/transport placement and cross-path read tests | **KILLED**, by the tests 3.2 names |
+| ra_3.3 | z-buffer disabled (all splats win, occlusion unresolved) | 5 failed, incl. **`test_occlusion_resolves_by_depth_not_by_write_order[1]` and `[-1]`** | **KILLED — by the occlusion test itself.** The prior audit's MINOR-6 (the old occlusion test asserted only on the zbuffer diagnostic) is repaired: the suite now has an occlusion test that fires on the pooled features |
+| ra_3.3b | farthest-wins z-buffer, zbuffer diagnostic left correct | same 5 failures | **KILLED** — feature-level occlusion covered independently of the diagnostic |
+| ra_3.4 | `unproject` treats depth as ray distance | 25 failed, incl. reprojection, correspondence, and pipeline tests | **KILLED**, by the tests 3.4 names |
+| ra_3.5 | `rotation_angle_deg` replaced by **unclamped acos of the trace term** (the bug class the 3.2-clamp guards; see dated note 3) | 20 failed: ordinary pose arithmetic in the suite raises `math domain error` (the overshoot condition is exercised), `test_rotation_angle_resolves_below_the_zero_rotation_tolerance` fails (the 3.12 resolution requirement), and the validator-defined `test_overshot_trace_argument_yields_finite_angle` fails, while passing on the control | **KILLED**, suite and validator test both |
+
+### 3.6 Target leak — PASS (signature present, unambiguous)
+
+`validation/reaudit_semantic.py` (fresh `ra_sem_*` mutants of the frozen
+source; the committed probe scene with surface-attached features; provenance
+line per run). Substituting the true target feature into Oracle-Transport's
+per-point prediction moves the score from +0.941 to **+0.999999 (min over
+pairs +0.999999166)** in raw cosine and from +0.938 to **+1.000000 (min
++0.999999762)** centered — the cosine-of-itself signature within 1e-6, raw and
+centered, with no partial inflation. The shipped path is not quietly leaking:
+its baseline sits far from 1 while the deliberate leak pins it there.
+
+### 3.7 Correspondence shuffle — PASS (identity is load-bearing)
+
+Within-pair permutation of the warp locations (read-location set unchanged,
+pairing destroyed), on the single probe scene, so pair-level bootstrap per
+VALIDATION 3.7's own provision: baseline paired Oracle-over-No-Warp margin
++0.1343 [+0.0637, +0.2125] raw (+0.1430 centered) over 40 pairs; shuffled
+−0.7022 [−0.7709, −0.6314] (−0.7605 centered). **623% / 632% of the margin
+destroyed, intervals disjoint** — far past the ≥50% criterion. The full-scene-
+set version of this control requires the caches: unverified here, with the
+single-scene fallback exercised exactly as the frozen text permits.
 
 ---
 
@@ -543,303 +769,215 @@ Two scoping claims were partially checkable:
 
 ### Blockers
 
-**BLOCKER-1 — the normative artifact set is incomplete and uncommitted.**
-`AMENDMENTS.md` and `configs/analysis.yaml` do not exist on disk or in any git history.
-PROTOCOL.md and VALIDATION.md are untracked. VALIDATION.md: "A missing, uncommitted, or
-dirty normative artifact is the first blocker: an audit against a target that can drift
-mid-run proves nothing." PROTOCOL.md's preamble makes `configs/analysis.yaml` part of the
-protocol and lists what it must hold — bin edges, the co-visibility depth tolerance,
-sample-support cutoffs, `epsilon_margin`, gate tolerances, boundary dilation radius, texture
-thresholds, the depth-convention threshold. `grep -rn "analysis.yaml\|epsilon_margin" src/ tests/ configs/`
-returns nothing. Every one of those constants is instead a module constant or a function
-default in source.
-
-**BLOCKER-2 — Mean-Feature is not the object PROTOCOL 3.6 freezes, and is three different
-objects.** PROTOCOL 3.6: "Mean-Feature is a single global D-dimensional mean vector per
-encoder, averaged over all evaluation-split frames and all spatial positions. …
-Position-conditioned mean maps are explicitly not used." Implemented:
-
-| where | object | file |
-|---|---|---|
-| per_point prediction | mean of **the current context image's own** patches | [correspondence.py:246](src/lot/correspondence.py:246) |
-| splat_pool prediction | the **position-conditioned dataset mean map** `[C, Hp, Wp]` | [evaluate.py:315](src/lot/evaluate.py:315) |
-| centering vector | global `[C]` vector = that map averaged over positions | [evaluate.py:294](src/lot/evaluate.py:294) |
-
-None is the frozen definition, and the frames averaged are the **train** split, not the
-evaluation split ([evaluate.py:385](src/lot/evaluate.py:385)). `dataset_mean_feature_map`'s
-own docstring states the intent plainly: "The Mean-Feature floor is a map, not a single
-vector" — a deliberate choice, recorded as such in FINDINGS.md, that contradicts a frozen
-protocol section. Measured consequence: raw Mean-Feature differs by path by **0.2037**, and
-on surface-attached probe features the splat_pool Mean-Feature floor (**0.960**) *exceeds
-Oracle-Transport* (**0.951**) — a floor beating the correct answer, which is precisely the
-artifact PROTOCOL 3.6 forbids position-conditioned maps to avoid.
-
-**BLOCKER-3 — `sample_id` does not exist.** PROTOCOL 3.2: "every physical correspondence
-carries a deterministic sample_id … All intersections this protocol references, paired
-differences, surviving sets, matched ceilings, and common-valid gates, operate on sample_id
-… where storage is pair-aggregated, the exact contributing sample_id set or its validity
-bitmask is persisted per record."
-
-```bash
-grep -rn "sample_id" src/ tests/ configs/    # no hits
-```
-
-Storage is pair-aggregated (one mean per pair/variant/path, plus an integer `n`) and no
-sample set or bitmask is persisted. This makes the following **structurally impossible**,
-not merely absent: sample-level paired differences (3.7), Random-Patch's hash-based
-determinism (3.6), Phase 4's matched ceilings and surviving sets (4.6), the per-record
-target-exclusion invariant test (4.3), the common-valid intersection the pure-rotation gate
-runs on (4.5), and VALIDATION 2.3's row-by-row reproduction. **Phase 4 cannot be executed as
-specified against this schema.**
-
-**BLOCKER-4 — no evaluation artifacts exist, and the corrected re-run PROTOCOL 3.7 requires
-has not been produced.** PROTOCOL 3.7: "the Phase 3 aggregates must be re-run under the
-frozen definitions before Phase 4." No `outputs/`, no `cache/`, no `data/`. The audit's
-centerpiece (2.3), the aggregate reproduction (2.4), the population checks (4.2), the record
-accounting against the shipped table (4.1), and all 95 claims of Part 5 are unexecutable.
+**None.** The hash gate passed; the run's measurement identity equals the
+frozen config's; no Part 1 blocker condition fired (Neighbor-Patch reads one
+patch from the correct correspondence; visibility touches no estimated depth);
+sample identity exists and is verifiably load-bearing; the corrected-run
+accounting closes exactly.
 
 ### Majors
 
-**MAJOR-1 — centered Mean-Feature is finite.** 68 of 68 populated Mean-Feature rows carry a
-finite `cosine_centered_mean`. PROTOCOL 3.7: it is undefined and must be recorded not
-applicable; "No implementation may substitute an epsilon-regularized zero vector to
-manufacture a centered Mean-Feature score." VALIDATION 2.5 directs this be rejected as a
-major. Cause is BLOCKER-2: because the floor object and the centering vector are different
-objects, the difference is nonzero rather than the zero vector.
+**R-1 (major) — the Stream D evaluation ran from a worktree marked dirty.**
+All 18 run records carry `git_commit: 61c9e99…-dirty`. The marker fires on any
+`git status --porcelain` output including untracked files, and untracked SLURM
+logs are structurally guaranteed at run time (the job templates write
+`slurm-*.out` into the repo root; they were gitignored only afterwards at
+`4787937`), so the benign explanation is strongly implied — but a dirty flag
+cannot distinguish untracked logs from uncommitted source edits, so the
+run-to-source link has one unprovable step. Mitigation, verified: the
+row-producing modules are byte-identical between the run commit and the freeze;
+the analysis config is bound by content digest; and the committed ledger
+evidence reconstructs every recorded score from the caches and manifests
+through the closure-era (= frozen) code to 2e-7/6e-7 with zero bit-level
+preflight mismatches over all 33,772 comparisons, which re-derives the rows'
+populations and scores under provable code. The residual exposure is small and
+explicitly bounded, but the direct proof (a clean tree at run time) does not
+exist, and the protocol's provenance posture ("locked means retrievable")
+warrants recording it at this severity. Resolution path: none retroactively;
+for Phase 4, run evaluations from clean commits (the `-dirty` refusal could be
+promoted from a warning to a gate).
 
-**MAJOR-2 — rotation bin edges contradict PROTOCOL 3.4.**
-[datasets.py:63](src/lot/datasets.py:63): `ROTATION_BIN_EDGES = (5.0, 10.0, 20.0, 40.0, inf)`.
-PROTOCOL 3.4: "fixed equal-width 10-degree bins from 0 to 50 with a retained 50-plus overflow
-bin. Quantile bins are not used." The implemented scheme is neither equal-width nor
-10-degree, and its overflow starts at 40. No amendment records a permitted widening.
-(Parallax edges at [datasets.py:59](src/lot/datasets.py:59) *do* match 3.4.)
+**F-1 (major) — a FINDINGS sentence contradicts its own evidence table.**
+"Sixteen are localization gaps … Six are Oracle margins" (the split of the 22
+both-in-band cells). Both my independent recomputation and the shipped
+`validation/evidence/path_margin_differences.parquet` say **18 localization
+gaps and 4 Oracle margins**. Every other number in that section verifies,
+including the 27/232, the 22/1/4 case split, and all four individually quoted
+cells to five decimals; the licensed wording is identical for both quantities,
+so no conclusion changes — but the sentence fails its query and Part 5's
+frozen rule grades that major. Fix: erratum via AMENDMENTS.md-adjacent record
+(FINDINGS is not frozen; correct the two words and cite this finding).
 
-**MAJOR-3 — bin labels are in the rows and bin edges live in source.** PROTOCOL 3.2: "Bin
-labels never appear in rows. Bin edges live only in a committed analysis config applied by
-the figures code." `PairRecord` declares `parallax_bin` and `rotation_bin`
-([datasets.py:148](src/lot/datasets.py:148)) and `as_row()` returns
-`dataclasses.asdict(self)`, so both land in every parquet row — confirmed on a real table.
-figures.py then reads those pre-stamped labels and orders them via
-`lot.datasets.parallax_bin_order` / `rotation_bin_order`
-([figures.py:21](src/lot/figures.py:21)), whose edges are module constants. No analysis
-config is read anywhere.
+**F-3 (major) — the materiality sentence's arithmetic doesn't hold under its
+natural reading.** "The observed operator agreement, +0.000115 raw and
++0.000175 centered, is between 3 and 5 percent of even the smallest
+interpreted effect." The smallest effect carrying a licensed claim (a
+both-in-band cell) is 0.0013, giving **8.9% and 13.5%**. The sentence's
+arithmetic matches only the single one-in-band cell (0.00374 → 3.1% and 4.7%),
+i.e. the smallest effect whose direction-claim is licensed with path-sensitive
+magnitude. Under that narrow reading the sentence is true; the reading is not
+the one the words most naturally carry, and the 22 both-in-band cells are
+explicitly "interpreted" by the same section. Fix: restate with the intended
+referent (or the inclusive ratios); no conclusion turns on it because the
+band's cells' claims are jointly licensed by both paths by construction.
 
-**MAJOR-4 — the parallax statistic is not the protocol's.** PROTOCOL 3.2: "parallax at pair
-level is the median of per-point baseline over ground-truth depth across the pair's
-co-visible point set." Implemented as `baseline / context_median_depth_m`
-([datasets.py:177](src/lot/datasets.py:177)), where the median is over the **entire context
-frame's valid depth map**, read from the frame-stats sidecar. Since baseline is constant per
-pair, `median(b/d) = b/median(d)` — so the form is equivalent *only if* the depth set is the
-co-visible set. It is not. The denominator is computed over a different, larger population,
-and this quantity is the binning variable for the primary parallax analysis.
+### Minors
 
-**MAJOR-5 — Neighbor-Patch's offset direction is random per sample.** PROTOCOL 3.6: "The
-offset is a single fixed direction applied identically to every record; the direction used
-by the completed Phase 3 run is normative." Implemented: four candidate offsets, one drawn
-per sample by `torch.multinomial` over the in-bounds options
-([correspondence.py:207](src/lot/correspondence.py:207)). The direction therefore varies
-record to record and there is no single normative direction to transcribe into a config.
+- **F-2 (minor)** — "The centered metric moves every value up and changes no
+  ordering": the first half verifies everywhere; the second fails for exactly
+  one adjacent near-tie on the translation splat path (0.1-0.2 vs 0.4+:
+  raw 0.1217 < 0.1227, centered 0.1382 > 0.1347). Per-point orderings and all
+  rotation orderings are unchanged.
+- **F-4 (minor)** — methods-note calibration sentence: "less than 4 percent of
+  … the 0.072 one-patch localization cost" is 0.003/0.072 = **4.17%**. The
+  governing 10% re-check against corrected margins holds (8.5%).
+- **G-1 (minor, protocol gap)** — PROTOCOL 3.2's parallax ("median of per-point
+  baseline over ground-truth depth across the pair's co-visible point set")
+  does not name which view's depth; the implementation uses the target-view
+  depth of each co-visible point ([evaluate.py:449](src/lot/evaluate.py:449)).
+  Record the decision in AMENDMENTS.md.
+- **G-2 (minor, protocol gap)** — `coverage_mean` is NaN on per-point rows
+  (coverage is a splat-path property). PROTOCOL 3.2's "no other row may carry a
+  nonfinite score" is read as covering scores, which coverage is not; the
+  reading should be recorded. Same reading applies to the centered-intersect
+  column of Mean-Feature rows (structural N/A, consistent with 3.2's one
+  representation).
 
-**MAJOR-6 — Random-Patch is neither hash-deterministic nor a patch.** PROTOCOL 3.6: "the
-patch index derives from a fixed hash of the record's sample_id, so the same record receives
-the same null regardless of batching or execution order." Implemented as sequential
-`torch.rand` draws from a per-pair generator
-([correspondence.py:214](src/lot/correspondence.py:214)) — reproducible given identical
-ordering, but order-dependent, not per-record. Separately, `rand01 * span` yields a
-**continuous** location that is then bilinearly interpolated, so the value read is a blend
-of up to four patches rather than "a random patch". Both diverge from the frozen definition.
-(The scoping claim that Random-Patch is drawn inside the context image, never across scenes,
-**is** correct — `span` is built from the context grid.)
+### Notes
 
-**MAJOR-7 — the primary parallax curve and table pool all three regimes.** PROTOCOL 3.3:
-"Orbit pairs never appear as points on the primary rotation curve or the primary parallax
-curve." `margin_versus_parallax.png` is built with `regimes=None`
-([figures.py:390](src/lot/figures.py:390)), and the console parallax table calls `_axis_table`
-without the `regimes` argument ([figures.py:229](src/lot/figures.py:229)), as does
-`summary_table` ([figures.py:140](src/lot/figures.py:140)). Orbit and rotation pairs land on
-the primary parallax curve. The rotation figure and table **do** correctly restrict to
-`regimes=("rotation",)`.
-
-**MAJOR-8 — required figures are missing or do not plot the required series.**
-PROTOCOL 3.10 requires four. Only two figure files are produced, both from one function
-`margin_versus_axis_figure` ([figures.py:270](src/lot/figures.py:270)).
-
-- **Figure A** (null ladder per encoder, raw and centered): no figure. The data is in
-  `summary_table` and the console summary.
-- **Figure B** (ceiling **and** No-Warp-Copy floor vs parallax, translation regime): the
-  figure plots floor-subtracted **margins** only, with the floor implicit as the zero line
-  (`axhline(0.0)`, y-label "margin over No-Warp-Copy"). The absolute ceiling and floor
-  curves 3.10 calls mandatory are not plotted. They do appear in the console `_axis_table`.
-  Also not restricted to translation — see MAJOR-7.
-- **Figure C** (vs rotation angle, in-place rotation only): regime restriction correct;
-  same margin-only issue.
-- **Figure D** (orbit joint rotation × parallax): **absent entirely.** No code path anywhere
-  selects the orbit regime.
-
-**MAJOR-9 — no support accounting and no greying.** PROTOCOL 3.4: "every bin reports
-n_scenes, n_camera_pairs, and n_feature_comparisons … Bins below the support threshold …
-remain plotted, are greyed, show their n."
-
-```bash
-grep -rn "n_scenes\|n_camera_pairs\|n_feature_comparisons\|support_threshold\|grey" src/   # no hits
-```
-
-`aggregate` emits a single `n_pairs` ([figures.py:122](src/lot/figures.py:122)). Bins are
-kept solely on presence, plotted with identical styling and no `n` annotation
-([figures.py:321](src/lot/figures.py:321)).
-
-**MAJOR-10 — no uncertainty quantification at all.** PROTOCOL 3.4: "bootstrap resampling at
-the scene level as the primary interval, camera-pair level as the secondary." `grep -rn
-"bootstrap\|resample\|confidence" src/` returns only two unrelated depth-percentile lines in
-render_replica.py. No interval is computed anywhere, so no bin, margin, or headline number in
-FINDINGS.md carries one.
-
-**MAJOR-11 — margins are paired on the camera pair, not on sample_id.** PROTOCOL 3.7: "All
-derived differences … are paired: computed on the intersection of the compared variants'
-valid records." `PAIR_KEYS = ("scene", "context_frame_id", "target_frame_id", "encoder",
-"path")` ([figures.py:42](src/lot/figures.py:42)). Within a path all variants do share one
-sample set by construction, so this is not currently wrong in effect — but it is not the
-specified operation, and it cannot be made so without BLOCKER-3.
-
-**MAJOR-12 — metric is a column, not a row dimension.** PROTOCOL 3.2 lists "metric name,
-metric value" among the fields each scored record carries. Four wide metric columns are
-stored instead. This changes what "one record" means and therefore every record-count
-derivation in VALIDATION 4.1.
-
-**MAJOR-13 — the in-place rotation regime's zero translation is never asserted from the
-manifest, and manifest poses are simulator read-backs.** PROTOCOL 3.3: "translation is
-exactly zero by construction and is asserted from the manifest." `render_scene` stores
-`T_world_from_camera=T_readback` ([render_replica.py:1366](src/lot/render_replica.py:1366)),
-the pose read back from Habitat, not the planned pose. `validate_manifest` checks regimes,
-intrinsics, and rotation orthonormality but **never** that rotation-regime frames share a
-position. The residual is recorded only as an aggregate,
-`metadata.pose_readback_max_abs_err`. Meanwhile `ZERO_PARALLAX_TOL = 1e-9`
-([datasets.py:69](src/lot/datasets.py:69)) decides whether a pair lands in the zero-parallax
-bin. If read-back error exceeds 1e-9 m, rotation pairs silently leave the zero bin. Whether
-they do **cannot be checked** — no manifests exist. This also bears directly on PROTOCOL
-4.5's pure-rotation gate, which is a hard invariant for Phase 4.
-
-**MAJOR-14 — two of five nulls exist on only one path.** Neighbor-Patch and Random-Patch are
-computed on `per_point` only ([evaluate.py:298](src/lot/evaluate.py:298) vs
-[evaluate.py:319](src/lot/evaluate.py:319)). PROTOCOL 3.5 runs both paths; 3.10 Figure A asks
-for the full five-variant ladder. Confirmed on a real table.
-
-**MAJOR-15 — the permanent batch-equality test is gated and unreachable in practice.**
-PROTOCOL 3.1: "The single-frame shape test and the batch-equality test remain in the suite
-permanently." `test_vggt_batching_does_not_mix_frames`
-([test_encoder_cache.py:459](tests/test_encoder_cache.py:459)) and
-`test_dinov2_grid_orientation_and_shape` ([test_encoder_cache.py:370](tests/test_encoder_cache.py:370))
-are both `skipif(not os.environ.get("LOT_ENCODER_SMOKE"))`, and **no script, sbatch template,
-or config sets that variable** — the baseline run skips them:
-
-```
-SKIPPED [1] tests\test_encoder_cache.py:366: set LOT_ENCODER_SMOKE=1 …
-SKIPPED [1] tests\test_encoder_cache.py:455: set LOT_ENCODER_SMOKE=1 …
-```
-
-The skip reason is loud rather than silent (visible with `-rs`), which is to the
-implementation's credit. VALIDATION Part 5 requires this test be **run on the cluster and
-confirmed to pass rather than skip**; that could not be done here. The ungated companion
-asserting the length-one sequence axis does run and does pass.
-
-### Minors and protocol gaps
-
-- **MINOR-1** — co-visibility tolerance `0.015` hard-coded at
-  [visibility.py:48](src/lot/visibility.py:48) rather than read from the normative config.
-  Downstream of BLOCKER-1.
-- **MINOR-2** — depth-convention decision thresholds are function defaults
-  (`flat_tol=0.01, margin=3.0, center_crop=0.5`, [render_replica.py:282](src/lot/render_replica.py:282)),
-  and frame-usability thresholds are module constants
-  ([render_replica.py:660](src/lot/render_replica.py:660)). Both are named by PROTOCOL's
-  preamble as config-resident. Downstream of BLOCKER-1.
-- **MINOR-3** — PROTOCOL 3.4 asserts the open interval (0, 0.025) is empty by the
-  translation program's design floor, and says a bin must be **added** if any pair falls
-  there. The implementation already has a `0-0.025` bin that would absorb such pairs
-  silently, so the assertion is never enforced.
-- **MINOR-4** — pairs with no co-visible surface reach the parquet with NaN in all four
-  metric columns ([evaluate.py:105](src/lot/evaluate.py:105)). VALIDATION 4.3 permits exactly
-  one missing metric and this is not it. Real incidence unknown.
-- **MINOR-5** — bin intervals are half-open on the left (`value <= edge`,
-  [datasets.py:90](src/lot/datasets.py:90)). PROTOCOL does not specify the side. **Protocol
-  gap**, to be recorded in AMENDMENTS.md.
-- **MINOR-6** — the analytic two-plane occlusion test cannot detect last-write-wins
-  z-buffering; in all 6272 contested pixels the two policies coincide, and the test asserts
-  on the zbuffer diagnostic rather than the pooled features. See Part 3, 3.3.
-- **NOTE-1** — DINOv2 preprocessing performs no resize or crop by deliberate design
-  ([encoders.py:220](src/lot/encoders.py:220)); a resize would invalidate the manifest
-  intrinsics. A defensible deviation from the letter of VALIDATION 1.9.
-- **NOTE-2** — the renderer's depth-convention test generalises PLAN's literal "constant
-  across the wall" to a plane-fit residual comparison, documented in the docstring and
-  motivated in FINDINGS by 9 of 18 scans being off gravity alignment. Verified correct.
-- **NOTE-3** — PROTOCOL 4.1's VGGT secant regression and the nearest-neighbor resampling
-  requirement have no implementation. Phase 4 has not begun, so this is a readiness note,
-  not a conformance failure.
+- **N-1** — PROTOCOL 4.1's secant regression and nearest-neighbor resampling
+  have no implementation yet; Phase 4 has not begun (readiness, not
+  conformance). The validator's independent implementation of the secant
+  procedure is demonstrated correct on both synthetic conventions and is
+  available for the Phase 4 cross-check.
+- **N-2** — Two illustrative constants inside frozen PROTOCOL prose predate the
+  corrected run: 3.7's motivating example (0.967 vs 0.964; corrected pooled
+  analog 0.9528 vs 0.9536 — the saturated-scale point stands, now with a
+  slightly negative pooled margin) and 3.8's "roughly 0.80 to 0.54" (corrected
+  0.807 → 0.515 — monotone decay confirmed). PROTOCOL is never edited; worth a
+  clarifying AMENDMENTS entry when one is next written.
+- **N-3** — VALIDATION.md instructs appending dated notes to itself while
+  FREEZE.md pins it by hash; resolved by keeping it byte-frozen and recording
+  notes here (dated note 2).
+- **N-4** — the zero-rotation dispersion pool is 3,590 translation + 1,227
+  orbit pairs; FINDINGS' "which are the translation programme" is imprecise
+  prose around a correct number (0.00389).
+- **N-5** — "agree there to within 0.001" holds at FINDINGS' own printed
+  precision; the strict maximum is 0.00101 (centered, 20-30°).
+- **N-6** — "five hundred times inside the frozen 1e-4 tolerance" is exact for
+  the per-point reconstruction (2.0e-7) and generous for the splat side
+  (6.3e-7 ≈ 158×).
+- **N-7** — the shipped figures were rendered by matplotlib 3.10.9; this
+  audit's environment has 3.10.3. Regeneration from the frozen code and the
+  shipped parquet reproduces the results table **bit-exactly** (436 rows, every
+  numeric column including all bootstrap intervals) and all four figures with
+  identical dimensions but version-different pixels. PLAN Phase 8's
+  byte-identical criterion will need a pinned plotting environment.
+- **N-8** — VALIDATION.md 1.2/3.5's arccos-clamp wording is superseded by
+  PROTOCOL 3.12's skew-vs-trace mandate, which the implementation follows;
+  audited accordingly (dated note 3), with the overshoot bug class still
+  mutation-covered (ra_3.5).
 
 ---
 
 ## Unverified — listed, not assumed
 
-1. VALIDATION 2.3, the one-scene row-by-row reproduction of apartment_0 (the designated
-   centerpiece).
-2. VALIDATION 2.4, aggregate reproduction against the historical parquet under its own
-   definitions, and against the corrected re-run under the frozen ones.
-3. VALIDATION 4.1's reconciliation of 29,196 comparisons and 233,536 records, including the
-   cause of the 32-row difference.
-4. VALIDATION 4.2's population checks: per-regime pair counts against render program
-   parameters, parallax-inside-assigned-bin, the translation program's rotation bound, and
-   exact-zero translation for rotation-program pairs.
-5. VALIDATION Part 5 in full: all 95 quantitative claims in FINDINGS.md
-   (`validation/evidence/claims_table.md`).
-6. The real-weights VGGT batch-equality test and the DINOv2 grid-orientation test.
-7. Whether the shipped Phase 3 parquet contains nonfinite scores or duplicate keys.
-8. Whether real rotation-program pairs satisfy `baseline < 1e-9` and therefore land in the
-   zero-parallax bin (MAJOR-13).
+Everything below requires `data/` and `cache/` on the Borah cluster, which
+this session cannot reach non-interactively (K5):
+
+1. VALIDATION 2.3's centerpiece: the independent row-by-row reproduction of
+   apartment_0 from the frozen caches, manifests, and persisted sample
+   identities. The aggregate layer above the rows is fully and exactly
+   verified (2.4, Part 5); the pixels-to-rows step is covered only by the
+   implementation's own committed ledger evidence, which is self-evidence.
+2. 2.1/2.2 on real manifest pairs (surrogates passed).
+3. Independent recomputation of the global mean vector and the raw
+   Mean-Feature scores from the caches (representation and object-identity
+   checks passed from rows and source).
+4. The renderer depth-convention probe on real raw output, and
+   `metadata.depth_convention` across the 18 manifests (classifier verified on
+   ground truth; `validate_manifest` refuses unresolved conventions, and the
+   run passed it — indirect).
+5. Manifest-derived population design: 5,136 = 107 × 48, per-regime frame
+   totals 1,381/1,790/1,907, usable 5,078, per-scene depth statistics, navmesh
+   recomputation records. (Row-level corroborations passed: 18 scenes 13/5,
+   107 viewpoints with frl_apartment_2 = 5, frames-used ⊆ usable.)
+6. The direct cluster log of the real-weights batch-equality and
+   grid-orientation tests (wiring verified: they run ungated before every
+   caching job under `set -e`; the caches' existence is indirect evidence).
+7. The per-cell ledger parquets (~27M rows) behind the committed
+   `report.json`; the report's every quoted number was verified against it,
+   and the margins table was reproduced independently and exactly, but the
+   cells themselves are cluster-only.
+8. Real-scene byte-determinism of evaluation (synthetic-scene determinism
+   passed; the sampler is RNG-free by design).
+9. Content pinning of `data/` (dated note 1); `cache/` is pinned per scene via
+   the digests carried in the pinned run records.
 
 ---
 
 ## Sign-off
 
-**Verdict: FAIL.**
+**Verdict: pass with findings — no blockers; 3 majors (R-1, F-1, F-3); 4
+minors (F-2, F-4, G-1, G-2); 8 notes.**
 
-**Blockers (4):** BLOCKER-1 normative artifact set incomplete and uncommitted; BLOCKER-2
-Mean-Feature is not the frozen object and is three different objects; BLOCKER-3 `sample_id`
-absent, making Phase 4's specified operations structurally impossible; BLOCKER-4 no
-evaluation artifacts and no corrected re-run.
+VALIDATION.md's three-value vocabulary (pass / pass with minor findings /
+fail) does not name this grade; recording the mismatch per ground rule 5
+rather than rounding in either direction. The operational consequence the
+frozen text attaches to a verdict — "Phase 4 implementation does not start
+until blockers are resolved" — is not triggered: there are no blockers. The
+majors are two erratum-level prose corrections in FINDINGS (F-1, F-3), whose
+fixes change no conclusion and should be recorded and re-verified against the
+queries in `validation/evidence/reaudit/claims.json` before FINDINGS is cited,
+and one provenance flag (R-1) that is unresolvable retroactively and should be
+closed going forward by refusing dirty-tree evaluation runs.
 
-**Majors (15):** MAJOR-1 through MAJOR-15 above.
-
-Per VALIDATION.md, Phase 4 implementation does not start until the blockers are resolved and
-the resolution is re-verified by re-running the affected checks.
-
-The core is sound, and that is worth stating as plainly as the failures. Geometry,
-visibility, transport, coverage, the pixel-to-patch mapping, and the rotation angle all
-reproduce independently to 1e-14 pixels or better across all three regime shapes. All five
-prescribed mutants are killed under proven provenance with a green control. Both semantic
-negative controls pass decisively: the pipeline does not leak the target, and correspondence
-identity is load-bearing. The failures are concentrated in the analysis and reporting
-layer — floor definitions, binning, record identity, regime separation, support and
-uncertainty — and in the absence of the artifacts needed to check any of it against real
-numbers.
-
-The validator signs off only on what was checked. Everything in the Unverified list is
-unverified, not assumed.
+What this audit established positively, in one paragraph: the four normative
+artifacts verify against FREEZE.md at the freeze commit and at HEAD; the
+frozen source conforms to the frozen protocol on every Part 1 item, with all
+four blockers and all fifteen majors of the previous audit verifiably
+repaired; the corrected run's parquet was produced by byte-identical-to-frozen
+code under the frozen measurement identity, its accounting closes exactly at
+337,720 rows = 33,772 comparisons × 2 paths × 5 variants with zero
+mask-consistency violations, its populations honor every regime and binning
+invariant including exact-zero baselines for rotation pairs and exact-zero
+rotations for translation pairs, and the only nonfinite values are the single
+permitted representation; the 3.9 gate passes on the frozen statistic at the
+frozen tolerance (+0.000115 raw, +0.000175 centered) and reproduces
+independently; the shipped results table and support counts reproduce exactly
+(the table bit-for-bit, bootstrap intervals included); the dual-path margins
+table reproduces independently to zero difference with identical
+classifications; of 48 preregistered claim checks, 45 pass and the 3 failures
+are the prose findings above; all five prescribed mutants plus a supplementary
+one are killed under proven provenance with a green control, including the
+occlusion bug class the previous audit found uncovered; and both semantic
+negative controls show their preregistered signatures decisively. The
+validator signs off only on what was checked; everything in the Unverified
+list is unverified, not assumed.
 
 ---
 
 ## Reproducing this audit
 
 ```bash
-python validation/check_geometry.py          # 2.1, 2.2, 2.3 surrogate, 1.2, 1.3 -> 27/27
-python validation/mutate.py                  # 3.0-3.5 + 3.3b/3.3c
-python validation/check_semantic.py          # 3.6, 3.7
-python validation/check_forensics.py         # 4.1, 4.3, 1.7, 1.8, 2.5, 1.10
-python validation/check_depth_convention.py  # 2.6
+# kickoff hashes: FREEZE.md's own loop, plus validation/evidence/reaudit/outputs_pin.txt
+python validation/reaudit_forensics.py       # Part 4 + population/mask checks
+python validation/reaudit_claims.py          # Part 2.4 + Part 5 claim ledger
+python validation/check_geometry.py          # 2.1/2.2/2.3 surrogates (prior harness, re-run)
+python validation/check_depth_convention.py  # 2.6 (prior harness, re-run)
+python validation/reaudit_determinism.py     # 4.3 determinism + overwrite refusal
+python validation/reaudit_mutate.py          # Part 3 mutants (fresh copies, ra_*)
+python validation/reaudit_semantic.py        # 3.6 / 3.7 controls (fresh ra_sem_*)
+PYTHONPATH=src python -m lot.figures --eval-dir outputs/experiment_zero/eval \
+    --out-dir validation/evidence/reaudit/regen   # regeneration comparison
 ```
 
-| file | role |
+| evidence file (validation/evidence/reaudit/) | contents |
 |---|---|
-| `validation/independent.py` | reimplementation from protocol text; imports no `lot` |
-| `validation/probe_scene.py` | synthetic scene, smooth and surface-attached features |
-| `validation/mutate.py`, `run_one.py` | mutant construction and provenance-checked execution |
-| `validation/validator_test_clamp.py` | validator-defined test for VALIDATION 3.5 |
-| `validation/evidence/` | raw output of every run, plus the 95-claim table |
+| `outputs_pin.txt` | per-file and aggregate sha256 of outputs/ (K3) |
+| `forensics.json` | Part 4 accounting, hygiene, masks, populations |
+| `claims.json` | the 48-check claim ledger with every recomputed value |
+| `mutation_report.json` | Part 3 run tails and return codes |
+| `semantic_controls.json` | 3.6/3.7 raw aggregates |
+| `check_geometry_rerun.txt`, `check_depth_convention_rerun.txt` | prior-harness re-runs |
+| `regen/` | frozen-code regeneration of figures and table |

@@ -1,0 +1,111 @@
+{
+ "n_rows_total": 337720,
+ "accounting": {
+  "expected_rows_from_run_records": 337720,
+  "observed_rows": 337720,
+  "rows_match": true,
+  "expected_comparisons_pair_encoder_path": 67544,
+  "expected_cross_path_pair_encoder": 33772,
+  "pairs_considered_total": 16895,
+  "pairs_dropped_unscorable_total": 9,
+  "neighbor_omitted_total_meta": 0,
+  "groups_pair_encoder_path": 67544,
+  "groups_with_exactly_5_variants": 67544,
+  "per_scene_counter_match_all": true
+ },
+ "hygiene": {
+  "grain": [
+   "scene",
+   "context_frame_id",
+   "target_frame_id",
+   "encoder",
+   "path",
+   "variant"
+  ],
+  "duplicate_rows_at_grain": 0,
+  "nonfinite_by_column": {
+   "cosine_mean": {},
+   "l2_mean": {},
+   "cosine_centered_mean": {
+    "Mean-Feature/per_point": 33772,
+    "Mean-Feature/splat_pool": 33772
+   },
+   "l2_centered_mean": {
+    "Mean-Feature/per_point": 33772,
+    "Mean-Feature/splat_pool": 33772
+   },
+   "cosine_intersect_mean": {},
+   "cosine_centered_intersect_mean": {
+    "Mean-Feature/per_point": 33772,
+    "Mean-Feature/splat_pool": 33772
+   },
+   "coverage_mean": {
+    "Oracle-Transport/per_point": 33772,
+    "No-Warp-Copy/per_point": 33772,
+    "Neighbor-Patch/per_point": 33772,
+    "Random-Patch/per_point": 33772,
+    "Mean-Feature/per_point": 33772
+   }
+  },
+  "mean_feature_rows": 67544,
+  "mean_feature_centered_all_nan": true,
+  "nonfinite_raw_intersect_with_support": 0,
+  "rows_with_empty_intersection": 0,
+  "coverage_nan_per_point_rows": 168860,
+  "coverage_nonfinite_splat_rows": 0
+ },
+ "mask_consistency": {
+  "mask_same_within_path": 67544,
+  "popcount_eq_n": 67544,
+  "n_intersect_ok": 33772,
+  "coverage_difference_ok": 33772,
+  "violations": [],
+  "n_violations": 0
+ },
+ "population": {
+  "pairs_distinct": 16886,
+  "by_regime": {
+   "orbit": 9188,
+   "rotation": 4108,
+   "translation": 3590
+  },
+  "rotation_max_baseline_m": 0.0,
+  "rotation_max_parallax": 0.0,
+  "rotation_all_parallax_below_zero_tol": true,
+  "translation_max_rotation_deg": 0.0,
+  "translation_all_rotation_below_zero_tol": true,
+  "translation_rotation_bound_deg_config": 1e-07,
+  "translation_pairs_over_manifest_bound": 0,
+  "translation_pairs_in_forbidden_interval": 0,
+  "orbit_pairs_in_(0,0.025)": 0,
+  "strata_count": 473,
+  "max_pairs_in_stratum": 40,
+  "cap": 40
+ },
+ "binning": {
+  "parallax_bins_seen": [
+   "0.025-0.05",
+   "0.05-0.1",
+   "0.1-0.2",
+   "0.2-0.4",
+   "0.4+",
+   "zero"
+  ],
+  "rotation_bins_seen": [
+   "0-10",
+   "10-20",
+   "20-30",
+   "30-40",
+   "40-50",
+   "50+",
+   "zero"
+  ],
+  "rotation_regime_parallax_bins": [
+   "zero"
+  ],
+  "translation_regime_rotation_bins": [
+   "zero"
+  ]
+ },
+ "problems": []
+}

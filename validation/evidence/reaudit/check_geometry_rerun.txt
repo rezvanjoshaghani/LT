@@ -1,0 +1,43 @@
+D:\LT\validation\independent.py:76: RuntimeWarning: invalid value encountered in divide
+  u = fx * pts[..., 0] / z + cx
+D:\LT\validation\independent.py:77: RuntimeWarning: invalid value encountered in divide
+  v = fy * pts[..., 1] / z + cy
+=== 2.1 independent reprojection vs lot geometry ===
+[PASS] 2.1 rotation: relative_pose matrix: max|diff| = 2.220e-16
+[PASS] 2.1 rotation: 20 pixels reprojected: max pixel disagreement = 1.421e-14 px, max depth disagreement = 1.776e-15 m
+[PASS] 2.1 translation: relative_pose matrix: max|diff| = 0.000e+00
+[PASS] 2.1 translation: 20 pixels reprojected: max pixel disagreement = 0.000e+00 px, max depth disagreement = 0.000e+00 m
+[PASS] 2.1 orbit: relative_pose matrix: max|diff| = 2.776e-17
+[PASS] 2.1 orbit: 20 pixels reprojected: max pixel disagreement = 2.842e-14 px, max depth disagreement = 8.882e-16 m
+[PASS] 2.1b reversed relative pose is separable: max separation = 55.998 px, so the 0.1 px test is not vacuous
+
+=== 2.2 pure-rotation homography vs depth-based reprojection ===
+[PASS] 2.2 rotation pair has exactly zero translation: ||t|| = 0.000e+00 m
+[PASS] 2.2 homography equals lot reprojection at 3 depths: max disagreement over the full 98x98 grid = 5.684e-14 px
+[PASS] 2.2b single-K shortcut is separable from the general form: max separation = 2.881 px
+
+=== 2.3 surrogate: independent visibility and transport vs lot ===
+[PASS] 2.3a rotation: co-visible mask: 0 of 9604 pixels differ; independent covisible = 6941, lot = 6941
+[PASS] 2.3b rotation: transported features: max|diff| = 1.728e-07
+[PASS] 2.3c rotation: coverage: max|diff| = 2.919e-08 (float32 epsilon); coverage range lot = [0.000, 1.000]
+[PASS] 2.3a translation: co-visible mask: 0 of 9604 pixels differ; independent covisible = 7542, lot = 7542
+[PASS] 2.3b translation: transported features: max|diff| = 1.437e-07
+[PASS] 2.3c translation: coverage: max|diff| = 2.554e-08 (float32 epsilon); coverage range lot = [0.255, 1.000]
+[PASS] 2.3a orbit: co-visible mask: 0 of 9604 pixels differ; independent covisible = 4896, lot = 4896
+[PASS] 2.3b orbit: transported features: max|diff| = 1.819e-07
+[PASS] 2.3c orbit: coverage: max|diff| = 1.825e-08 (float32 epsilon); coverage range lot = [0.000, 1.000]
+[PASS] 2.3d coverage stays in [0,1] and has both extremes: min = 0.255, max = 1.000, exact-zero patches = 0, exact-one patches = 2
+
+=== 1.3 pixel-to-patch mapping ===
+[PASS] 1.3 pixel_to_patch_coords matches (u+0.5)/14-0.5: max|diff| = 0.000e+00 over 50 random coordinates
+[PASS] 1.3b bilinear feature sampling matches independent arithmetic: max|diff| = 0.000e+00 over 30 random locations
+
+=== 1.2 rotation angle ===
+[PASS] 1.2 rotation_angle_deg at 0.0 deg: independent 0.000000000 vs lot 0.000000000
+[PASS] 1.2 rotation_angle_deg at 7.5 deg: independent 7.500000000 vs lot 7.500000000
+[PASS] 1.2 rotation_angle_deg at 33.0 deg: independent 33.000000000 vs lot 33.000000000
+[PASS] 1.2 rotation_angle_deg at 179.0 deg: independent 179.000000000 vs lot 179.000000000
+[PASS] 1.2b arccos argument overshoot is clamped: arg = np.float64(1.0000000000001499) > 1 is True, lot returns 0.0 (finite = True)
+
+=== SUMMARY ===
+27 passed, 0 failed, of 27 checks

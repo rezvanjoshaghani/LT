@@ -1,0 +1,31 @@
+# Phase 2 batch: cache DINOv2 features for all 18 rendered scenes.
+# Phase 3 compares encoders, so VGGT is cached by a second run of the same
+# entrypoint against configs/cache_features_vggt.yaml.
+# Submit on the cluster:
+#   sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#          --array 0-17 scripts/cache_features.sbatch configs/cache_features_all.yaml
+renders_root: data/replica_renders
+cache_root: cache/features
+scenes:
+  - apartment_0
+  - apartment_1
+  - apartment_2
+  - frl_apartment_0
+  - frl_apartment_1
+  - frl_apartment_2
+  - frl_apartment_3
+  - frl_apartment_4
+  - frl_apartment_5
+  - hotel_0
+  - office_0
+  - office_1
+  - office_2
+  - office_3
+  - office_4
+  - room_0
+  - room_1
+  - room_2
+encoder: dinov2_vitb14
+batch_size: 8
+device: cuda
+export_depth: false

@@ -1,0 +1,11 @@
+# Phase 2 pilot: cache DINOv2 features for the pilot scene only.
+# Run after the Phase 1 render, from the repository root:
+#   python -m lot.encoders --config configs/cache_features_pilot.yaml
+renders_root: data/replica_renders
+cache_root: cache/features
+scenes:
+  - room_0
+encoder: dinov2_vitb14
+batch_size: 8
+device: cuda
+export_depth: false

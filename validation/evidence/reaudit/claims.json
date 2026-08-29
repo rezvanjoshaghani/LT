@@ -1,0 +1,489 @@
+{
+ "dinov2_raw_rotation_margins": {
+  "per_point": {
+   "0-10": 0.235558,
+   "10-20": 0.281514,
+   "20-30": 0.265296,
+   "30-40": 0.213315,
+   "40-50": 0.189021,
+   "50+": 0.159649
+  },
+  "splat_pool": {
+   "0-10": 0.235167,
+   "10-20": 0.280859,
+   "20-30": 0.263854,
+   "30-40": 0.212254,
+   "40-50": 0.187793,
+   "50+": 0.158664
+  }
+ },
+ "dinov2_raw_translation_margins": {
+  "per_point": {
+   "0.025-0.05": 0.05677,
+   "0.05-0.1": 0.078495,
+   "0.1-0.2": 0.12051,
+   "0.2-0.4": 0.149754,
+   "0.4+": 0.126449
+  },
+  "splat_pool": {
+   "0.025-0.05": 0.056902,
+   "0.05-0.1": 0.078747,
+   "0.1-0.2": 0.121685,
+   "0.2-0.4": 0.153616,
+   "0.4+": 0.122714
+  }
+ },
+ "vggt_centered_rotation_margins": {
+  "per_point": {
+   "0-10": 0.057189,
+   "10-20": 0.018432,
+   "20-30": -0.055642,
+   "30-40": -0.142798,
+   "40-50": -0.230555,
+   "50+": -0.333333
+  },
+  "splat_pool": {
+   "0-10": 0.056775,
+   "10-20": 0.017832,
+   "20-30": -0.056647,
+   "30-40": -0.143566,
+   "40-50": -0.230736,
+   "50+": -0.333691
+  }
+ },
+ "vggt_raw_rotation_margins": {
+  "per_point": {
+   "0-10": 0.009705,
+   "10-20": 0.003286,
+   "20-30": -0.006674,
+   "30-40": -0.018104,
+   "40-50": -0.030872,
+   "50+": -0.051858
+  },
+  "splat_pool": {
+   "0-10": 0.009667,
+   "10-20": 0.003252,
+   "20-30": -0.00679,
+   "30-40": -0.018197,
+   "40-50": -0.030989,
+   "50+": -0.05212
+  }
+ },
+ "dinov2_localization_gap_range_supported": [
+  0.0351,
+  0.137
+ ],
+ "dinov2_path_diff": {
+  "max_abs": 0.00664,
+  "share_below_0.002": 0.818,
+  "max_ratio": 0.0418,
+  "share_ratio_below_0.02": 0.682,
+  "cells": 22
+ },
+ "gate_3_9": {
+  "comparisons": 33772,
+  "signed_raw": 0.0001148,
+  "signed_centered": 0.0001746,
+  "mean_abs_raw": 0.0030367,
+  "mean_abs_centered": 0.0041745,
+  "median_abs_raw": 0.0007169,
+  "median_abs_centered": 0.0013914,
+  "max_abs_raw": 0.1867931,
+  "tolerance": 0.003
+ },
+ "dispersion_by_rotation_bin_raw": {
+  "0-10": 0.00308,
+  "10-20": 0.00265,
+  "20-30": 0.00275,
+  "30-40": 0.00266,
+  "40-50": 0.00253,
+  "50+": 0.00082,
+  "zero": 0.00389
+ },
+ "spearman_absd_vs_n_intersect_raw": -0.1568,
+ "near_zero": {
+  "supported_rows": 232,
+  "flagged": 27,
+  "flagged_all_vggt_raw": true,
+  "cases": {
+   "both_in_band": 22,
+   "not_robust": 4,
+   "one_in_band": 1
+  },
+  "flagged_by_quantity": {
+   "localization_gap": 18,
+   "oracle_margin": 4
+  },
+  "cross_validation_vs_shipped": {
+   "rows_merged": 248,
+   "max_abs_value_diff": 0.0,
+   "case_disagreements": 0,
+   "support_disagreements": 0
+  },
+  "not_robust_cells": [
+   "orbit/30-40 x 0.2-0.4/oracle_margin",
+   "orbit/30-40 x 0.4+/oracle_margin",
+   "orbit/zero x 0.2-0.4/oracle_margin",
+   "orbit/zero x 0.4+/oracle_margin"
+  ]
+ },
+ "materiality": {
+  "smallest_interpreted_effect_inclusive": 0.001296,
+  "ratios_inclusive": [
+   0.0886,
+   0.1348
+  ],
+  "one_in_band_effect": 0.003737,
+  "ratios_vs_one_in_band": [
+   0.0307,
+   0.0467
+  ]
+ },
+ "vggt_pooled_raw": {
+  "oracle": 0.9528,
+  "no_warp": 0.9536
+ },
+ "dinov2_centered_ceiling_translation_by_parallax": {
+  "0.025-0.05": 0.807,
+  "0.05-0.1": 0.7727,
+  "0.1-0.2": 0.711,
+  "0.2-0.4": 0.6168,
+  "0.4+": 0.515
+ },
+ "summary_table_comparison": {
+  "rows_compared": 396,
+  "mismatches": 0
+ },
+ "ledger": {
+  "verdict": "PASS",
+  "stop": [],
+  "raw_pairs": 33772,
+  "centered_pairs": 33772,
+  "max_abs_closure": 7.36464654451513e-16,
+  "max_abs_T3": 0.0,
+  "max_abs_T1": 1.998187748597502e-07,
+  "max_abs_T4": 6.30880331087269e-07,
+  "signed_T2_raw": 0.00011504246060902725,
+  "signed_T2_centered": 0.0001745653796424161,
+  "mean_abs_c": {
+   "dinov2_vitb14/raw": 0.012978175100437252,
+   "dinov2_vitb14/centered": 0.015028778130358147,
+   "vggt_1b/raw": 0.0012448639094189602,
+   "vggt_1b/centered": 0.006887255251569326
+  },
+  "boundary": {
+   "dinov2_vitb14/raw": {
+    "diff_over_level": 0.10924603703304485,
+    "ci": [
+     0.0008980556591400237,
+     0.001986470123187206
+    ],
+    "n_group": 12825753,
+    "n_rest": 2063656
+   },
+   "dinov2_vitb14/centered": {
+    "diff_over_level": 0.12160234840804095,
+    "ci": [
+     0.0012491024380954408,
+     0.002455769652629655
+    ],
+    "n_group": 12825753,
+    "n_rest": 2063656
+   },
+   "vggt_1b/raw": {
+    "diff_over_level": 0.40553830243312144,
+    "ci": [
+     0.00037470705888759337,
+     0.000654898027116665
+    ],
+    "n_group": 12825753,
+    "n_rest": 2063656
+   },
+   "vggt_1b/centered": {
+    "diff_over_level": 0.30503820409480276,
+    "ci": [
+     0.0014869912620166868,
+     0.002835084327053584
+    ],
+    "n_group": 12825753,
+    "n_rest": 2063656
+   }
+  },
+  "norm": {
+   "dinov2_vitb14/raw": {
+    "diff_over_level": -0.004349627348286328,
+    "ci": [
+     -0.0007249326288385105,
+     0.0004579534612161554
+    ],
+    "spearman": -0.02092090946239317
+   },
+   "dinov2_vitb14/centered": {
+    "diff_over_level": 0.00889425627444799,
+    "ci": [
+     -0.0005821890120292196,
+     0.00070927502758846
+    ],
+    "spearman": -0.029289273247350436
+   },
+   "vggt_1b/raw": {
+    "diff_over_level": -0.5375313951500597,
+    "ci": [
+     -0.0008498178729701643,
+     -0.0005192818235937053
+    ],
+    "spearman": 0.5505187889961174
+   },
+   "vggt_1b/centered": {
+    "diff_over_level": 0.05844756099667738,
+    "ci": [
+     -0.0003699011305607107,
+     0.0010325869498178947
+    ],
+    "spearman": -0.18589722408012216
+   }
+  }
+ },
+ "checks": [
+  {
+   "id": "C16 rotation 0-10 raw +0.2356/+0.2352",
+   "ok": true,
+   "evidence": "pp=0.23556 sp=0.23517"
+  },
+  {
+   "id": "C16 rotation 50+ raw +0.1596/+0.1587",
+   "ok": true,
+   "evidence": "pp=0.15965 sp=0.15866"
+  },
+  {
+   "id": "C17 translation 0.025-0.05 raw +0.0568/+0.0569",
+   "ok": true,
+   "evidence": "pp=0.05677 sp=0.05690"
+  },
+  {
+   "id": "C17 translation 0.4+ raw +0.1264/+0.1227",
+   "ok": true,
+   "evidence": "pp=0.12645 sp=0.12271"
+  },
+  {
+   "id": "C22 VGGT centered rotation series (6 bins x 2 paths)",
+   "ok": true,
+   "evidence": "{\"0-10\": [0.05719, 0.05678], \"10-20\": [0.01843, 0.01783], \"20-30\": [-0.05564, -0.05665], \"30-40\": [-0.1428, -0.14357], \"40-50\": [-0.23056, -0.23074], \"50+\": [-0.33333, -0.33369]}"
+  },
+  {
+   "id": "C22 monotone decreasing (per_point centered)",
+   "ok": true,
+   "evidence": "[0.0572, 0.0184, -0.0556, -0.1428, -0.2306, -0.3333]"
+  },
+  {
+   "id": "C23 VGGT raw endpoints +0.0097 .. -0.0519",
+   "ok": true,
+   "evidence": "0-10=0.00971 50+=-0.05186"
+  },
+  {
+   "id": "C24 VGGT margins negative >=20deg both paths both metrics",
+   "ok": true,
+   "evidence": "see series"
+  },
+  {
+   "id": "C24 paths agree there within 0.001 (at printed precision)",
+   "ok": true,
+   "evidence": "max |pp-sp| = 0.00101 (strictly 0.001 is exceeded by 1.4e-5 in the centered 20-30 bin)"
+  },
+  {
+   "id": "C15 DINOv2 margin > 0 in every supported primary cell (both metrics, both paths)",
+   "ok": true,
+   "evidence": "failures=[]"
+  },
+  {
+   "id": "C18 centered > raw for every DINOv2 primary cell",
+   "ok": true,
+   "evidence": "fails=[]"
+  },
+  {
+   "id": "C18 ordering of bins unchanged under centering",
+   "ok": false,
+   "evidence": "fails=[[\"translation\", \"splat_pool\", {\"0.025-0.05\": [0.0569, 0.0654], \"0.05-0.1\": [0.0787, 0.0902], \"0.1-0.2\": [0.1217, 0.1382], \"0.2-0.4\": [0.1536, 0.1713], \"0.4+\": [0.1227, 0.1347]}]]"
+  },
+  {
+   "id": "C19 one-patch cost spans 0.036..0.137 (verified at rounding precision)",
+   "ok": true,
+   "evidence": "min=0.0351 max=0.1370 over 116 supported cells"
+  },
+  {
+   "id": "C20 max |path diff| <= 0.013 on DINOv2 primary cells",
+   "ok": true,
+   "evidence": "{\"max_abs\": 0.00664, \"share_below_0.002\": 0.818, \"max_ratio\": 0.0418, \"share_ratio_below_0.02\": 0.682, \"cells\": 22}"
+  },
+  {
+   "id": "C20 ratio < 10% everywhere, < 2% in the large majority",
+   "ok": true,
+   "evidence": "{\"max_abs\": 0.00664, \"share_below_0.002\": 0.818, \"max_ratio\": 0.0418, \"share_ratio_below_0.02\": 0.682, \"cells\": 22}"
+  },
+  {
+   "id": "C13 33,772 comparisons, both paths",
+   "ok": true,
+   "evidence": "33772"
+  },
+  {
+   "id": "C14 signed aggregate +0.000115 raw",
+   "ok": true,
+   "evidence": "+0.000115"
+  },
+  {
+   "id": "C14 signed aggregate +0.000175 centered",
+   "ok": true,
+   "evidence": "+0.000175"
+  },
+  {
+   "id": "C14 gate passes at 0.003",
+   "ok": true,
+   "evidence": ""
+  },
+  {
+   "id": "C7 mean |d| 0.0030 raw / 0.0042 centered",
+   "ok": true,
+   "evidence": "0.00304 / 0.00417"
+  },
+  {
+   "id": "C7 median |d| 0.0007 raw / 0.0014 centered",
+   "ok": true,
+   "evidence": "0.00072 / 0.00139"
+  },
+  {
+   "id": "C9 zero-rotation dispersion 0.0039 raw",
+   "ok": true,
+   "evidence": "0.00389"
+  },
+  {
+   "id": "C9 50+ dispersion 0.0008 raw",
+   "ok": true,
+   "evidence": "0.00082"
+  },
+  {
+   "id": "C8 dispersion falls as common set grows (rho < 0)",
+   "ok": true,
+   "evidence": "spearman=-0.1568"
+  },
+  {
+   "id": "C21 27 of 232 supported cells flagged",
+   "ok": true,
+   "evidence": "supported=232 flagged=27"
+  },
+  {
+   "id": "C21 all flagged are VGGT raw",
+   "ok": true,
+   "evidence": ""
+  },
+  {
+   "id": "C25 22 both-in-band / 1 one-in-band / 4 not-robust",
+   "ok": true,
+   "evidence": "{\"both_in_band\": 22, \"not_robust\": 4, \"one_in_band\": 1}"
+  },
+  {
+   "id": "C25 FINDINGS' 16+6 split of the 22 both-in-band cells",
+   "ok": false,
+   "evidence": "{\"localization_gap\": 18, \"oracle_margin\": 4} (shipped table agrees with 18+4)"
+  },
+  {
+   "id": "C25x my independent margins table equals the shipped one (values and cases)",
+   "ok": true,
+   "evidence": "{\"rows_merged\": 248, \"max_abs_value_diff\": 0.0, \"case_disagreements\": 0, \"support_disagreements\": 0}"
+  },
+  {
+   "id": "C25 orbit 20-30 x 0.4+ localization +0.00180/+0.00176 d +0.00004",
+   "ok": true,
+   "evidence": "+0.00180/+0.00176 d=+0.00004 case=both_in_band"
+  },
+  {
+   "id": "C25 translation 0.2-0.4 oracle +0.00239/+0.00256 d -0.00017",
+   "ok": true,
+   "evidence": "+0.00239/+0.00256 d=-0.00017 case=both_in_band"
+  },
+  {
+   "id": "C25 orbit 10-20 x 0.4+ oracle +0.00374/+0.00296 d +0.00078 (one_in_band)",
+   "ok": true,
+   "evidence": "+0.00374/+0.00296 d=+0.00078 case=one_in_band"
+  },
+  {
+   "id": "C25 orbit zero x 0.2-0.4 oracle -0.00019/+0.00050 (not_robust)",
+   "ok": true,
+   "evidence": "-0.00019/+0.00050 case=not_robust"
+  },
+  {
+   "id": "C25 the 4 failing cells are the named orbit oracle cells",
+   "ok": true,
+   "evidence": "[\"orbit/30-40 x 0.2-0.4/oracle_margin\", \"orbit/30-40 x 0.4+/oracle_margin\", \"orbit/zero x 0.2-0.4/oracle_margin\", \"orbit/zero x 0.4+/oracle_margin\"]"
+  },
+  {
+   "id": "C26 '3 to 5 percent of even the smallest interpreted effect' (inclusive reading)",
+   "ok": false,
+   "evidence": "{\"smallest_interpreted_effect_inclusive\": 0.001296, \"ratios_inclusive\": [0.0886, 0.1348], \"one_in_band_effect\": 0.003737, \"ratios_vs_one_in_band\": [0.0307, 0.0467]}"
+  },
+  {
+   "id": "C26 same sentence under the narrow reading (the 0.00374 one-in-band cell)",
+   "ok": true,
+   "evidence": "[0.0307, 0.0467]"
+  },
+  {
+   "id": "2.4 shipped table values and margins reproduce exactly (primary analyses)",
+   "ok": true,
+   "evidence": "{\"rows_compared\": 396, \"mismatches\": 0}"
+  },
+  {
+   "id": "support_counts.parquet reproduces (scenes, pairs, comparisons)",
+   "ok": true,
+   "evidence": "mismatches=0 of 124"
+  },
+  {
+   "id": "L1 ledger verdict PASS with empty stop list",
+   "ok": true,
+   "evidence": "PASS"
+  },
+  {
+   "id": "L2 ledger covered 33,772 comparisons per metric",
+   "ok": true,
+   "evidence": "raw=33772 centered=33772"
+  },
+  {
+   "id": "L3 closure at float64 epsilon (7e-16)",
+   "ok": true,
+   "evidence": "7.4e-16/6.6e-16"
+  },
+  {
+   "id": "L4 T3 exactly zero",
+   "ok": true,
+   "evidence": "0.0"
+  },
+  {
+   "id": "L5 reconstruction 2e-7 per-point / 6e-7 splat vs 1e-4",
+   "ok": true,
+   "evidence": "T1=2.00e-07 T4=6.31e-07"
+  },
+  {
+   "id": "L6 ledger signed T2 equals the gate's signed aggregates",
+   "ok": true,
+   "evidence": "+0.000115 vs +0.000115"
+  },
+  {
+   "id": "L7 boundary contrast 11/12/41/31 percent, intervals exclude zero",
+   "ok": true,
+   "evidence": "{\"dinov2_vitb14/raw\": 0.109, \"dinov2_vitb14/centered\": 0.122, \"vggt_1b/raw\": 0.406, \"vggt_1b/centered\": 0.305}"
+  },
+  {
+   "id": "L8 86% of cells trip the boundary flag",
+   "ok": true,
+   "evidence": "0.861"
+  },
+  {
+   "id": "L9 norm contrast absent for 3 of 4, present for VGGT raw at -54% with Spearman +0.55",
+   "ok": true,
+   "evidence": "{\"dinov2_vitb14/raw\": -0.004, \"dinov2_vitb14/centered\": 0.009, \"vggt_1b/raw\": -0.538, \"vggt_1b/centered\": 0.058}"
+  },
+  {
+   "id": "L10 per-cell |c| 0.0130 DINOv2 vs 0.0012 VGGT raw",
+   "ok": true,
+   "evidence": "0.01298 / 0.00124"
+  }
+ ]
+}

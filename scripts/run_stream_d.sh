@@ -40,6 +40,17 @@ run_lot() {
     PYTHONPATH="$REPO_ROOT/src" "$MM" run -n "$LOT_ENV" "$@"
 }
 
+# Every evidence-producing mode refuses a dirty worktree. The check mode stays
+# ungated so a dirty tree can be diagnosed. Re-audit finding R-1.
+require_clean_tree() {
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "refusing to run from a dirty worktree:" >&2
+        git status --porcelain | head -20 >&2
+        exit 1
+    fi
+    echo "clean worktree at commit $(git rev-parse HEAD)"
+}
+
 cd "$REPO_ROOT"
 case "$MODE" in
 check)
@@ -71,6 +82,7 @@ check)
     run_lot python -m pytest tests/ -q
     ;;
 evaluate)
+    require_clean_tree
     # An existing directory is either this run's, interrupted, or an older run's.
     # The two need opposite treatment and only the evaluator can tell them apart:
     # it compares each parquet's stored run record against this run's config and
@@ -89,6 +101,7 @@ evaluate)
     echo "Per-scene run metadata is inside each parquet and beside it as <scene>.meta.json."
     ;;
 ledger)
+    require_clean_tree
     # The path-agreement ledger: preflight bit checks, exact decomposition of
     # the recorded per-path scores, and per-cell mechanism rows, one scene at
     # a time. Use the sbatch array on the cluster; this mode runs all scenes
@@ -97,12 +110,14 @@ ledger)
         --out validation/evidence/path_agreement_ledger
     ;;
 ledger-report)
+    require_clean_tree
     # Stop logic and the preregistered mechanism contrasts. Exits nonzero on
     # any stop condition; the freeze commit waits on this verdict.
     run_lot python -m lot.path_ledger --config "$CONFIG" --report \
         --out validation/evidence/path_agreement_ledger
     ;;
 margins)
+    require_clean_tree
     # Interpreted quantities under both paths, paired by sample_id, with the
     # near-zero classification and the wording each case licenses. Reads the
     # evaluation parquet only; it neither re-runs nor re-derives support.
@@ -110,9 +125,11 @@ margins)
         --out validation/evidence
     ;;
 counts)
+    require_clean_tree
     run_lot python -m lot.figures --eval-dir "$EVAL_DIR" --counts-only
     ;;
 figures)
+    require_clean_tree
     run_lot python -m lot.figures --eval-dir "$EVAL_DIR"
     ;;
 *)

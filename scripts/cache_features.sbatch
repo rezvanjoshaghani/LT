@@ -46,6 +46,16 @@ fi
 
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# Refuse a dirty worktree. Caches are normative inputs, and a cache built from
+# uncommitted code cannot name the code that built it. Re-audit finding R-1.
+if [ -n "$(git status --porcelain)" ]; then
+    echo "refusing to run from a dirty worktree:" >&2
+    git status --porcelain | head -20 >&2
+    exit 1
+fi
+echo "clean worktree at commit $(git rev-parse HEAD)"
+
 # The weight caches are set before anything loads a model. The encoder tests
 # below download the same checkpoints this job then encodes with, so setting
 # these afterwards would have sent the test downloads to the default locations

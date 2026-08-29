@@ -43,6 +43,19 @@ fi
 
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# Runs are provenance or they are nothing. The Stream D records carry a -dirty
+# marker because untracked SLURM logs shared the tree at run time; re-audit
+# finding R-1 is that the marker cannot separate logs from source edits after
+# the fact. The logs are gitignored now, so a clean tree is achievable, and
+# this job refuses to produce evidence without one.
+if [ -n "$(git status --porcelain)" ]; then
+    echo "refusing to run from a dirty worktree:" >&2
+    git status --porcelain | head -20 >&2
+    exit 1
+fi
+echo "clean worktree at commit $(git rev-parse HEAD)"
+
 # This job reads cached features and never loads an encoder, so it does not
 # request a GPU. An earlier revision ran the real-weight encoder tests here to
 # make PROTOCOL 3.1's permanent tests actually execute on the cluster. That was

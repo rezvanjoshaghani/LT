@@ -24,6 +24,16 @@ if [ -z "$MM" ]; then
 fi
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# Refuse a dirty worktree. Ledger evidence is committed and cited; it must
+# name the commit that produced it. Re-audit finding R-1.
+if [ -n "$(git status --porcelain)" ]; then
+    echo "refusing to run from a dirty worktree:" >&2
+    git status --porcelain | head -20 >&2
+    exit 1
+fi
+echo "clean worktree at commit $(git rev-parse HEAD)"
+
 "$MM" run -n "$LOT_ENV" python -m lot.path_ledger \
     --config "$CONFIG" \
     --scene-index "${SLURM_ARRAY_TASK_ID:-0}" \

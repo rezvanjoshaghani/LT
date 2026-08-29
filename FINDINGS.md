@@ -157,9 +157,11 @@ at the top of the parallax range will be genuinely hard.
 
 The 0.003 path-agreement tolerance was calibrated from the pilot run's
 aggregate discrepancy between direct per-point evaluation and splat-and-pool
-evaluation, and retained prospectively because it is less than 4 percent of
-the smallest effect interpreted in the study, the 0.072 one-patch localization
-cost. The tolerance gates the statistic it was calibrated on, the signed
+evaluation, and retained prospectively because it is about 4.2 percent of the
+smallest effect interpreted in the study at calibration time, the 0.072
+one-patch localization cost. Recomputed against the corrected margins, the
+ratio is 8.5 percent of the smallest supported one-patch cost, 0.035, which
+stays under the 10 percent amendment flag below. The tolerance gates the statistic it was calibrated on, the signed
 aggregate over pairs; per-pair dispersion between the two paths is reported
 beside it and judged by the path-agreement ledger
 (validation/evidence/path_agreement_ledger/), whose reconstruction and closure
@@ -263,7 +265,9 @@ metrics and both evaluation paths. In-place rotation, raw cosine: +0.2356
 per-point and +0.2352 splat-and-pool between 0 and 10 degrees, falling to
 +0.1596 and +0.1587 beyond 50. Translation, raw cosine: +0.0568 and +0.0569
 in the 0.025 to 0.05 parallax bin, rising to +0.1264 and +0.1227 above 0.4.
-The centered metric moves every value up and changes no ordering.
+The centered metric moves every value up. It changes no ordering on the
+per-point path. On the splat path one adjacent near-tie flips, the 0.1-0.2 and
+0.4+ translation bins, whose raw margins differ by 0.001.
 
 Landing one patch away from the correct location costs between 0.036 and
 0.137 depending on the cell, again under both paths. The agreement is
@@ -308,10 +312,10 @@ smaller than itself, so nothing here is certified by the gate; what is claimed
 is restricted to what both paths show.
 
 Twenty-two of the 27 have both paths inside the band, one sign, and both
-intervals clear of zero. Sixteen are localization gaps, for which the reading
+intervals clear of zero. Eighteen are localization gaps, for which the reading
 is that Oracle transport adds only a small, sign-consistent improvement over
 Neighbor-Patch: for instance VGGT orbit at 20 to 30 degrees and parallax above
-0.4, +0.00180 per-point and +0.00176 splat-and-pool, difference +0.00004. Six
+0.4, +0.00180 per-point and +0.00176 splat-and-pool, difference +0.00004. Four
 are Oracle margins, read as a small, sign-consistent positive transport margin
 under both evaluation paths, quantitatively close to the No-Warp floor: VGGT
 translation in the 0.2 to 0.4 parallax bin gives +0.00239 and +0.00256,
@@ -345,11 +349,26 @@ which side the data falls on is the practice this study forbids elsewhere.
 The resolution is disclosure rather than recalibration. Those effects are not
 certified by the tolerance. They are reported under both validated evaluation
 paths, with both estimates and their difference shown, and the interpretation
-is restricted to content common to the two. The observed operator agreement,
-+0.000115 raw and +0.000175 centered, is between 3 and 5 percent of even the
-smallest interpreted effect, so no claim in this section turns on the choice
-of path; the four cells where a claim would have turned on it are reported as
+is restricted to content common to the two. Aggregate path bias is +0.000115
+raw and +0.000175 centered against the 0.003 tolerance. Relative to the
+smallest claim-carrying effect in this section, 0.0013, that bias is roughly
+9 to 13 percent; relative to the smallest effect interpreted outside the band,
+0.0037, it is roughly 3 to 5 percent. Near-zero claims are therefore reported
+under both paths rather than certified by the operator gate, and the four
+cells where a claim would have turned on the choice of path are reported as
 carrying no robust advantage.
+
+Corrections, 2026-08-28, from the re-audit (VALIDATION_REPORT.md): the split
+of the 22 both-in-band cells above previously read sixteen localization gaps
+and six Oracle margins; the evidence table says eighteen and four, and the
+text now matches it (finding F-1). The materiality paragraph previously
+claimed the operator agreement was 3 to 5 percent of even the smallest
+interpreted effect; that ratio holds only against the one path-sensitive cell
+at 0.0037, and the text now states both referents (finding F-3). Two smaller
+wording fixes from the same audit: the calibration note's "less than 4
+percent" is 4.2 percent (finding F-4), and the centering claim now names the
+one splat-path near-tie ordering flip (finding F-2). No number in the tables
+or evidence changed; these are corrections to prose that misdescribed it.
 
 Evidence: validation/evidence/path_margin_differences.parquet and its readable
 summary; validation/evidence/path_agreement_ledger/ for the decomposition and

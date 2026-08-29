@@ -560,7 +560,7 @@ def test_a_mislabelled_rotation_pair_trips_the_coordinate_gate(phase4_run):
 
 
 def test_report_ladder_from_the_fixture(phase4_run):
-    from lot.phase4_report import build_records, ladder_table, quantity_statistics
+    from lot.phase4_report import build_records, ladder_table, quantity_formulas
 
     analysis = phase4_run["analysis"]
     records = build_records(phase4_run["rows"], analysis)
@@ -577,12 +577,11 @@ def test_report_ladder_from_the_fixture(phase4_run):
     # and is suppressed rather than reported when the margin is tiny.
     if math.isfinite(aligned["retained_fraction"]):
         assert abs(aligned["retained_fraction"] - 1.0) < 0.1
-    quantities = quantity_statistics(analysis)
-    tiny = [
-        {"scene": "s", "camera_pair": ("a", "b"), "oracle_m": 0.5001,
-         "nowarp_m": 0.5, "est": 0.5, "oracle_full": 0.5, "n": 1, "n_gt": 1,
-         "transported_fraction": 1.0, "tax_boundary": float("nan"),
-         "tax_interior": float("nan"), "tax_lowtex": float("nan"),
-         "tax_hightex": float("nan")}
-    ]
-    assert math.isnan(quantities["retained_fraction"](tiny))
+    formulas = quantity_formulas(analysis)
+    tiny = {"oracle_m": 0.5001, "nowarp_m": 0.5, "est": 0.5, "oracle_full": 0.5,
+            "transported_fraction": 1.0}
+    assert math.isnan(formulas["retained_fraction"](tiny))
+    healthy = {"oracle_m": 0.7, "nowarp_m": 0.5, "est": 0.65, "oracle_full": 0.72,
+               "transported_fraction": 0.9}
+    assert abs(formulas["retained_fraction"](healthy) - 0.75) < 1e-12
+    assert abs(formulas["depth_tax"](healthy) - 0.05) < 1e-12

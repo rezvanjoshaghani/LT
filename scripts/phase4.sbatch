@@ -21,7 +21,13 @@
 
 set -euo pipefail
 
-CONFIG="${1:?usage: sbatch ... scripts/phase4.sbatch <config.yaml>}"
+CONFIG="${1:?usage: sbatch ... scripts/phase4.sbatch <config.yaml> [gates|evaluate]}"
+# Second argument picks what the array does. "gates" runs PROTOCOL 4.5's
+# pure-rotation correctness gates for every alignment level and writes gate
+# evidence without a parquet; "evaluate" is the full run. Same code, same
+# per-scene shape, so the gates can be cleared at array speed before any
+# result is produced.
+MODE="${2:-evaluate}"
 LOT_ENV="${LOT_ENV:-lot-encode}"
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
 
@@ -49,7 +55,21 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 echo "clean worktree at commit $(git rev-parse HEAD)"
 
-"$MM" run -n "$LOT_ENV" python -m lot.phase4 \
-    --config "$CONFIG" \
-    --scene-index "${SLURM_ARRAY_TASK_ID:-0}" \
-    --resume
+case "$MODE" in
+gates)
+    "$MM" run -n "$LOT_ENV" python -m lot.phase4 \
+        --config "$CONFIG" \
+        --scene-index "${SLURM_ARRAY_TASK_ID:-0}" \
+        --gates-only
+    ;;
+evaluate)
+    "$MM" run -n "$LOT_ENV" python -m lot.phase4 \
+        --config "$CONFIG" \
+        --scene-index "${SLURM_ARRAY_TASK_ID:-0}" \
+        --resume
+    ;;
+*)
+    echo "unknown mode '$MODE'; use gates or evaluate" >&2
+    exit 1
+    ;;
+esac

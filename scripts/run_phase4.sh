@@ -150,6 +150,10 @@ convention)
     ;;
 gates)
     require_clean_tree
+    # All 18 scenes in one process. The forced-collision gate builds extra
+    # transport plans per rotation pair, so this is the slow mode; on the
+    # cluster prefer the array, which runs the same code one scene per task:
+    #   sbatch --array 0-17 scripts/phase4.sbatch configs/phase4.yaml gates
     run_lot python -m lot.phase4 --config "$CONFIG" --gates-only
     ;;
 evaluate)
@@ -162,7 +166,18 @@ figures)
     ;;
 smoke)
     require_clean_tree
-    # The permanent real-weight encoder tests, PROTOCOL 3.1, on a GPU node.
+    # The permanent real-weight encoder tests, PROTOCOL 3.1. These load VGGT-1B
+    # and fall back to CPU when CUDA is absent, so on a login node they would
+    # quietly run a billion-parameter trunk on the CPU. Refuse instead: run
+    # this inside an allocation, for example
+    #   srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+    #        --gres=gpu:1 --time=00:30:00 --pty ./scripts/run_phase4.sh smoke
+    if ! run_lot python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+        echo "no CUDA device visible. These tests load real VGGT weights, so" >&2
+        echo "run them inside a GPU allocation rather than on a login node:" >&2
+        echo "  srun --gres=gpu:1 --time=00:30:00 --pty ./scripts/run_phase4.sh smoke" >&2
+        exit 1
+    fi
     mkdir -p "$RUN_DIR/evidence"
     export LOT_ENCODER_SMOKE=1
     run_lot python -m pytest tests/test_encoder_cache.py \

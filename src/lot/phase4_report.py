@@ -115,7 +115,6 @@ def build_records(
         key = (row["scene"], row["context_frame_id"], row["target_frame_id"], row["path"])
         by_key.setdefault(key, {})[f"{row['level']}|{row['population']}|{row['variant']}"] = row
 
-    level_names = dict(LEVELS)
     records: list[dict[str, Any]] = []
     for key, slots in by_key.items():
         scene, context_frame_id, target_frame_id, path = key
@@ -182,39 +181,75 @@ def group_by(records: Sequence[dict], keys: Sequence[str]) -> dict[tuple, list[d
     return grouped
 
 
-def _mean(records: Sequence[dict], field: str) -> float:
-    values = [r[field] for r in records if math.isfinite(r[field])]
-    return float(np.mean(values)) if values else float("nan")
+# The per-pair fields every reported quantity is built from. Each quantity is
+# a closed-form function of these fields' unweighted means over camera pairs,
+# which is what lets a replicate be summarized rather than re-pooled.
+FIELDS = (
+    "oracle_m", "est", "nowarp_m", "oracle_full", "transported_fraction",
+    "tax_boundary", "tax_interior", "tax_lowtex", "tax_hightex",
+)
 
 
-def quantity_statistics(analysis: AnalysisConfig) -> dict[str, Callable[[Sequence[dict]], float]]:
-    """Every reported quantity as a statistic over one cell's records.
+def scene_aggregates(records: Sequence[dict]) -> dict[str, dict[str, tuple[float, int]]]:
+    """Per scene, the sum and count of finite values of every field.
 
-    Each is a closed-form function of the records so the bootstrap can
-    recompute it whole inside every replicate, which is what makes the ratio
-    and difference intervals paired rather than assembled.
+    A resampled mean is sum-of-sums over sum-of-counts, so a bootstrap
+    replicate costs one pass over 18 scenes instead of one pass over every
+    record in the cell. The value is identical to pooling the records: the
+    statistic is still recomputed whole inside each replicate, from that
+    replicate's own means, which is what Addendum B requires of a ratio.
     """
+    out: dict[str, dict[str, list]] = {}
+    for record in records:
+        slot = out.setdefault(record["scene"], {field: [0.0, 0] for field in FIELDS})
+        for field in FIELDS:
+            value = record[field]
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                slot[field][0] += float(value)
+                slot[field][1] += 1
+    return {
+        scene: {field: (total, count) for field, (total, count) in fields.items()}
+        for scene, fields in out.items()
+    }
+
+
+def pooled_means(
+    aggregates: dict[str, dict[str, tuple[float, int]]], scenes: Sequence[str]
+) -> dict[str, float]:
+    """Field means over a (possibly resampled, possibly repeated) scene list."""
+    means: dict[str, float] = {}
+    for field in FIELDS:
+        total, count = 0.0, 0
+        for scene in scenes:
+            scene_total, scene_count = aggregates[scene][field]
+            total += scene_total
+            count += scene_count
+        means[field] = total / count if count else float("nan")
+    return means
+
+
+def quantity_formulas(analysis: AnalysisConfig) -> dict[str, Callable[[dict[str, float]], float]]:
+    """Every reported quantity as a closed form over one replicate's means."""
     eps = analysis.epsilon_margin
 
-    def retained(records: Sequence[dict]) -> float:
-        oracle_margin = _mean(records, "oracle_m") - _mean(records, "nowarp_m")
-        est_margin = _mean(records, "est") - _mean(records, "nowarp_m")
+    def retained(m: dict[str, float]) -> float:
+        oracle_margin = m["oracle_m"] - m["nowarp_m"]
         if not math.isfinite(oracle_margin) or abs(oracle_margin) < eps:
             return float("nan")
-        return est_margin / oracle_margin
+        return (m["est"] - m["nowarp_m"]) / oracle_margin
 
     return {
-        "matched_ceiling": lambda r: _mean(r, "oracle_m"),
-        "estimated_score": lambda r: _mean(r, "est"),
-        "matched_floor": lambda r: _mean(r, "nowarp_m"),
-        "depth_tax": lambda r: _mean(r, "oracle_m") - _mean(r, "est"),
-        "oracle_margin": lambda r: _mean(r, "oracle_m") - _mean(r, "nowarp_m"),
-        "estimated_margin": lambda r: _mean(r, "est") - _mean(r, "nowarp_m"),
+        "matched_ceiling": lambda m: m["oracle_m"],
+        "estimated_score": lambda m: m["est"],
+        "matched_floor": lambda m: m["nowarp_m"],
+        "depth_tax": lambda m: m["oracle_m"] - m["est"],
+        "oracle_margin": lambda m: m["oracle_m"] - m["nowarp_m"],
+        "estimated_margin": lambda m: m["est"] - m["nowarp_m"],
         "retained_fraction": retained,
-        "selection_differential": lambda r: _mean(r, "oracle_full") - _mean(r, "oracle_m"),
-        "transported_fraction": lambda r: _mean(r, "transported_fraction"),
-        "boundary_minus_interior_tax": lambda r: _mean(r, "tax_boundary") - _mean(r, "tax_interior"),
-        "lowtex_minus_hightex_tax": lambda r: _mean(r, "tax_lowtex") - _mean(r, "tax_hightex"),
+        "selection_differential": lambda m: m["oracle_full"] - m["oracle_m"],
+        "transported_fraction": lambda m: m["transported_fraction"],
+        "boundary_minus_interior_tax": lambda m: m["tax_boundary"] - m["tax_interior"],
+        "lowtex_minus_hightex_tax": lambda m: m["tax_lowtex"] - m["tax_hightex"],
     }
 
 
@@ -233,52 +268,48 @@ def is_supported(counts: dict[str, int], analysis: AnalysisConfig) -> bool:
     )
 
 
-def bootstrap_cell(
-    records: Sequence[dict],
-    statistic: Callable[[Sequence[dict]], float],
-    analysis: AnalysisConfig,
-) -> tuple[float, float, int]:
-    """Paired scene bootstrap for one cell and one statistic."""
-    by_scene: dict[str, list[dict]] = {}
-    for record in records:
-        by_scene.setdefault(record["scene"], []).append(record)
-    scenes = sorted(by_scene)
-    rng = np.random.default_rng(analysis.bootstrap_seed)
-    draws: list[float] = []
-    for _ in range(analysis.bootstrap_resamples):
-        picked = rng.integers(0, len(scenes), size=len(scenes))
-        pooled: list[dict] = []
-        for position in picked:
-            pooled.extend(by_scene[scenes[position]])
-        value = statistic(pooled)
-        if math.isfinite(value):
-            draws.append(value)
-    if not draws:
-        return float("nan"), float("nan"), 0
-    tail = (1.0 - analysis.bootstrap_confidence) / 2.0
-    return (
-        float(np.quantile(draws, tail)),
-        float(np.quantile(draws, 1.0 - tail)),
-        len(draws),
-    )
-
-
 def cell_summary(
     records: Sequence[dict],
     analysis: AnalysisConfig,
-    quantities: dict[str, Callable[[Sequence[dict]], float]],
+    formulas: dict[str, Callable[[dict[str, float]], float]],
     with_ci: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    """Point estimates, paired scene-bootstrap intervals, and support.
+
+    One draw of scenes serves every quantity in the cell, so the intervals
+    around a tax, its margins, and their ratio all come from the same
+    resampled scenes and carry the covariance the pairing gives them. The
+    replicate recomputes each quantity from its own means; nothing is
+    assembled from independently bootstrapped components.
+    """
     counts = support_counts(records)
     out: dict[str, Any] = {**counts, "supported": is_supported(counts, analysis)}
-    for name, statistic in quantities.items():
-        out[name] = statistic(records)
-        if name in with_ci:
-            low, high, replicates = bootstrap_cell(records, statistic, analysis)
-            out[f"{name}_ci_low"] = low
-            out[f"{name}_ci_high"] = high
-            out[f"{name}_ci_replicates"] = replicates
-            out["bootstrap_resamples"] = analysis.bootstrap_resamples
+    aggregates = scene_aggregates(records)
+    scenes = sorted(aggregates)
+    point = pooled_means(aggregates, scenes)
+    for name, formula in formulas.items():
+        out[name] = formula(point)
+    if not with_ci or not scenes:
+        return out
+
+    rng = np.random.default_rng(analysis.bootstrap_seed)
+    draws: dict[str, list[float]] = {name: [] for name in with_ci}
+    for _ in range(analysis.bootstrap_resamples):
+        picked = [scenes[i] for i in rng.integers(0, len(scenes), size=len(scenes))]
+        means = pooled_means(aggregates, picked)
+        for name in with_ci:
+            value = formulas[name](means)
+            if math.isfinite(value):
+                draws[name].append(value)
+    tail = (1.0 - analysis.bootstrap_confidence) / 2.0
+    for name in with_ci:
+        values = draws[name]
+        out[f"{name}_ci_low"] = float(np.quantile(values, tail)) if values else float("nan")
+        out[f"{name}_ci_high"] = (
+            float(np.quantile(values, 1.0 - tail)) if values else float("nan")
+        )
+        out[f"{name}_ci_replicates"] = len(values)
+    out["bootstrap_resamples"] = analysis.bootstrap_resamples
     return out
 
 
@@ -293,7 +324,7 @@ LADDER_CI = ("depth_tax", "oracle_margin", "estimated_margin", "retained_fractio
 
 def ladder_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict[str, Any]]:
     """PROTOCOL 4.10 Table 1: per regime and pooled, per metric, path, level."""
-    quantities = quantity_statistics(analysis)
+    formulas = quantity_formulas(analysis)
     table: list[dict[str, Any]] = []
     scopes = [("pooled", None), ("rotation", "rotation"),
               ("translation", "translation"), ("orbit", "orbit")]
@@ -301,7 +332,7 @@ def ladder_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict
         scoped = [r for r in records if regime is None or r["regime"] == regime]
         for key, cell in sorted(group_by(scoped, ("metric", "path", "level")).items()):
             metric, path, level = key
-            summary = cell_summary(cell, analysis, quantities, with_ci=LADDER_CI)
+            summary = cell_summary(cell, analysis, formulas, with_ci=LADDER_CI)
             table.append({
                 "analysis": scope_name, "metric": metric, "path": path,
                 "level": level, **summary,
@@ -311,13 +342,13 @@ def ladder_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict
 
 def bin_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict[str, Any]]:
     """Per-bin quantities behind Figures 1 to 4, one row per reported cell."""
-    quantities = quantity_statistics(analysis)
+    formulas = quantity_formulas(analysis)
     table: list[dict[str, Any]] = []
     for axis, regime in PRIMARY_REGIME.items():
         scoped = [r for r in records if r["regime"] == regime]
         for key, cell in sorted(group_by(scoped, ("metric", "path", "level", axis)).items()):
             metric, path, level, label = key
-            summary = cell_summary(cell, analysis, quantities, with_ci=LADDER_CI)
+            summary = cell_summary(cell, analysis, formulas, with_ci=LADDER_CI)
             table.append({
                 "analysis": regime, "axis": axis, "bin": label, "metric": metric,
                 "path": path, "level": level, **summary,
@@ -327,7 +358,7 @@ def bin_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict[st
         group_by(joint, ("metric", "path", "level", "rotation_bin", "parallax_bin")).items()
     ):
         metric, path, level, rlabel, plabel = key
-        summary = cell_summary(cell, analysis, quantities, with_ci=("depth_tax",))
+        summary = cell_summary(cell, analysis, formulas, with_ci=("depth_tax",))
         table.append({
             "analysis": JOINT_REGIME, "axis": "rotation_bin x parallax_bin",
             "bin": f"{rlabel} x {plabel}", "metric": metric, "path": path,

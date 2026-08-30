@@ -14,10 +14,26 @@ this file on the cluster before anything runs.
   worktree; the SLURM-log ignore rule was already committed at `4787937`).
 - Validation package commit: `aa977f4` (Stream F re-audit, pass with
   findings, preserved before any Phase 4 work).
-- Phase 4 execution commit: `b964c42` (lot.phase4, lot.phase4_report, the A3
-  config keys, tests, launch scripts, and the validator 2.3 script). The pin
-  covers this commit; the commit adding this file is bookkeeping on top of it
-  and changes no code.
+- Phase 4 execution commits. The measurement code was introduced at `b964c42`
+  (lot.phase4, lot.phase4_report, the A3 config keys, tests, launch scripts,
+  and the validator 2.3 script) and this pin was written at `6ac138d`. Three
+  commits follow, none of which touch a measurement path, and the runs are
+  made at the last of them:
+
+      96c66a3  cluster readiness. lot/phase4_report.py's paired scene
+               bootstrap was re-pooling every record per replicate, 60 s per
+               pooled cell; it now sums per-scene (sum, count) pairs, verified
+               equal to the pooled-records reference to 3.6e-15 with the
+               replicate still recomputing each quantity whole. Also the smoke
+               mode's CUDA guard, the gates array mode, and the runbook.
+      ea0730b  mode bits on the two launch scripts, content unchanged.
+      this one bookkeeping: the inspect mode read vggt.__file__, which is
+               None for a namespace package, plus this record.
+
+  src/lot/phase4.py is byte-identical to its `b964c42` form at every one of
+  them, so nothing that decides a row has moved since the pin was written.
+  The Phase 4 measurement digest below is unchanged across all four commits,
+  and every run record carries the commit it actually ran at.
 
 ## Frozen artifacts
 
@@ -75,10 +91,15 @@ landing rule). All predate any Phase 4 result.
   and every Phase 4 run record carries them forward.
 - Mean vector: reused from outputs/experiment_zero with its provenance
   record and vector digest; the loader refuses a mismatch.
-- Manifest-set content hash: computed on the cluster at `check` time
-  (`sha256sum data/replica_renders/*/manifest.json`, sorted-path aggregate)
-  and appended to outputs/phase4_rung1/evidence/ as the first run artifact,
-  because the manifests are not on this machine (re-audit dated note 1).
+- Manifest-set content hash, computed on Borah 2026-08-29 and recorded here
+  rather than only in gitignored evidence, closing the deferral that re-audit
+  dated note 1 left open:
+
+      99bf3e938ffeeb9a2c82a919ee37824c632a539901fb783fe37064e1f14b9046
+
+  over 18 manifests, as the sha256 of the sorted
+  `sha256sum data/replica_renders/*/manifest.json` listing. The per-file
+  listing is outputs/phase4_rung1/evidence/manifest_files.txt.
 
 ## Structural guarantees asserted before the run
 
@@ -92,6 +113,29 @@ landing rule). All predate any Phase 4 result.
 - The 4.5 gate tolerances, the confidence rule, and the mask
   operationalizations are config- and amendment-resident; nothing is
   introduced or loosened at run time.
+
+## Verified on Borah, 2026-08-29
+
+`./scripts/run_phase4.sh check` passed at `ea0730b`: frozen blobs verified
+against FREEZE.md, all five amendments listed, clean worktree, all four
+inputs present, both caches re-read and valid across 18 scenes (DINOv2
+`1159bd1e21ae`, VGGT `b9e29c09ce79` at revision `860abec7...` and code
+`a288dd0f...`, matching the pins above), Phase 3 measurement digest
+`27244e6481d521159e513f2ea8799482` and Phase 4 measurement digest
+`1579714398feff4771a9981e5f427c8a` both as recorded, suite 262 passed and 3
+skipped. Frame counts corroborate the Phase 1 record independently: 17 scenes
+at 288 plus frl_apartment_2 at 240 is 5,136.
+
+Depth convention, PROTOCOL 4.1's primary authority: established as planar
+camera-z from the installed VGGT source. `vggt/utils/geometry.py`'s
+`depth_to_cam_coords_points`, which is what VGGT's own
+`unproject_depth_map_to_point_map` uses to turn `predictions["depth"]` into
+points, assigns `z_cam = depth_map` directly with `x_cam` and `y_cam` scaled
+by depth over focal length, term for term the same as `lot.geometry.unproject`.
+A ray-distance head would have to divide by the secant of the pixel angle
+there and does not. The deterministic secant regression of 4.1 is therefore
+run as a consistency check, with the verdict passed in as `--doc-verdict
+planar_z`. Evidence: outputs/phase4_rung1/evidence/vggt_source_inspection.txt.
 
 ## Cluster execution order (all modes refuse a dirty worktree)
 

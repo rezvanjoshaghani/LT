@@ -117,23 +117,47 @@ inspect)
     # decision; pass the conclusion to convention as --doc-verdict.
     mkdir -p "$RUN_DIR/evidence"
     run_lot python - <<'PY' | tee "$RUN_DIR/evidence/vggt_source_inspection.txt"
-import inspect, pathlib
+import pathlib
 try:
     import vggt
 except ImportError:
     raise SystemExit("vggt is not installed in this environment")
-root = pathlib.Path(vggt.__file__).parent
-print("vggt package at", root)
-for rel in ("heads/dpt_head.py", "heads/head_act.py", "utils/geometry.py"):
-    path = root / rel
-    if not path.exists():
-        continue
-    text = path.read_text(encoding="utf-8", errors="replace")
-    print(f"\n===== {rel} =====")
-    for i, line in enumerate(text.splitlines(), 1):
-        low = line.lower()
-        if any(k in low for k in ("depth", "unproject", "point_map", "pointmap", "ray")):
-            print(f"{i:5d}: {line}")
+# VGGT installs as a namespace package, so __file__ is None and the package
+# directory has to come from __path__. Reading __file__ alone raised here.
+roots = [pathlib.Path(p) for p in getattr(vggt, "__path__", [])]
+if getattr(vggt, "__file__", None):
+    roots.append(pathlib.Path(vggt.__file__).parent)
+roots = sorted({r for r in roots if r.is_dir()})
+if not roots:
+    raise SystemExit("vggt imported but its package directory could not be located")
+print("vggt package roots:", *[str(r) for r in roots], sep="\n  ")
+
+# The decisive evidence is how VGGT itself turns predictions["depth"] into 3D
+# points: a planar-z head assigns z = depth directly, while a ray-distance
+# head must divide by the secant of the pixel angle first. Print those
+# function bodies whole rather than grepping lines out of context.
+DECISIVE = ("depth_to_cam_coords_points", "depth_to_world_coords_points")
+KEYS = ("depth", "unproject", "pointmap", "point_map", "world_points", "ray")
+for root in roots:
+    for path in sorted(root.rglob("*.py")):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for name in DECISIVE:
+            for index, line in enumerate(lines):
+                if line.startswith(f"def {name}"):
+                    end = index + 1
+                    while end < len(lines) and not lines[end].startswith("def "):
+                        end += 1
+                    print(f"\n===== {path.relative_to(root)}: {name} =====")
+                    for offset, body in enumerate(lines[index:end], index + 1):
+                        print(f"{offset:5d}: {body}")
+        hits = [
+            (i, l) for i, l in enumerate(lines, 1)
+            if any(k in l.lower() for k in KEYS)
+        ]
+        if hits and path.name in ("vggt.py", "dpt_head.py", "head_act.py"):
+            print(f"\n===== {path.relative_to(root)} ({len(hits)} matching lines) =====")
+            for i, l in hits[:60]:
+                print(f"{i:5d}: {l}")
 PY
     echo "inspection -> $RUN_DIR/evidence/vggt_source_inspection.txt"
     ;;

@@ -165,6 +165,56 @@ measurement code, so the state is re-pinned here.
   scoring, and feature code are untouched, and `src/lot/phase4_report.py` is
   not modified.
 
+## Re-pin after the Phase 4 code review, 2026-08-29
+
+A second review against the closure commit found ten defects, all fixed
+before any evaluation ran, so nothing was discarded. The state is re-pinned
+at the commit containing this section; no Phase 4 eval parquet, table, or
+figure exists yet.
+
+What changed in measurement code (`src/lot/phase4.py`):
+
+- Phase 3 inheritance is row-level, not name-level: per pair, the recomputed
+  validity masks must equal the persisted Phase 3 masks bit for bit and the
+  recomputed Oracle and No-Warp ceilings must reproduce the recorded scores
+  within `PHASE3_SCORE_RECON_TOL = 1e-5`, with the worst residual carried in
+  the run record. Phase 3's feature-cache digest and measurement identity are
+  compared before any pair is, and the Phase 3 source identity travels in
+  every Phase 4 run record.
+- The frozen 5a validity rule is applied to the depth maps themselves
+  (invalid pixels become NaN), so a nonnull confidence threshold would govern
+  transport and scoring, not only calibration. Null threshold: no behavior
+  change.
+- The multiplicative-level identity is asserted on the boolean sets, not
+  their counts.
+- The forced-collision gate checks raw and centered cosine; the unforced arm
+  runs on the same common source population as the forced one, so the
+  collision-ordering tax carries ordering only, not missingness; the forced
+  scores are persisted for Figure 2.
+- Run records carry the feature-encoder identity triple, the mean-vector
+  digest, the manifest digest, and the convention record fields; resume
+  refuses on any of them; rows carry the configured encoder.
+
+What changed in reporting code (`src/lot/phase4_report.py`): the report
+binds to the active Phase 4 measurement digest; refuses duplicate rows,
+partial matched arms, and mask-mismatched arms while counting legitimately
+empty scored sets; the cross-path disclosure uses the persisted intersection
+columns with a paired scene bootstrap on dM and includes the selection
+differential; affine accounting is per scope and an all-failed scope still
+emits its accounting row; localization contrasts intersect their arm
+populations per pair and carry their own support; Figure 1 shows the Phase 3
+reference ceiling; Figure 2 plots the forced-order control; cell summaries
+carry the secondary camera-pair bootstrap and the comparison-weighted
+diagnostic, and the reporting-digest note is printed when reporting values
+moved.
+
+Tolerances: no frozen threshold changed. `PHASE3_SCORE_RECON_TOL` is a new
+reconciliation bound for a new provenance check, an order of magnitude above
+the ledger's observed 2e-7 reconstruction and unrelated to any gate.
+
+Tests: 274 passed, 3 skipped, including tampered-mask, tampered-score,
+stale-provenance, partial-arm, and masked-validity regression cases.
+
 ## Cluster execution order (all modes refuse a dirty worktree)
 
     ./scripts/run_phase4.sh check

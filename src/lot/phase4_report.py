@@ -84,12 +84,36 @@ def read_phase4_dir(eval_dir: Path, analysis: AnalysisConfig) -> list[dict[str, 
             raise ValueError(f"{path} carries no run record")
         metas[path.stem] = meta
         rows.extend(pq.read_table(path).to_pylist())
+    # One run is one identity: the encoders, the depth convention, the mean
+    # vector, and the Phase 3 source, not only the version and seed. A scene
+    # evaluated from a different feature cache or under a different conversion
+    # would otherwise average into the table unremarked.
     for field in ("phase4_version", "seed", "phase4_measurement_digest",
                   "depth_weights_fingerprint", "depth_weights_revision",
-                  "depth_code_revision", "run_scenes", "git_commit"):
+                  "depth_code_revision", "run_scenes", "git_commit",
+                  "feature_encoder", "feature_weights_fingerprint",
+                  "feature_weights_revision", "feature_code_revision",
+                  "depth_encoder", "mean_vector_digest", "depth_convention",
+                  "depth_convention_conversion_applied", "phase3_git_commit",
+                  "phase3_measurement_digest", "analysis_reporting_digest"):
+        absent = sorted(s for s, m in metas.items() if m.get(field) is None)
+        if absent:
+            raise ValueError(
+                f"{eval_dir}: {len(absent)} run records carry no {field}, "
+                f"first {absent[0]}"
+            )
         values = {json.dumps(m.get(field), sort_keys=True) for m in metas.values()}
         if len(values) > 1:
             raise ValueError(f"{eval_dir} mixes runs: {field} takes {sorted(values)[:3]}")
+    # Per-scene by construction, so present is the check, not equality.
+    for field in ("features_digest", "depth_digest", "manifest_digest",
+                  "phase3_features_digest"):
+        absent = sorted(s for s, m in metas.items() if not m.get(field))
+        if absent:
+            raise ValueError(
+                f"{eval_dir}: {len(absent)} run records carry no {field}, "
+                f"first {absent[0]}"
+            )
     any_meta = next(iter(metas.values()))
     if any_meta.get("phase4_version") != PHASE4_VERSION:
         raise ValueError(
@@ -104,8 +128,10 @@ def read_phase4_dir(eval_dir: Path, analysis: AnalysisConfig) -> list[dict[str, 
     fingerprint = any_meta.get("depth_weights_fingerprint")
     if not (isinstance(fingerprint, str) and CONTENT_DIGEST.fullmatch(fingerprint)):
         raise ValueError("depth weights fingerprint is missing or malformed")
-    for field in ("depth_weights_revision", "depth_code_revision"):
-        if not is_pinned_revision(field.replace("depth_", ""), any_meta.get(field)):
+    for field in ("depth_weights_revision", "depth_code_revision",
+                  "feature_weights_revision", "feature_code_revision"):
+        kind = field.split("_", 1)[1]
+        if not is_pinned_revision(kind, any_meta.get(field)):
             raise ValueError(f"{field} {any_meta.get(field)!r} is not a pin")
     if str(any_meta.get("git_commit", "")).endswith("-dirty"):
         raise ValueError(
@@ -131,6 +157,15 @@ def read_phase4_dir(eval_dir: Path, analysis: AnalysisConfig) -> list[dict[str, 
         raise ValueError(
             f"{eval_dir} carries no record of its pair population having been "
             "reconciled against Phase 3; PROTOCOL 4.1 inherits those pairs"
+        )
+    if any_meta.get("analysis_reporting_digest") != analysis.reporting_digest():
+        # Permitted by PROTOCOL 3.4, which sets reporting values from counts
+        # after the run; said out loud rather than silently absorbed.
+        print(
+            "note: reporting config differs from the run's "
+            f"({any_meta.get('analysis_reporting_digest')} -> "
+            f"{analysis.reporting_digest()}). Bin edges, support thresholds, "
+            "bootstrap settings or gate tolerances changed since evaluation."
         )
     return rows
 
@@ -166,10 +201,19 @@ def build_records(
     # reported. build_records returns both counts alongside the records.
     mask_mismatches: list[tuple] = []
     affine_absent: set[tuple] = set()
+    empty_scored: dict[str, int] = {}
+    split_mask_mismatches = 0
     for key, slots in by_key.items():
         scene, context_frame_id, target_frame_id, path = key
         gt_oracle = slots.get(f"{GT_LEVEL}|{POPULATION_FULL}|{ORACLE_TRANSPORT}")
         if gt_oracle is None:
+            # A pair-path with matched rows but no ground-truth reference is a
+            # corrupt directory, not a smaller population.
+            if slots:
+                raise ValueError(
+                    f"{key}: rows exist but the ground-truth Oracle reference "
+                    "row is absent; the directory is corrupt or truncated"
+                )
             continue
         context = gt_oracle
         pbin = parallax_bin(context["parallax"], analysis)
@@ -178,11 +222,24 @@ def build_records(
             est = slots.get(f"{level}|{POPULATION_MATCHED}|{variant_name}")
             oracle_m = slots.get(f"{level}|{POPULATION_MATCHED}|{ORACLE_TRANSPORT}")
             nowarp_m = slots.get(f"{level}|{POPULATION_MATCHED}|{NO_WARP_COPY}")
-            if est is None or oracle_m is None or nowarp_m is None:
-                # An affine level that failed its fit contributes no matched
-                # arm. Counted below rather than vanishing.
+            present = [arm for arm in (est, oracle_m, nowarp_m) if arm is not None]
+            if len(present) not in (0, 3):
+                # The evaluator emits a level's arms together or not at all, so
+                # a partial slot means rows were lost or mixed in, and averaging
+                # what survived would remove pairs from the population silently.
+                raise ValueError(
+                    f"{key} level {level}: {3 - len(present)} of the three "
+                    "matched arms are missing; the directory is corrupt"
+                )
+            if not present:
+                # Complete absence is a legitimately empty scored set for the
+                # level, an affine fit failure, or coverage collapse. It is
+                # population information either way, so it is counted per level
+                # rather than dropped in silence.
                 if level == "affine":
                     affine_absent.add((scene, context_frame_id, target_frame_id, path))
+                else:
+                    empty_scored[level] = empty_scored.get(level, 0) + 1
                 continue
             # PROTOCOL 4.6 makes the tax a subset-matched quantity: the
             # estimated score, the matched ceiling, and the matched floor must
@@ -233,6 +290,7 @@ def build_records(
                     "oracle_intersect": oracle_m[INTERSECT_OF[metric]],
                     "nowarp_intersect": nowarp_m[INTERSECT_OF[metric]],
                     "n_intersect": est["n_intersect"],
+                    "oracle_full_intersect": gt_oracle[INTERSECT_OF[metric]],
                     # PROTOCOL 4.6's representation reference ceiling, carried
                     # through so it can be reported rather than only used to
                     # form the selection differential.
@@ -246,11 +304,21 @@ def build_records(
                 for split in SPLITS:
                     est_s = slots.get(f"{level}|{split}|{variant_name}")
                     oracle_s = slots.get(f"{level}|{split}|{ORACLE_TRANSPORT}")
+                    usable = (
+                        est_s is not None and oracle_s is not None
+                        and math.isfinite(est_s[metric])
+                        and math.isfinite(oracle_s[metric])
+                    )
+                    if usable and (
+                        bytes(est_s["sample_mask"]) != bytes(oracle_s["sample_mask"])
+                        or est_s["n"] != oracle_s["n"]
+                    ):
+                        # A split tax over two different sample sets is not a
+                        # tax; excluded and counted like the main arms.
+                        split_mask_mismatches += 1
+                        usable = False
                     record[f"tax_{split}"] = (
-                        oracle_s[metric] - est_s[metric]
-                        if est_s is not None and oracle_s is not None
-                        and math.isfinite(est_s[metric]) and math.isfinite(oracle_s[metric])
-                        else float("nan")
+                        oracle_s[metric] - est_s[metric] if usable else float("nan")
                     )
                 # A contrast is a difference between two arms, so a pair
                 # contributes to it only when it has both. Leaving one arm
@@ -266,6 +334,8 @@ def build_records(
         "mask_mismatched_arms": len(mask_mismatches),
         "mask_mismatch_examples": [list(m) for m in mask_mismatches[:5]],
         "affine_arms_absent": len(affine_absent),
+        "empty_scored_sets_by_level": empty_scored,
+        "split_mask_mismatches": split_mask_mismatches,
     }
 
 
@@ -291,8 +361,10 @@ FIELDS = (
 )
 
 
-def scene_aggregates(records: Sequence[dict]) -> dict[str, dict[str, tuple[float, int]]]:
-    """Per scene, the sum and count of finite values of every field.
+def unit_aggregates(
+    records: Sequence[dict], unit: str = "scene"
+) -> dict[Any, dict[str, tuple[float, int]]]:
+    """Per resampling unit, the sum and count of finite values of every field.
 
     A resampled mean is sum-of-sums over sum-of-counts, so a bootstrap
     replicate costs one pass over 18 scenes instead of one pass over every
@@ -300,18 +372,42 @@ def scene_aggregates(records: Sequence[dict]) -> dict[str, dict[str, tuple[float
     statistic is still recomputed whole inside each replicate, from that
     replicate's own means, which is what Addendum B requires of a ratio.
     """
-    out: dict[str, dict[str, list]] = {}
+    out: dict[Any, dict[str, list]] = {}
     for record in records:
-        slot = out.setdefault(record["scene"], {field: [0.0, 0] for field in FIELDS})
+        slot = out.setdefault(record[unit], {field: [0.0, 0] for field in FIELDS})
         for field in FIELDS:
             value = record[field]
             if isinstance(value, (int, float)) and math.isfinite(value):
                 slot[field][0] += float(value)
                 slot[field][1] += 1
     return {
-        scene: {field: (total, count) for field, (total, count) in fields.items()}
-        for scene, fields in out.items()
+        unit_value: {field: (total, count) for field, (total, count) in fields.items()}
+        for unit_value, fields in out.items()
     }
+
+
+def scene_aggregates(records: Sequence[dict]) -> dict[Any, dict[str, tuple[float, int]]]:
+    return unit_aggregates(records, "scene")
+
+
+def weighted_means(records: Sequence[dict]) -> dict[str, float]:
+    """Field means with each record weighted by its comparison count n.
+
+    The diagnostic PROTOCOL 3.4 puts beside the estimand, never in its place:
+    a pair's comparison count rises with the easier geometry, so the gap
+    between the weighted and unweighted numbers measures how much of a
+    reported quantity rides on that weighting.
+    """
+    out: dict[str, float] = {}
+    for field in FIELDS:
+        total, weight = 0.0, 0.0
+        for record in records:
+            value = record[field]
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                total += float(value) * record["n"]
+                weight += record["n"]
+        out[field] = total / weight if weight else float("nan")
+    return out
 
 
 def pooled_means(
@@ -415,23 +511,35 @@ def cell_summary(
     if not with_ci or not scenes:
         return out
 
-    rng = np.random.default_rng(analysis.bootstrap_seed)
-    draws: dict[str, list[float]] = {name: [] for name in with_ci}
-    for _ in range(analysis.bootstrap_resamples):
-        picked = [scenes[i] for i in rng.integers(0, len(scenes), size=len(scenes))]
-        means = pooled_means(aggregates, picked)
-        for name in with_ci:
-            value = formulas[name](means)
-            if math.isfinite(value):
-                draws[name].append(value)
-    tail = (1.0 - analysis.bootstrap_confidence) / 2.0
+    # The comparison-weighted diagnostic beside every interval-carrying
+    # quantity, per PROTOCOL 3.4. Diagnostic, never the headline.
+    weighted = weighted_means(records)
     for name in with_ci:
-        values = draws[name]
-        out[f"{name}_ci_low"] = float(np.quantile(values, tail)) if values else float("nan")
-        out[f"{name}_ci_high"] = (
-            float(np.quantile(values, 1.0 - tail)) if values else float("nan")
-        )
-        out[f"{name}_ci_replicates"] = len(values)
+        out[f"{name}_comparison_weighted"] = formulas[name](weighted)
+
+    # PROTOCOL 3.4: scene-level bootstrap primary, camera-pair secondary.
+    tail = (1.0 - analysis.bootstrap_confidence) / 2.0
+    for unit, prefix in (("scene", ""), ("camera_pair", "pair_")):
+        aggregates_u = aggregates if unit == "scene" else unit_aggregates(records, unit)
+        units = sorted(aggregates_u, key=repr)
+        rng = np.random.default_rng(analysis.bootstrap_seed)
+        draws: dict[str, list[float]] = {name: [] for name in with_ci}
+        for _ in range(analysis.bootstrap_resamples):
+            picked = [units[i] for i in rng.integers(0, len(units), size=len(units))]
+            means = pooled_means(aggregates_u, picked)
+            for name in with_ci:
+                value = formulas[name](means)
+                if math.isfinite(value):
+                    draws[name].append(value)
+        for name in with_ci:
+            values = draws[name]
+            out[f"{name}_{prefix}ci_low"] = (
+                float(np.quantile(values, tail)) if values else float("nan")
+            )
+            out[f"{name}_{prefix}ci_high"] = (
+                float(np.quantile(values, 1.0 - tail)) if values else float("nan")
+            )
+            out[f"{name}_{prefix}ci_replicates"] = len(values)
     out["bootstrap_resamples"] = analysis.bootstrap_resamples
     return out
 
@@ -443,6 +551,37 @@ def cell_summary(
 LADDER_CI = ("depth_tax", "oracle_margin", "estimated_margin", "retained_fraction",
              "selection_differential", "boundary_minus_interior_tax",
              "lowtex_minus_hightex_tax")
+
+# A contrast's support is its own, not the level's: a pair contributes only
+# when it carries both arms, so the contrast population can be far thinner
+# than the matched one and the overall flag would overstate it.
+CONTRASTS = {
+    "boundary_minus_interior_tax": ("tax_boundary", "tax_interior"),
+    "lowtex_minus_hightex_tax": ("tax_lowtex", "tax_hightex"),
+}
+
+
+def contrast_support(
+    records: Sequence[dict], analysis: AnalysisConfig
+) -> dict[str, Any]:
+    """Support counts and flags for each contrast, over both-arm pairs only."""
+    out: dict[str, Any] = {}
+    for name, (left, right) in CONTRASTS.items():
+        both = [
+            r for r in records
+            if math.isfinite(r[left]) and math.isfinite(r[right])
+        ]
+        counts = {
+            "n_scenes": len({r["scene"] for r in both}),
+            "n_camera_pairs": len({r["camera_pair"] for r in both}),
+        }
+        out[f"{name}_n_scenes"] = counts["n_scenes"]
+        out[f"{name}_n_camera_pairs"] = counts["n_camera_pairs"]
+        out[f"{name}_supported"] = (
+            counts["n_scenes"] >= analysis.support_min_scenes
+            and counts["n_camera_pairs"] >= analysis.support_min_camera_pairs
+        )
+    return out
 
 
 def ladder_table(
@@ -462,22 +601,26 @@ def ladder_table(
     table: list[dict[str, Any]] = []
     scopes = [("pooled", None), ("rotation", "rotation"),
               ("translation", "translation"), ("orbit", "orbit")]
-    attempted = {
-        key: len({r["camera_pair"] for r in cell})
-        for key, cell in group_by(
-            [r for r in records if r["level"] == "none"], ("metric", "path")
-        ).items()
-    }
     for scope_name, regime in scopes:
         scoped = [r for r in records if regime is None or r["regime"] == regime]
+        # Attempted counts are the scope's own. A run-wide total reused per
+        # regime reported failures that never happened in that regime.
+        attempted = {
+            key: len({r["camera_pair"] for r in cell})
+            for key, cell in group_by(
+                [r for r in scoped if r["level"] == "none"], ("metric", "path")
+            ).items()
+        }
+        affine_seen: set[tuple] = set()
         for key, cell in sorted(group_by(scoped, ("metric", "path", "level")).items()):
             metric, path, level = key
             summary = cell_summary(cell, analysis, formulas, with_ci=LADDER_CI)
             row = {
                 "analysis": scope_name, "metric": metric, "path": path,
-                "level": level, **summary,
+                "level": level, **summary, **contrast_support(cell, analysis),
             }
             if level == "affine":
+                affine_seen.add((metric, path))
                 contributed = len({r["camera_pair"] for r in cell})
                 total = attempted.get((metric, path), contributed)
                 row["affine_pairs_attempted"] = total
@@ -487,6 +630,24 @@ def ladder_table(
                     "fitted scale nonpositive or calibration population too small"
                 )
             table.append(row)
+        # A scope whose every affine fit failed still owes the reader a row:
+        # PROTOCOL 4.3 reports the failure, and total silence is the one form
+        # the report must not take.
+        for (metric, path), total in sorted(attempted.items()):
+            if (metric, path) in affine_seen:
+                continue
+            table.append({
+                "analysis": scope_name, "metric": metric, "path": path,
+                "level": "affine", "n_scenes": 0, "n_camera_pairs": 0,
+                "n_feature_comparisons": 0, "supported": False,
+                "affine_pairs_attempted": total,
+                "affine_pairs_contributed": 0,
+                "affine_pairs_failed": total,
+                "affine_failure_reason": (
+                    "every affine fit in this scope failed: fitted scale "
+                    "nonpositive or calibration population too small"
+                ),
+            })
     if affine_absent:
         for row in table:
             if row["level"] == "affine":
@@ -506,6 +667,7 @@ def bin_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict[st
             table.append({
                 "analysis": regime, "axis": axis, "bin": label, "metric": metric,
                 "path": path, "level": level, **summary,
+                **contrast_support(cell, analysis),
             })
     joint = [r for r in records if r["regime"] == JOINT_REGIME]
     for key, cell in sorted(
@@ -524,9 +686,6 @@ def bin_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict[st
 # ---------------------------------------------------------------------------
 # Addendum A: dual-path near-zero disclosure
 # ---------------------------------------------------------------------------
-
-DISCLOSED_QUANTITIES = ("depth_tax", "estimated_margin", "selection_differential")
-
 
 def reporting_cell(record: dict[str, Any]) -> tuple[str, str] | None:
     """The reporting cell a record belongs to, per PROTOCOL 3.3.
@@ -566,6 +725,10 @@ def cross_path_disclosure(
     quantities = {
         "depth_tax": ("oracle_intersect", "est_intersect"),
         "estimated_margin": ("est_intersect", "nowarp_intersect"),
+        # The selection differential's two terms are each computed on a
+        # cross-path common population: the full-set intersection for the
+        # reference ceiling and the level intersection for the matched one.
+        "selection_differential": ("oracle_full_intersect", "oracle_intersect"),
     }
     paired: dict[tuple, dict[str, dict]] = {}
     for record in records:
@@ -710,10 +873,12 @@ def figure1_tax_vs_parallax(bin_rows, path_out: Path, analysis: AnalysisConfig) 
     """
     plt = _pyplot()
     order = [b for b in bin_order(analysis.parallax_edges())]
-    figure, axes = plt.subplots(2, len(METRICS), figsize=(6.4 * len(METRICS), 8.0),
+    figure, axes = plt.subplots(3, len(METRICS), figsize=(6.4 * len(METRICS), 11.5),
                                 squeeze=False)
     for column, metric in enumerate(METRICS):
-        tax_panel, coverage_panel = axes[0][column], axes[1][column]
+        tax_panel, coverage_panel, absolute_panel = (
+            axes[0][column], axes[1][column], axes[2][column],
+        )
         unsupported: set[int] = set()
         for level, variant_name in LEVELS:
             rows = _rows_for(bin_rows, analysis="translation", metric=metric,
@@ -731,7 +896,23 @@ def figure1_tax_vs_parallax(bin_rows, path_out: Path, analysis: AnalysisConfig) 
                 "-s", markersize=4, label=variant_name,
             )
             unsupported |= {order.index(b) for b in present if not by_bin[b]["supported"]}
-        for panel in (tax_panel, coverage_panel):
+            absolute_panel.plot(
+                xs, [by_bin[b]["estimated_score"] for b in present],
+                "-x", markersize=4, label=f"{variant_name}, matched",
+            )
+            absolute_panel.plot(
+                xs, [by_bin[b]["matched_ceiling"] for b in present],
+                ":", linewidth=1, label=f"matched ceiling, {level}",
+            )
+            if level == "none":
+                # PROTOCOL 4.6: the full-population Phase 3 ceiling is the
+                # representation reference ceiling and appears in figures. It
+                # is level-independent, so one curve suffices.
+                absolute_panel.plot(
+                    xs, [by_bin[b]["reference_ceiling_phase3"] for b in present],
+                    "k--", linewidth=1.6, label="Phase 3 reference ceiling",
+                )
+        for panel in (tax_panel, coverage_panel, absolute_panel):
             _band(panel, sorted(unsupported))
             panel.set_xticks(range(len(order)))
             panel.set_xticklabels(order, rotation=45, ha="right", fontsize=8)
@@ -742,7 +923,11 @@ def figure1_tax_vs_parallax(bin_rows, path_out: Path, analysis: AnalysisConfig) 
         tax_panel.set_ylabel("matched ceiling minus estimated score", fontsize=8)
         coverage_panel.set_title("transported fraction beside it", fontsize=9)
         coverage_panel.set_ylabel("surviving fraction of GT co-visible", fontsize=8)
-        coverage_panel.set_xlabel("parallax bin", fontsize=9)
+        absolute_panel.set_title(
+            "absolute scores against the Phase 3 reference ceiling", fontsize=9
+        )
+        absolute_panel.set_ylabel("cosine", fontsize=8)
+        absolute_panel.set_xlabel("parallax bin", fontsize=9)
     figure.suptitle(
         "Figure 1: estimated-geometry tax versus parallax, translation regime",
         fontsize=11,
@@ -900,11 +1085,10 @@ def figure4_localization(ladder_rows, path_out: Path) -> None:
             values.append(value)
             low.append(max(0.0, value - row[f"{quantity}_ci_low"]))
             high.append(max(0.0, row[f"{quantity}_ci_high"] - value))
-            # Support is the contrast's own, not the level's overall support:
-            # a pair contributes to a contrast only when it carries both arms,
-            # so the arms can be far thinner than the matched population and a
-            # cell can pass overall while the contrast rests on almost nothing.
-            if not row["supported"] or row[f"{quantity}_ci_replicates"] == 0:
+            # Support is the contrast's own, computed over both-arm pairs
+            # only: a cell can pass overall while the contrast rests on a
+            # handful of pairs that happen to carry both splits.
+            if not row.get(f"{quantity}_supported", False):
                 unsupported.append(len(labels) - 1)
         _band(panel, unsupported)
         panel.errorbar(range(len(labels)), values, yerr=[low, high], fmt="o", capsize=3)

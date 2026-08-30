@@ -867,21 +867,23 @@ def test_phase4_refuses_a_population_phase3_did_not_score(phase4_run, tmp_path):
     """PROTOCOL 4.1 inherits the pairs, so a divergence is refused not averaged."""
     import pyarrow.parquet as pq
 
-    from lot.phase4 import phase3_pair_identities
+    from lot.evaluate import read_run_metadata, write_rows
+    from lot.phase4 import phase3_scene_reference
 
     run = phase4_run
-    real = phase3_pair_identities(run["phase3_eval_dir"], SCENE)
-    assert real, "the fixture's Phase 3 run scored something"
+    real = phase3_scene_reference(run["phase3_eval_dir"], SCENE, "dinov2_vitb14")
+    assert real["pairs"], "the fixture's Phase 3 run scored something"
 
     # A Phase 3 run naming a pair this scene cannot produce must stop Phase 4.
-    table = pq.read_table(run["phase3_eval_dir"] / f"{SCENE}.parquet").to_pylist()
+    # The forged run keeps the genuine provenance record, so the population
+    # check fires rather than the earlier cache-identity check.
+    source = run["phase3_eval_dir"] / f"{SCENE}.parquet"
+    table = pq.read_table(source).to_pylist()
     invented = dict(table[0])
     invented["context_frame_id"] = "room_0_vp99_rotation_000"
     forged = tmp_path / "forged"
     forged.mkdir()
-    from lot.evaluate import write_rows
-
-    write_rows(forged / f"{SCENE}.parquet", table + [invented], {"scene": SCENE})
+    write_rows(forged / f"{SCENE}.parquet", table + [invented], read_run_metadata(source))
     cfg = dataclasses.replace(run["cfg"], phase3_eval_dir=forged)
     with pytest.raises(Phase4GateError, match="absent from the regenerated sample"):
         evaluate_scene_phase4(
@@ -889,4 +891,156 @@ def test_phase4_refuses_a_population_phase3_did_not_score(phase4_run, tmp_path):
         )
 
     with pytest.raises(Phase4GateError, match="does not exist"):
-        phase3_pair_identities(tmp_path / "nowhere", SCENE)
+        phase3_scene_reference(tmp_path / "nowhere", SCENE, "dinov2_vitb14")
+
+
+def test_phase4_refuses_tampered_phase3_masks_and_scores(phase4_run, tmp_path):
+    """Name-level agreement is not inheritance: masks and ceilings must match.
+
+    The review's core case: a Phase 3 run whose pair names are intact but
+    whose recorded masks or ceilings differ from what the current inputs
+    reproduce means a pose, depth map, or filter moved underneath the names.
+    """
+    import pyarrow.parquet as pq
+
+    from lot.evaluate import read_run_metadata, write_rows
+
+    run = phase4_run
+    source = run["phase3_eval_dir"] / f"{SCENE}.parquet"
+    meta = read_run_metadata(source)
+
+    # Tampered mask: flip one byte of one row's persisted validity mask.
+    table = pq.read_table(source).to_pylist()
+    victim = next(r for r in table if r["variant"] == ORACLE_TRANSPORT)
+    mask = bytearray(bytes(victim["sample_mask"]))
+    mask[0] ^= 0xFF
+    for row in table:
+        if (row["context_frame_id"], row["target_frame_id"], row["path"]) == (
+            victim["context_frame_id"], victim["target_frame_id"], victim["path"]
+        ):
+            row["sample_mask"] = bytes(mask)
+    forged = tmp_path / "mask"
+    forged.mkdir()
+    write_rows(forged / f"{SCENE}.parquet", table, meta)
+    cfg = dataclasses.replace(run["cfg"], phase3_eval_dir=forged)
+    with pytest.raises(Phase4GateError, match="not the one Phase 3 persisted"):
+        evaluate_scene_phase4(
+            cfg, SCENE, run["mean_vector"], run["analysis"], run["convention"],
+        )
+
+    # Tampered ceiling: move one recorded Oracle score past the recon bound.
+    table = pq.read_table(source).to_pylist()
+    for row in table:
+        if row["variant"] == ORACLE_TRANSPORT and row["path"] == PER_POINT:
+            row["cosine_mean"] = row["cosine_mean"] + 1e-3
+            break
+    forged = tmp_path / "score"
+    forged.mkdir()
+    write_rows(forged / f"{SCENE}.parquet", table, meta)
+    cfg = dataclasses.replace(run["cfg"], phase3_eval_dir=forged)
+    with pytest.raises(Phase4GateError, match="not the ones Phase 3 measured"):
+        evaluate_scene_phase4(
+            cfg, SCENE, run["mean_vector"], run["analysis"], run["convention"],
+        )
+
+    # A Phase 3 record claiming a different feature cache is refused before
+    # any pair is compared.
+    stale = dict(meta)
+    stale["cache_provenance"] = {
+        "dinov2_vitb14": {**meta["cache_provenance"]["dinov2_vitb14"],
+                          "features_digest": "0" * 32}
+    }
+    forged = tmp_path / "provenance"
+    forged.mkdir()
+    write_rows(forged / f"{SCENE}.parquet", pq.read_table(source).to_pylist(), stale)
+    cfg = dataclasses.replace(run["cfg"], phase3_eval_dir=forged)
+    with pytest.raises(Phase4GateError, match="feature cache"):
+        evaluate_scene_phase4(
+            cfg, SCENE, run["mean_vector"], run["analysis"], run["convention"],
+        )
+
+
+def test_report_refuses_a_partial_arm_and_counts_empty_levels(phase4_run):
+    """A lost arm is corruption; a whole absent level is counted population."""
+    from lot.phase4_report import build_records
+
+    run = phase4_run
+    analysis = run["analysis"]
+    rows = run["rows"]
+
+    # Remove one no-alignment estimate row: its ceiling and floor survive, so
+    # the slot is partial and the directory is corrupt, not smaller.
+    partial = [
+        r for r in rows
+        if not (r["level"] == "none" and r["population"] == "matched"
+                and r["variant"] == VGGT_NO_ALIGN
+                and r["path"] == PER_POINT
+                and r["context_frame_id"] == rows[0]["context_frame_id"]
+                and r["target_frame_id"] == rows[0]["target_frame_id"])
+    ]
+    assert len(partial) < len(rows)
+    with pytest.raises(ValueError, match="matched arms are missing"):
+        build_records(partial, analysis)
+
+    # Remove a whole level for one pair-path: legitimately absent, counted.
+    key = (rows[0]["context_frame_id"], rows[0]["target_frame_id"])
+    absent = [
+        r for r in rows
+        if not (r["level"] == "none"
+                and (r["context_frame_id"], r["target_frame_id"]) == key
+                and r["path"] == PER_POINT)
+    ]
+    _, exclusions = build_records(absent, analysis)
+    assert exclusions["empty_scored_sets_by_level"].get("none", 0) >= 1
+
+
+def test_confidence_masked_depth_shrinks_validity_identically(tmp_path_factory):
+    """5a-invalid pixels are NaN in the maps every consumer reads (finding 7),
+    and the surviving sets stay identical across multiplicative levels as sets
+    (finding 8), not merely as counts."""
+    root = tmp_path_factory.mktemp("phase4_masked")
+
+    def holed(gt):
+        est = (gt / EST_SCALE).astype(np.float32)
+        est[:, :14] = -1.0
+        return est
+
+    manifest = build_scene(root, est_transform=holed)
+    cfg = Phase4Config(
+        experiment_name="phase4_masked", renders_root=root, cache_root=root / "cache",
+        output_root=root / "out", scenes=[SCENE], mean_vector_dir=root / "out" / "mv",
+    )
+    analysis = load_analysis_config()
+    phase3_eval_dir, _ = run_phase3(root, cfg, analysis)
+    cfg.phase3_eval_dir = phase3_eval_dir
+    diagnostic = convention_report(cfg, analysis)
+    convention = build_convention_record(
+        diagnostic, planar_authority(),
+        json.loads((cache_dir(cfg.cache_root, "vggt_1b", SCENE) / "meta.json").read_text()),
+    )
+    from lot.evaluate import load_or_build_mean_vector
+
+    mean_vector = load_or_build_mean_vector(
+        cfg.cache_root, "dinov2_vitb14", [SCENE], cfg.mean_vector_dir
+    )
+    rows, evidence = evaluate_scene_phase4(cfg, SCENE, mean_vector, analysis, convention)
+    assert rows
+    shrunk = 0
+    for audit in evidence["audits"].values():
+        valid_counts = {
+            level: audit["levels"][level]["pp_transport_valid"]
+            for level in ("none", "scene", "image")
+            if level in audit["levels"]
+        }
+        # Identity across levels held internally as sets; visible here as one
+        # value, and strictly below the full sample count wherever a read
+        # touched the invalidated stripe.
+        assert len(set(valid_counts.values())) == 1
+        matched = [
+            r for r in rows
+            if r["level"] == "none" and r["population"] == "matched"
+            and r["path"] == PER_POINT
+        ]
+        if matched and min(valid_counts.values()) < max(r["n_gt"] for r in matched):
+            shrunk += 1
+    assert shrunk > 0, "the invalid stripe never reduced transport validity"

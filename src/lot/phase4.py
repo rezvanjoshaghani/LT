@@ -54,7 +54,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -90,6 +90,7 @@ from .evaluate import (
     pack_mask,
     pair_geometry,
     read_run_metadata,
+    vector_digest,
     write_rows,
 )
 from .geometry import invert_se3, pixel_grid, project, relative_pose, transform_points, unproject
@@ -519,17 +520,34 @@ def manifest_digest(scene_root: Path) -> str:
     ).hexdigest()
 
 
-def phase3_pair_identities(eval_dir: Path, scene: str) -> set[tuple[str, str]]:
-    """The camera pairs the corrected Phase 3 run actually scored for a scene.
+# How far a Phase 4 recomputation of a Phase 3 score may sit from the value
+# Phase 3 recorded before the inheritance is refused. The two are the same
+# code over the same bytes in the same environment, so the honest expectation
+# is bitwise equality; the bound absorbs dtype accumulation drift across
+# library builds and nothing else. The path-agreement ledger reconstructed the
+# recorded scores from the caches to 2e-7, an order of magnitude inside this.
+PHASE3_SCORE_RECON_TOL = 1e-5
 
-    PROTOCOL 4.1 keeps the context-target pairs identical to Phase 3. Phase 4
-    regenerates them from the manifests with the frozen sampler, which is the
-    same computation but not the same evidence: a changed manifest, pose,
-    frame filter, or selection implementation would produce a self-consistent
-    run over a different population. Reading what Phase 3 recorded turns the
-    inheritance into something checkable.
+
+def phase3_scene_reference(
+    eval_dir: Path, scene: str, feature_encoder: str
+) -> dict[str, Any]:
+    """What the corrected Phase 3 run recorded for a scene, as the referee.
+
+    PROTOCOL 4.1 keeps the pairs, masks, sample identities, and ceilings
+    identical to Phase 3. Phase 4 regenerates all of them from the manifests
+    with the frozen code, which is the same computation but not the same
+    evidence: a changed pose, depth map, or frame filter that preserves the
+    pair names would still pass a name-level check while measuring a
+    different population. So the reference carries, per (pair, path), the
+    persisted validity mask, its count, and the recorded Oracle and No-Warp
+    scores, and evaluation reconciles its own recomputation against them row
+    by row. It also carries the run record's provenance so the caches and
+    measurement identity can be compared, not assumed.
     """
     import pyarrow.parquet as pq
+
+    from .evaluate import read_run_metadata
 
     path = Path(eval_dir) / f"{scene}.parquet"
     if not path.is_file():
@@ -537,10 +555,78 @@ def phase3_pair_identities(eval_dir: Path, scene: str) -> set[tuple[str, str]]:
             f"{path} does not exist; Phase 4 inherits the Phase 3 pair "
             "population and cannot show it is using it without the run"
         )
-    table = pq.read_table(path, columns=["context_frame_id", "target_frame_id"])
-    return set(
-        zip(table.column(0).to_pylist(), table.column(1).to_pylist())
-    )
+    meta = read_run_metadata(path)
+    if meta is None:
+        raise Phase4GateError(f"{path} carries no run record")
+    provenance = (meta.get("cache_provenance") or {}).get(feature_encoder) or {}
+    rows = pq.read_table(
+        path,
+        columns=["context_frame_id", "target_frame_id", "encoder", "path",
+                 "variant", "n", "sample_mask", "cosine_mean"],
+    ).to_pylist()
+    reference: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        if row["encoder"] != feature_encoder:
+            continue
+        pair = (row["context_frame_id"], row["target_frame_id"])
+        slot = reference.setdefault(pair, {}).setdefault(
+            row["path"], {"mask": bytes(row["sample_mask"]), "n": row["n"]}
+        )
+        if row["variant"] in (ORACLE_TRANSPORT, NO_WARP_COPY):
+            slot[row["variant"]] = row["cosine_mean"]
+    return {
+        "pairs": reference,
+        "git_commit": meta.get("git_commit"),
+        "features_digest": provenance.get("features_digest"),
+        "measurement_digest": meta.get("analysis_measurement_digest"),
+        "universe_size": meta.get("universe_size"),
+        "eval_version": meta.get("eval_version"),
+    }
+
+
+def reconcile_pair_against_phase3(
+    scene: str,
+    pair: Any,
+    geometry: Any,
+    gt_rows: Sequence[dict[str, Any]],
+    reference: dict[str, dict[str, Any]],
+) -> float:
+    """One pair's recomputed masks and ceilings against Phase 3's record.
+
+    Masks are discrete predicate outcomes of the frozen float32 chain, so
+    they must be bit-identical; the scores must reproduce within
+    PHASE3_SCORE_RECON_TOL. Returns the largest score residual so the scene
+    metadata can carry the worst case rather than a boolean.
+    """
+    where = f"{scene} {pair.context_frame_id} -> {pair.target_frame_id}"
+    worst = 0.0
+    for row in gt_rows:
+        recorded = reference.get(row["path"])
+        if recorded is None:
+            raise Phase4GateError(
+                f"{where}: Phase 3 recorded no {row['path']} rows for this "
+                "pair, but Phase 4 scored it there"
+            )
+        if row["variant"] not in (ORACLE_TRANSPORT, NO_WARP_COPY):
+            continue
+        if bytes(row["sample_mask"]) != recorded["mask"] or row["n"] != recorded["n"]:
+            raise Phase4GateError(
+                f"{where} ({row['path']}): the recomputed validity mask is not "
+                "the one Phase 3 persisted. The pair names match but the "
+                "geometry, depth, or eligibility filters have moved, so this "
+                "is a different population wearing the same identity."
+            )
+        residual = abs(row["cosine_mean"] - recorded[row["variant"]])
+        worst = max(worst, residual)
+        if residual > PHASE3_SCORE_RECON_TOL:
+            raise Phase4GateError(
+                f"{where} ({row['path']}, {row['variant']}): recomputed score "
+                f"{row['cosine_mean']:.9f} against Phase 3's recorded "
+                f"{recorded[row['variant']]:.9f}, residual {residual:.2e} over "
+                f"{PHASE3_SCORE_RECON_TOL:g}. The ceilings Phase 4 inherits "
+                "are not the ones Phase 3 measured."
+            )
+    return worst
 
 
 def resample_depth_nearest(
@@ -1005,6 +1091,8 @@ class _LevelData:
     landed: np.ndarray                 # [N] bool over per-point samples (5d)
     n_transport_valid_pp: int          # 5c count over per-point samples
     n_transport_valid_ctx: int         # 5c pixel count on the context map
+    pp_transport_valid: np.ndarray     # [N] bool, the 5c set itself
+    ctx_transport_valid: np.ndarray    # [H*W] bool, the 5c set on the map
     uv_warp_est: Tensor
     est_reads: Tensor
     pp_scored: np.ndarray              # universe mask, per-point 5d
@@ -1031,6 +1119,7 @@ def evaluate_pair_phase4(
     K_target: Tensor,
     T_target_from_context: Tensor,
     gate_evidence: list[dict[str, Any]],
+    feature_encoder: str = "dinov2_vitb14",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Every Phase 4 row for one pair. Returns (rows, per-pair audit).
 
@@ -1065,7 +1154,7 @@ def evaluate_pair_phase4(
     base = pair.as_row()
     base["covisible_fraction"] = geometry.covisible_fraction
     base["parallax"] = geometry.parallax
-    base["encoder"] = "dinov2_vitb14"
+    base["encoder"] = feature_encoder
 
     nan = float("nan")
     empty_gate = {
@@ -1221,6 +1310,10 @@ def evaluate_pair_phase4(
             n_transport_valid_ctx=int(
                 (np.isfinite(context_aligned) & (context_aligned > 0)).sum()
             ),
+            pp_transport_valid=read_valid.numpy().copy(),
+            ctx_transport_valid=(
+                np.isfinite(context_aligned) & (context_aligned > 0)
+            ).reshape(-1),
             uv_warp_est=uv_warp_est,
             est_reads=sample_features_bilinear(features_context, uv_warp_est),
             pp_scored=pp_scored,
@@ -1248,9 +1341,13 @@ def evaluate_pair_phase4(
     # legitimately differ and are reported, never asserted.
     present = [l for l in MULTIPLICATIVE_LEVELS if l in levels]
     for left, right in zip(present, present[1:]):
-        left_valid = levels[left].n_transport_valid_pp
-        if left_valid != levels[right].n_transport_valid_pp or (
-            levels[left].n_transport_valid_ctx != levels[right].n_transport_valid_ctx
+        # The sets themselves, not their sizes: two levels exchanging which
+        # samples are valid while keeping the count would pass a count check
+        # and still violate the 4.4 identity the protocol states in set terms.
+        if not np.array_equal(
+            levels[left].pp_transport_valid, levels[right].pp_transport_valid
+        ) or not np.array_equal(
+            levels[left].ctx_transport_valid, levels[right].ctx_transport_valid
         ):
             raise Phase4GateError(
                 f"{pair.context_frame_id} -> {pair.target_frame_id}: "
@@ -1563,7 +1660,8 @@ def evaluate_scene_phase4(
     # the sampled set is a superset and only the containment is checkable here.
     # The equality that matters, that Phase 4 scored exactly what Phase 3
     # scored, is asserted after the evaluation loop against what was scored.
-    phase3_pairs = phase3_pair_identities(cfg.phase3_eval_dir, scene)
+    phase3 = phase3_scene_reference(cfg.phase3_eval_dir, scene, cfg.feature_encoder)
+    phase3_pairs = set(phase3["pairs"])
     regenerated = {(p.context_frame_id, p.target_frame_id) for p in pairs}
     missing = phase3_pairs - regenerated
     if regimes is None and missing:
@@ -1574,6 +1672,24 @@ def evaluate_scene_phase4(
             "ran, so this run would measure a different population."
         )
     expected_scored = phase3_pairs & regenerated
+
+    # The caches and measurement identity Phase 3 recorded must be the ones
+    # this run is about to read. Name-level pair agreement proves nothing if
+    # the features or the measurement config moved underneath them.
+    feature_meta = load_cache_meta(cfg.cache_root, cfg.feature_encoder, scene)
+    if phase3["features_digest"] != feature_meta.get("features_digest"):
+        raise Phase4GateError(
+            f"{scene}: Phase 3 was evaluated from feature cache "
+            f"{phase3['features_digest']} and this run would read "
+            f"{feature_meta.get('features_digest')}. The inherited ceilings "
+            "would come from different features."
+        )
+    if phase3["measurement_digest"] != analysis.measurement_digest():
+        raise Phase4GateError(
+            f"{scene}: Phase 3 ran under measurement identity "
+            f"{phase3['measurement_digest']}, this analysis carries "
+            f"{analysis.measurement_digest()}."
+        )
 
     # One checkpoint, one convention. The verdict comes from the run-level
     # record and never from this scene's diagnostic entry: reading a per-scene
@@ -1601,7 +1717,6 @@ def evaluate_scene_phase4(
             resampled = (
                 resampled / secant_map(frame.K, frame.height, frame.width)
             ).astype(np.float32)
-        est_maps[frame.frame_id] = resampled
         conversions.add(verdict)
         conf_raw = depth_cache["conf"][frame.frame_id]
         conf = (
@@ -1610,8 +1725,18 @@ def evaluate_scene_phase4(
             else None
         )
         prevalid = transport_prevalid(resampled, conf, analysis)
+        # The 5a rule is applied to the map itself: pixels failing it become
+        # NaN, so every downstream consumer, the per-point bilinear read and
+        # the splat's keep mask alike, excludes them by construction. Applying
+        # the rule only to calibration would let a nonnull confidence
+        # threshold change the calibration population while the reported
+        # surviving set silently kept every finite positive depth. The mask is
+        # scale-independent, so the step 10 invariant is untouched.
+        est_maps[frame.frame_id] = np.where(
+            prevalid, resampled, np.float32(np.nan)
+        ).astype(np.float32)
         calibrations[frame.frame_id] = frame_calibration(
-            resampled, cache.depth(frame.depth_path).numpy(), prevalid
+            est_maps[frame.frame_id], cache.depth(frame.depth_path).numpy(), prevalid
         )
     if len(conversions) > 1:
         raise Phase4GateError(
@@ -1626,6 +1751,7 @@ def evaluate_scene_phase4(
     affine_failed_pairs = 0
     universe_size = 0
     scored_pairs: set[tuple[str, str]] = set()
+    phase3_score_max_diff = 0.0
 
     for pair in pairs:
         context = frames[pair.context_frame_id]
@@ -1696,11 +1822,28 @@ def evaluate_scene_phase4(
             target.K.to(cfg.torch_dtype),
             T_target_from_context,
             gate_evidence,
+            feature_encoder=cfg.feature_encoder,
         )
+        # The inheritance is row-level, not name-level: the recomputed masks
+        # must be the ones Phase 3 persisted and the recomputed ceilings the
+        # ones it recorded, or the pair identity is the only thing the two
+        # runs share.
+        pair_key = (pair.context_frame_id, pair.target_frame_id)
+        if pair_key in phase3["pairs"]:
+            gt_rows = [
+                r for r in pair_rows
+                if r["level"] == GT_LEVEL and r["population"] == POPULATION_FULL
+            ]
+            phase3_score_max_diff = max(
+                phase3_score_max_diff,
+                reconcile_pair_against_phase3(
+                    scene, pair, geometry, gt_rows, phase3["pairs"][pair_key]
+                ),
+            )
         if collect_rows:
             rows.extend(pair_rows)
         audits[f"{pair.context_frame_id} -> {pair.target_frame_id}"] = audit
-        scored_pairs.add((pair.context_frame_id, pair.target_frame_id))
+        scored_pairs.add(pair_key)
     cache.close()
 
     # The inheritance, stated as equality on what was actually scored. A pair
@@ -1751,9 +1894,11 @@ def evaluate_scene_phase4(
         "analysis_measurement_digest": analysis.measurement_digest(),
         "phase4_measurement_digest": phase4_measurement_digest(analysis),
         "analysis_reporting_digest": analysis.reporting_digest(),
-        "features_digest": load_cache_meta(
-            cfg.cache_root, cfg.feature_encoder, scene
-        )["features_digest"],
+        "features_digest": feature_meta["features_digest"],
+        "feature_weights_fingerprint": feature_meta["weights_fingerprint"],
+        "feature_weights_revision": feature_meta.get("weights_revision", "unpinned"),
+        "feature_code_revision": feature_meta.get("code_revision", "unknown"),
+        "mean_vector_digest": vector_digest(mean_vector.numpy()),
         "depth_digest": depth_cache["meta"]["depth_digest"],
         "depth_weights_fingerprint": depth_cache["meta"]["weights_fingerprint"],
         "depth_weights_revision": depth_cache["meta"].get("weights_revision", "unpinned"),
@@ -1766,6 +1911,11 @@ def evaluate_scene_phase4(
         "manifest_digest": manifest_digest(scene_root),
         "phase3_pairs_reconciled": True,
         "phase3_pair_count": len(phase3_pairs),
+        "phase3_git_commit": phase3["git_commit"],
+        "phase3_features_digest": phase3["features_digest"],
+        "phase3_measurement_digest": phase3["measurement_digest"],
+        "phase3_score_max_abs_diff": phase3_score_max_diff,
+        "phase3_score_recon_tol": PHASE3_SCORE_RECON_TOL,
     }
     return rows, {"metadata": metadata, "gate_evidence": gate_evidence, "audits": audits}
 
@@ -1945,6 +2095,12 @@ def main(argv: list[str] | None = None) -> None:
                     ("seed", cfg.seed),
                     ("phase4_measurement_digest", phase4_measurement_digest(analysis)),
                     ("run_scenes", sorted(cfg.scenes)),
+                    ("feature_encoder", cfg.feature_encoder),
+                    ("depth_encoder", cfg.depth_encoder),
+                    ("depth_convention", convention.get("depth_convention")),
+                    ("depth_convention_conversion_applied",
+                     convention.get("depth_convention_conversion_applied")),
+                    ("mean_vector_digest", vector_digest(mean_vector.numpy())),
                 )
             )
             if differing:

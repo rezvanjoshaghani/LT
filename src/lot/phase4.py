@@ -141,6 +141,9 @@ class Phase4Config:
     # The Phase 3 run directory whose provenance-validated mean vector this
     # run reuses. PROTOCOL 4.1 freezes the floors and the centering statistic.
     mean_vector_dir: Path = Path("outputs/experiment_zero")
+    # The corrected Phase 3 evaluation whose pair population Phase 4 inherits
+    # under PROTOCOL 4.1 and must be able to prove it inherited.
+    phase3_eval_dir: Path = Path("outputs/experiment_zero/eval")
     seed: int = 0
     analysis_config: Path = DEFAULT_CONFIG_PATH
     geometry_dtype: str = "float32"
@@ -150,6 +153,7 @@ class Phase4Config:
         self.cache_root = Path(self.cache_root)
         self.output_root = Path(self.output_root)
         self.mean_vector_dir = Path(self.mean_vector_dir)
+        self.phase3_eval_dir = Path(self.phase3_eval_dir)
         self.analysis_config = Path(self.analysis_config)
         if not self.scenes:
             raise ValueError("config lists no scenes")
@@ -458,11 +462,14 @@ def build_convention_record(
     }
 
 
-def run_convention(record: dict[str, Any]) -> str:
+def run_convention(record: dict[str, Any], depth_meta: dict[str, Any]) -> str:
     """The single convention every scene of a run reads.
 
     Never keyed by scene, frame, camera program, angle, or diagnostic verdict.
-    A record without a global decision is refused rather than defaulted.
+    A record without a global decision is refused rather than defaulted, and
+    the record is re-bound to the cache it is about to govern every time it is
+    consumed: a record is a file on disk, so a stale or hand-edited one could
+    otherwise dictate the conversion for depth it was never written about.
     """
     verdict = record.get("depth_convention")
     if verdict not in ("planar_z", "ray_distance"):
@@ -476,7 +483,64 @@ def run_convention(record: dict[str, Any]) -> str:
             "PROTOCOL 4.1 and Amendment A6 admit no other basis for the "
             "global decision"
         )
+    for field, cache_field in (
+        ("checkpoint_code_revision", "code_revision"),
+        ("checkpoint_weights_fingerprint", "weights_fingerprint"),
+        ("checkpoint_weights_revision", "weights_revision"),
+    ):
+        recorded, current = record.get(field), depth_meta.get(cache_field)
+        if recorded != current:
+            raise Phase4GateError(
+                f"the convention record was written for {field}={recorded!r} "
+                f"but the depth cache being evaluated carries {current!r}. A "
+                "convention established about other predictions does not "
+                "govern these."
+            )
+    source_commit = record.get("depth_convention_source_commit")
+    if source_commit != depth_meta.get("code_revision"):
+        raise Phase4GateError(
+            f"the convention's source authority {source_commit!r} is not the "
+            f"inference revision {depth_meta.get('code_revision')!r} that "
+            "produced this cache"
+        )
     return verdict
+
+
+def manifest_digest(scene_root: Path) -> str:
+    """Content hash of a scene's manifest.
+
+    The manifests are untracked, so a commit hash says nothing about them. A
+    run that regenerated its pair sample from edited manifests would be
+    self-consistent and measuring a different population; binding the digest
+    into every run record is what makes that detectable afterwards.
+    """
+    return hashlib.sha256(
+        (Path(scene_root) / MANIFEST_NAME).read_bytes()
+    ).hexdigest()
+
+
+def phase3_pair_identities(eval_dir: Path, scene: str) -> set[tuple[str, str]]:
+    """The camera pairs the corrected Phase 3 run actually scored for a scene.
+
+    PROTOCOL 4.1 keeps the context-target pairs identical to Phase 3. Phase 4
+    regenerates them from the manifests with the frozen sampler, which is the
+    same computation but not the same evidence: a changed manifest, pose,
+    frame filter, or selection implementation would produce a self-consistent
+    run over a different population. Reading what Phase 3 recorded turns the
+    inheritance into something checkable.
+    """
+    import pyarrow.parquet as pq
+
+    path = Path(eval_dir) / f"{scene}.parquet"
+    if not path.is_file():
+        raise Phase4GateError(
+            f"{path} does not exist; Phase 4 inherits the Phase 3 pair "
+            "population and cannot show it is using it without the run"
+        )
+    table = pq.read_table(path, columns=["context_frame_id", "target_frame_id"])
+    return set(
+        zip(table.column(0).to_pylist(), table.column(1).to_pylist())
+    )
 
 
 def resample_depth_nearest(
@@ -1007,9 +1071,21 @@ def evaluate_pair_phase4(
     empty_gate = {
         "gate_coord_max_px": nan,
         "gate_score_max_abs": nan,
+        # The forced-order gate is checked on both metrics. Centering removes a
+        # shared direction, so a pooled disagreement invisible in raw cosine can
+        # surface once it is gone; gating raw alone would certify a centered
+        # table nothing looked at.
         "gate_forced_max_abs": nan,
+        "gate_forced_max_abs_centered": nan,
+        # Figure 2's series: the forced-order identity check needs the forced
+        # scores themselves, not the ordinary matched scores.
+        "forced_oracle_raw": nan,
+        "forced_estimated_raw": nan,
+        "forced_oracle_centered": nan,
+        "forced_estimated_centered": nan,
         "collision_tax_raw": nan,
         "collision_tax_centered": nan,
+        "collision_gate_cells": 0,
     }
 
     def emit(path: str, level: str, population: str, variant: str, mask: np.ndarray,
@@ -1323,55 +1399,82 @@ def evaluate_pair_phase4(
                     K_context, K_target, T_target_from_context, target_hw,
                     source_keep=common, forced_winner_keys=gt_common.winner_keys,
                 )
+                # The unforced arm runs on the same common source population as
+                # the forced one. Comparing forced-on-common against the
+                # unrestricted estimated plan would let estimated-only sources
+                # enter or win cells in one arm and not the other, so the
+                # difference would carry missingness as well as ordering and
+                # would not be the collision-ordering tax PROTOCOL 4.5 isolates.
+                unforced_common = splat_plan_detail(
+                    torch.from_numpy(data.context_aligned).to(torch_dtype),
+                    K_context, K_target, T_target_from_context, target_hw,
+                    source_keep=common,
+                )
                 pooled_oracle = flat_context @ gt_common.weights.mT
                 pooled_forced = flat_context @ forced_est.weights.mT
+                pooled_unforced = flat_context @ unforced_common.weights.mT
                 both_covered = (
                     (gt_common.coverage.reshape(-1) > 0)
                     & (forced_est.coverage.reshape(-1) > 0)
+                    & (unforced_common.coverage.reshape(-1) > 0)
                 ).numpy()
                 gate_cells = np.flatnonzero(data.sp_scored & both_covered)
                 if gate_cells.size:
                     gate_targets = flat_target[:, gate_cells].T
-                    oracle_scores = _per_sample_cosine(
-                        pooled_oracle[:, gate_cells].T, gate_targets, None
+                    scores = {}
+                    for label, pooled in (("oracle", pooled_oracle),
+                                          ("forced", pooled_forced),
+                                          ("unforced", pooled_unforced)):
+                        for metric, centre in (("raw", None), ("centered", center)):
+                            scores[(label, metric)] = _per_sample_cosine(
+                                pooled[:, gate_cells].T, gate_targets, centre
+                            )
+                    forced_max = float(
+                        (scores[("oracle", "raw")] - scores[("forced", "raw")]).abs().max()
                     )
-                    forced_scores = _per_sample_cosine(
-                        pooled_forced[:, gate_cells].T, gate_targets, None
-                    )
-                    forced_max = float((oracle_scores - forced_scores).abs().max())
-                    unforced_raw = _per_sample_cosine(
-                        data.transported_est[:, gate_cells].T, gate_targets, None
-                    )
-                    forced_cen = _per_sample_cosine(
-                        pooled_forced[:, gate_cells].T, gate_targets, center
-                    )
-                    unforced_cen = _per_sample_cosine(
-                        data.transported_est[:, gate_cells].T, gate_targets, center
+                    forced_max_cen = float(
+                        (scores[("oracle", "centered")]
+                         - scores[("forced", "centered")]).abs().max()
                     )
                     sp_gate_cols["gate_forced_max_abs"] = forced_max
+                    sp_gate_cols["gate_forced_max_abs_centered"] = forced_max_cen
+                    sp_gate_cols["forced_oracle_raw"] = float(scores[("oracle", "raw")].mean())
+                    sp_gate_cols["forced_estimated_raw"] = float(scores[("forced", "raw")].mean())
+                    sp_gate_cols["forced_oracle_centered"] = float(
+                        scores[("oracle", "centered")].mean()
+                    )
+                    sp_gate_cols["forced_estimated_centered"] = float(
+                        scores[("forced", "centered")].mean()
+                    )
                     sp_gate_cols["collision_tax_raw"] = float(
-                        (forced_scores - unforced_raw).mean()
+                        (scores[("forced", "raw")] - scores[("unforced", "raw")]).mean()
                     )
                     sp_gate_cols["collision_tax_centered"] = float(
-                        (forced_cen - unforced_cen).mean()
+                        (scores[("forced", "centered")]
+                         - scores[("unforced", "centered")]).mean()
                     )
+                    sp_gate_cols["collision_gate_cells"] = int(gate_cells.size)
                     gate_evidence.append(
                         {
                             "pair": f"{pair.context_frame_id} -> {pair.target_frame_id}",
                             "level": level,
                             "path": SPLAT_POOL,
                             "forced_max_abs": forced_max,
+                            "forced_max_abs_centered": forced_max_cen,
                             "collision_tax_raw": sp_gate_cols["collision_tax_raw"],
+                            "collision_tax_centered": sp_gate_cols["collision_tax_centered"],
                             "n_cells": int(gate_cells.size),
                         }
                     )
-                    if forced_max > analysis.rotation_gate_forced_tol:
+                    worst = max(forced_max, forced_max_cen)
+                    if worst > analysis.rotation_gate_forced_tol:
+                        metric_name = "raw" if forced_max >= forced_max_cen else "centered"
                         raise Phase4GateError(
                             "PROTOCOL 4.5 forced-collision-order gate failed: "
                             f"scene {pair.scene}, {pair.context_frame_id} -> "
                             f"{pair.target_frame_id}, level {level}, max forced "
-                            f"score residual {forced_max:.3e} over tolerance "
-                            f"{analysis.rotation_gate_forced_tol:g}"
+                            f"score residual {worst:.3e} on {metric_name} cosine "
+                            f"over tolerance {analysis.rotation_gate_forced_tol:g}"
                         )
             in_shared = torch.from_numpy(shared_level[cells_v])
             extra = {
@@ -1451,13 +1554,34 @@ def evaluate_scene_phase4(
     if regimes is not None:
         pairs = [p for p in pairs if p.regime in regimes]
 
+    # PROTOCOL 4.1 inherits Phase 3's pairs. Regenerating them is the same
+    # computation, not the same evidence, so the regenerated set is reconciled
+    # against what Phase 3 recorded. A regime filter makes this run a subset,
+    # which is checked as a subset; an unfiltered run must match exactly.
+    # Two stages, checked separately. The Phase 3 parquet holds the pairs that
+    # run scored, which is its sample minus the ones it found unscorable, so
+    # the sampled set is a superset and only the containment is checkable here.
+    # The equality that matters, that Phase 4 scored exactly what Phase 3
+    # scored, is asserted after the evaluation loop against what was scored.
+    phase3_pairs = phase3_pair_identities(cfg.phase3_eval_dir, scene)
+    regenerated = {(p.context_frame_id, p.target_frame_id) for p in pairs}
+    missing = phase3_pairs - regenerated
+    if regimes is None and missing:
+        raise Phase4GateError(
+            f"{scene}: {len(missing)} pairs Phase 3 scored are absent from the "
+            f"regenerated sample, first {sorted(missing)[:3]}. Manifests, "
+            "poses, the frame filter, or the sampler have moved since Phase 3 "
+            "ran, so this run would measure a different population."
+        )
+    expected_scored = phase3_pairs & regenerated
+
     # One checkpoint, one convention. The verdict comes from the run-level
     # record and never from this scene's diagnostic entry: reading a per-scene
     # verdict here let the same checkpoint be given different depth semantics
     # in different scenes, which would mix two incompatible interpretations
     # into one table. Amendment A6; the invariant is tested permanently.
-    verdict = run_convention(convention)
     depth_cache = load_depth_archive(cfg.cache_root, cfg.depth_encoder, scene)
+    verdict = run_convention(convention, depth_cache["meta"])
 
     cache = _SceneCache(scene_root, cfg.cache_root, [cfg.feature_encoder], scene, manifest)
     est_maps: dict[str, np.ndarray] = {}
@@ -1501,6 +1625,7 @@ def evaluate_scene_phase4(
     forcing_checked = False
     affine_failed_pairs = 0
     universe_size = 0
+    scored_pairs: set[tuple[str, str]] = set()
 
     for pair in pairs:
         context = frames[pair.context_frame_id]
@@ -1575,7 +1700,21 @@ def evaluate_scene_phase4(
         if collect_rows:
             rows.extend(pair_rows)
         audits[f"{pair.context_frame_id} -> {pair.target_frame_id}"] = audit
+        scored_pairs.add((pair.context_frame_id, pair.target_frame_id))
     cache.close()
+
+    # The inheritance, stated as equality on what was actually scored. A pair
+    # Phase 3 scored and Phase 4 dropped, or the reverse, means the two runs
+    # are not measuring the same population however similar their inputs look.
+    if scored_pairs != expected_scored:
+        dropped = sorted(expected_scored - scored_pairs)[:3]
+        added = sorted(scored_pairs - expected_scored)[:3]
+        raise Phase4GateError(
+            f"{scene}: Phase 4 scored {len(scored_pairs)} pairs where Phase 3 "
+            f"scored {len(expected_scored)} of the same sample. Dropped here: "
+            f"{dropped}. Added here: {added}. PROTOCOL 4.1 inherits the pair "
+            "population unchanged."
+        )
 
     metadata = {
         "phase4_version": PHASE4_VERSION,
@@ -1622,6 +1761,11 @@ def evaluate_scene_phase4(
         "universe_size": universe_size,
         "run_scenes": sorted(cfg.scenes),
         "target_exclusion_asserted_per_record": True,
+        # The untracked inputs, bound by content so a later audit can tell
+        # whether this run and Phase 3 saw the same scene.
+        "manifest_digest": manifest_digest(scene_root),
+        "phase3_pairs_reconciled": True,
+        "phase3_pair_count": len(phase3_pairs),
     }
     return rows, {"metadata": metadata, "gate_evidence": gate_evidence, "audits": audits}
 

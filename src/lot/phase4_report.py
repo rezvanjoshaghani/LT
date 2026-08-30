@@ -41,11 +41,21 @@ from .analysis_config import DEFAULT_CONFIG_PATH, AnalysisConfig, load_analysis_
 from .datasets import bin_order, parallax_bin, rotation_bin
 from .evaluate import MEAN_FEATURE, NO_WARP_COPY, ORACLE_TRANSPORT, PER_POINT, SPLAT_POOL
 from .figures import CONTENT_DIGEST, is_pinned_revision, write_table
-from .phase4 import GT_LEVEL, LEVELS, PHASE4_VERSION, POPULATION_FULL, POPULATION_MATCHED
+from .phase4 import (
+    GT_LEVEL,
+    LEVELS,
+    PHASE4_VERSION,
+    POPULATION_FULL,
+    POPULATION_MATCHED,
+    phase4_measurement_digest,
+)
 
 RAW = "cosine_mean"
 CENTERED = "cosine_centered_mean"
 METRICS = (RAW, CENTERED)
+# The cross-path common-valid columns the evaluator stored per row.
+INTERSECT_OF = {RAW: "cosine_intersect_mean",
+                CENTERED: "cosine_centered_intersect_mean"}
 SPLITS = ("boundary", "interior", "lowtex", "hightex")
 
 PRIMARY_REGIME = {"parallax_bin": "translation", "rotation_bin": "rotation"}
@@ -103,6 +113,25 @@ def read_phase4_dir(eval_dir: Path, analysis: AnalysisConfig) -> list[dict[str, 
             "launch templates should have made this impossible. Re-run from "
             "a clean tree rather than reporting on it"
         )
+    # The config reading a run must be the config that produced it, in every
+    # value that decided what the rows contain. Checking only that the files
+    # agree with one another binds nothing: a whole directory measured under a
+    # different confidence or validity rule agrees with itself perfectly, and
+    # would be reported as this experiment.
+    expected = any_meta.get("phase4_measurement_digest")
+    active = phase4_measurement_digest(analysis)
+    if expected != active:
+        raise ValueError(
+            f"{eval_dir} was evaluated under Phase 4 measurement config "
+            f"{expected}, this analysis carries {active}. Those values decide "
+            "what the rows contain, not how they are read; re-run the "
+            "evaluation or analyse with the config it used"
+        )
+    if not any_meta.get("phase3_pairs_reconciled"):
+        raise ValueError(
+            f"{eval_dir} carries no record of its pair population having been "
+            "reconciled against Phase 3; PROTOCOL 4.1 inherits those pairs"
+        )
     return rows
 
 
@@ -111,11 +140,32 @@ def build_records(
 ) -> list[dict[str, Any]]:
     """One record per (pair, path, metric, level) carrying every paired term."""
     by_key: dict[tuple, dict[str, dict[str, Any]]] = {}
+    duplicates: list[tuple] = []
     for row in rows:
         key = (row["scene"], row["context_frame_id"], row["target_frame_id"], row["path"])
-        by_key.setdefault(key, {})[f"{row['level']}|{row['population']}|{row['variant']}"] = row
+        slot = f"{row['level']}|{row['population']}|{row['variant']}"
+        bucket = by_key.setdefault(key, {})
+        if slot in bucket:
+            duplicates.append((*key, slot))
+        bucket[slot] = row
+    if duplicates:
+        # Assigning over a duplicate silently keeps whichever row was read
+        # last, so a directory holding two runs would produce a table drawn
+        # from a population nobody chose. Phase 3's analysis layer refuses the
+        # same way.
+        raise ValueError(
+            f"{len(duplicates)} duplicate (comparison, level, population, "
+            f"variant) rows, first {duplicates[0]}. The evaluation directory "
+            "holds more than one run for these comparisons"
+        )
 
     records: list[dict[str, Any]] = []
+    # Arms whose masks disagree are excluded and counted rather than averaged,
+    # and affine levels that failed their fit are counted rather than dropped
+    # in silence: PROTOCOL 4.3 requires a nonpositive-slope failure to be
+    # reported. build_records returns both counts alongside the records.
+    mask_mismatches: list[tuple] = []
+    affine_absent: set[tuple] = set()
     for key, slots in by_key.items():
         scene, context_frame_id, target_frame_id, path = key
         gt_oracle = slots.get(f"{GT_LEVEL}|{POPULATION_FULL}|{ORACLE_TRANSPORT}")
@@ -129,6 +179,24 @@ def build_records(
             oracle_m = slots.get(f"{level}|{POPULATION_MATCHED}|{ORACLE_TRANSPORT}")
             nowarp_m = slots.get(f"{level}|{POPULATION_MATCHED}|{NO_WARP_COPY}")
             if est is None or oracle_m is None or nowarp_m is None:
+                # An affine level that failed its fit contributes no matched
+                # arm. Counted below rather than vanishing.
+                if level == "affine":
+                    affine_absent.add((scene, context_frame_id, target_frame_id, path))
+                continue
+            # PROTOCOL 4.6 makes the tax a subset-matched quantity: the
+            # estimated score, the matched ceiling, and the matched floor must
+            # be the same records. The evaluation layer arranges that; this
+            # verifies it from the persisted masks rather than trusting it,
+            # because a difference of means over different populations wears
+            # exactly the shape of a method effect.
+            arms = (est, oracle_m, nowarp_m)
+            if len({bytes(arm["sample_mask"]) for arm in arms}) != 1 or len(
+                {(arm["n"], arm["n_intersect"]) for arm in arms}
+            ) != 1:
+                mask_mismatches.append(
+                    (scene, context_frame_id, target_frame_id, path, level)
+                )
                 continue
             for metric in METRICS:
                 if not all(
@@ -156,6 +224,24 @@ def build_records(
                     "transported_fraction": est["n"] / est["n_gt"] if est["n_gt"] else float("nan"),
                     "collision_tax_raw": est.get("collision_tax_raw", float("nan")),
                     "collision_tax_centered": est.get("collision_tax_centered", float("nan")),
+                    # PROTOCOL 3.9 compares the two paths on the cells both
+                    # scored. The evaluation layer computed those scores and
+                    # stored them per row; the ordinary means are over each
+                    # path's own matched set and are not comparable across
+                    # paths.
+                    "est_intersect": est[INTERSECT_OF[metric]],
+                    "oracle_intersect": oracle_m[INTERSECT_OF[metric]],
+                    "nowarp_intersect": nowarp_m[INTERSECT_OF[metric]],
+                    "n_intersect": est["n_intersect"],
+                    # PROTOCOL 4.6's representation reference ceiling, carried
+                    # through so it can be reported rather than only used to
+                    # form the selection differential.
+                    "forced_oracle_raw": est.get("forced_oracle_raw", float("nan")),
+                    "forced_estimated_raw": est.get("forced_estimated_raw", float("nan")),
+                    "forced_oracle_centered": est.get(
+                        "forced_oracle_centered", float("nan")),
+                    "forced_estimated_centered": est.get(
+                        "forced_estimated_centered", float("nan")),
                 }
                 for split in SPLITS:
                     est_s = slots.get(f"{level}|{split}|{variant_name}")
@@ -166,8 +252,21 @@ def build_records(
                         and math.isfinite(est_s[metric]) and math.isfinite(oracle_s[metric])
                         else float("nan")
                     )
+                # A contrast is a difference between two arms, so a pair
+                # contributes to it only when it has both. Leaving one arm
+                # populated would let the two sides average over different
+                # pairs and call the difference a localization effect.
+                for left, right in (("boundary", "interior"), ("lowtex", "hightex")):
+                    if not (math.isfinite(record[f"tax_{left}"])
+                            and math.isfinite(record[f"tax_{right}"])):
+                        record[f"tax_{left}"] = float("nan")
+                        record[f"tax_{right}"] = float("nan")
                 records.append(record)
-    return records
+    return records, {
+        "mask_mismatched_arms": len(mask_mismatches),
+        "mask_mismatch_examples": [list(m) for m in mask_mismatches[:5]],
+        "affine_arms_absent": len(affine_absent),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +286,8 @@ def group_by(records: Sequence[dict], keys: Sequence[str]) -> dict[tuple, list[d
 FIELDS = (
     "oracle_m", "est", "nowarp_m", "oracle_full", "transported_fraction",
     "tax_boundary", "tax_interior", "tax_lowtex", "tax_hightex",
+    "forced_oracle_raw", "forced_estimated_raw",
+    "forced_oracle_centered", "forced_estimated_centered",
 )
 
 
@@ -239,6 +340,11 @@ def quantity_formulas(analysis: AnalysisConfig) -> dict[str, Callable[[dict[str,
         return (m["est"] - m["nowarp_m"]) / oracle_margin
 
     return {
+        # PROTOCOL 4.6: the full-population Phase 3 ceiling is the
+        # representation reference ceiling. It is reported in its own
+        # right, not only consumed to form the selection differential,
+        # and it is never subtracted from a score on another population.
+        "reference_ceiling_phase3": lambda m: m["oracle_full"],
         "matched_ceiling": lambda m: m["oracle_m"],
         "estimated_score": lambda m: m["est"],
         "matched_floor": lambda m: m["nowarp_m"],
@@ -248,8 +354,25 @@ def quantity_formulas(analysis: AnalysisConfig) -> dict[str, Callable[[dict[str,
         "retained_fraction": retained,
         "selection_differential": lambda m: m["oracle_full"] - m["oracle_m"],
         "transported_fraction": lambda m: m["transported_fraction"],
+        # The localization contrasts are differences between two arms, so the
+        # arms must be the same pairs. scene_aggregates would otherwise average
+        # each arm over whatever pairs happened to populate it and present the
+        # difference as a contrast. build_records nulls both arms of a split
+        # whenever either is missing, so the means below are over one
+        # population by construction, and each arm's support is reported.
         "boundary_minus_interior_tax": lambda m: m["tax_boundary"] - m["tax_interior"],
         "lowtex_minus_hightex_tax": lambda m: m["tax_lowtex"] - m["tax_hightex"],
+        # PROTOCOL 4.10 Figure 2 is the forced-collision-order identity
+        # check, so the forced scores are reported quantities rather than
+        # gate internals. Nonfinite outside the rotation regime.
+        "forced_oracle_raw": lambda m: m["forced_oracle_raw"],
+        "forced_estimated_raw": lambda m: m["forced_estimated_raw"],
+        "forced_oracle_centered": lambda m: m["forced_oracle_centered"],
+        "forced_estimated_centered": lambda m: m["forced_estimated_centered"],
+        "forced_identity_gap_raw": lambda m: (
+            m["forced_oracle_raw"] - m["forced_estimated_raw"]),
+        "forced_identity_gap_centered": lambda m: (
+            m["forced_oracle_centered"] - m["forced_estimated_centered"]),
     }
 
 
@@ -322,21 +445,52 @@ LADDER_CI = ("depth_tax", "oracle_margin", "estimated_margin", "retained_fractio
              "lowtex_minus_hightex_tax")
 
 
-def ladder_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict[str, Any]]:
-    """PROTOCOL 4.10 Table 1: per regime and pooled, per metric, path, level."""
+def ladder_table(
+    records: Sequence[dict],
+    analysis: AnalysisConfig,
+    affine_absent: int = 0,
+) -> list[dict[str, Any]]:
+    """PROTOCOL 4.10 Table 1: per regime and pooled, per metric, path, level.
+
+    The affine sensitivity row carries its own accounting. PROTOCOL 4.3 marks
+    an image whose fitted scale is nonpositive as a failed affine row and
+    requires the failure to be reported rather than silently skipped, so every
+    affine row states how many pairs were attempted, how many contributed, and
+    how many failed their fit.
+    """
     formulas = quantity_formulas(analysis)
     table: list[dict[str, Any]] = []
     scopes = [("pooled", None), ("rotation", "rotation"),
               ("translation", "translation"), ("orbit", "orbit")]
+    attempted = {
+        key: len({r["camera_pair"] for r in cell})
+        for key, cell in group_by(
+            [r for r in records if r["level"] == "none"], ("metric", "path")
+        ).items()
+    }
     for scope_name, regime in scopes:
         scoped = [r for r in records if regime is None or r["regime"] == regime]
         for key, cell in sorted(group_by(scoped, ("metric", "path", "level")).items()):
             metric, path, level = key
             summary = cell_summary(cell, analysis, formulas, with_ci=LADDER_CI)
-            table.append({
+            row = {
                 "analysis": scope_name, "metric": metric, "path": path,
                 "level": level, **summary,
-            })
+            }
+            if level == "affine":
+                contributed = len({r["camera_pair"] for r in cell})
+                total = attempted.get((metric, path), contributed)
+                row["affine_pairs_attempted"] = total
+                row["affine_pairs_contributed"] = contributed
+                row["affine_pairs_failed"] = max(0, total - contributed)
+                row["affine_failure_reason"] = (
+                    "fitted scale nonpositive or calibration population too small"
+                )
+            table.append(row)
+    if affine_absent:
+        for row in table:
+            if row["level"] == "affine":
+                row["affine_arms_absent_run_total"] = affine_absent
     return table
 
 
@@ -374,47 +528,127 @@ def bin_table(records: Sequence[dict], analysis: AnalysisConfig) -> list[dict[st
 DISCLOSED_QUANTITIES = ("depth_tax", "estimated_margin", "selection_differential")
 
 
-def near_zero_disclosure(
-    bin_rows: Sequence[dict[str, Any]], analysis: AnalysisConfig
+def reporting_cell(record: dict[str, Any]) -> tuple[str, str] | None:
+    """The reporting cell a record belongs to, per PROTOCOL 3.3.
+
+    Each primary curve takes only the regime that holds the other axis at
+    zero; orbit appears in the joint view alone.
+    """
+    regime = record["regime"]
+    for axis, primary in PRIMARY_REGIME.items():
+        if regime == primary:
+            return regime, record[axis]
+    if regime == JOINT_REGIME:
+        return regime, f"{record['rotation_bin']} x {record['parallax_bin']}"
+    return None
+
+
+def cross_path_disclosure(
+    records: Sequence[dict[str, Any]], analysis: AnalysisConfig
 ) -> list[dict[str, Any]]:
     """Score-space effects at the scale of the operator gate, both paths shown.
 
-    The band is the frozen 0.003 operator tolerance. It applies to score-space
-    quantities only; retained and transported fractions are dimensionless and
-    are governed by epsilon_margin instead (Addendum A). The two estimates are
-    each path's own matched value; the frozen three-way reading restricts what
-    may be claimed.
+    PROTOCOL 3.9 compares the two paths on the cells both scored, so every
+    term here is read from the intersection columns the evaluator computed on
+    the cross-path common-valid set, and a pair enters only when both paths
+    scored it. Comparing each path's ordinary matched mean would difference
+    two different populations and call the result an operator effect.
+
+    The interval on the difference comes from a paired scene bootstrap: one
+    draw of scenes serves both paths and dM is recomputed inside the
+    replicate, so it carries the covariance the pairing gives it rather than
+    the inflation of two independently bootstrapped intervals.
+
+    The band is the frozen operator tolerance and applies to score-space
+    quantities only; dimensionless ratios are governed by epsilon_margin.
     """
     band = analysis.path_agreement_tolerance
-    by_cell: dict[tuple, dict[str, dict]] = {}
-    for row in bin_rows:
-        key = (row["analysis"], row["axis"], row["bin"], row["metric"], row["level"])
-        by_cell.setdefault(key, {})[row["path"]] = row
-    out: list[dict[str, Any]] = []
-    for key, paths in sorted(by_cell.items()):
+    quantities = {
+        "depth_tax": ("oracle_intersect", "est_intersect"),
+        "estimated_margin": ("est_intersect", "nowarp_intersect"),
+    }
+    paired: dict[tuple, dict[str, dict]] = {}
+    for record in records:
+        key = (record["scene"], record["camera_pair"], record["level"], record["metric"])
+        paired.setdefault(key, {})[record["path"]] = record
+
+    cells: dict[tuple, list[dict[str, Any]]] = {}
+    for (scene, camera_pair, level, metric), paths in paired.items():
         if PER_POINT not in paths or SPLAT_POOL not in paths:
             continue
-        if not (paths[PER_POINT]["supported"] and paths[SPLAT_POOL]["supported"]):
+        per_point, splat = paths[PER_POINT], paths[SPLAT_POOL]
+        if per_point["n_intersect"] != splat["n_intersect"]:
             continue
-        for quantity in DISCLOSED_QUANTITIES:
-            m_pp = paths[PER_POINT][quantity]
-            m_sp = paths[SPLAT_POOL][quantity]
-            if not (math.isfinite(m_pp) and math.isfinite(m_sp)):
-                continue
+        cell = reporting_cell(per_point)
+        if cell is None:
+            continue
+        values: dict[str, float] = {}
+        complete = True
+        for name, (high, low) in quantities.items():
+            for row, suffix in ((per_point, "pp"), (splat, "sp")):
+                a, b = row[high], row[low]
+                if not (math.isfinite(a) and math.isfinite(b)):
+                    complete = False
+                    break
+                values[f"{name}_{suffix}"] = a - b
+            if not complete:
+                break
+        if not complete:
+            continue
+        cells.setdefault((level, metric, *cell), []).append(
+            {"scene": scene, "camera_pair": camera_pair, **values}
+        )
+
+    out: list[dict[str, Any]] = []
+    for key, members in sorted(cells.items(), key=repr):
+        level, metric, analysis_name, label = key
+        counts = {
+            "n_scenes": len({m["scene"] for m in members}),
+            "n_camera_pairs": len({m["camera_pair"] for m in members}),
+            "n_feature_comparisons": 0,
+        }
+        if not is_supported(counts, analysis):
+            continue
+        by_scene: dict[str, list[dict[str, float]]] = {}
+        for member in members:
+            by_scene.setdefault(member["scene"], []).append(member)
+        scenes = sorted(by_scene)
+        for quantity in quantities:
+            pp = {s: np.array([m[f"{quantity}_pp"] for m in by_scene[s]]) for s in scenes}
+            sp = {s: np.array([m[f"{quantity}_sp"] for m in by_scene[s]]) for s in scenes}
+            m_pp = float(np.concatenate([pp[s] for s in scenes]).mean())
+            m_sp = float(np.concatenate([sp[s] for s in scenes]).mean())
+            rng = np.random.default_rng(analysis.bootstrap_seed)
+            draws = {"pp": [], "sp": [], "dM": []}
+            for _ in range(analysis.bootstrap_resamples):
+                picked = rng.integers(0, len(scenes), size=len(scenes))
+                rep_pp = np.concatenate([pp[scenes[i]] for i in picked])
+                rep_sp = np.concatenate([sp[scenes[i]] for i in picked])
+                if not rep_pp.size:
+                    continue
+                a, b = float(rep_pp.mean()), float(rep_sp.mean())
+                draws["pp"].append(a)
+                draws["sp"].append(b)
+                draws["dM"].append(a - b)
+            tail = (1.0 - analysis.bootstrap_confidence) / 2.0
+            interval = {
+                name: (
+                    (float(np.quantile(values, tail)),
+                     float(np.quantile(values, 1.0 - tail)))
+                    if values else (float("nan"), float("nan"))
+                )
+                for name, values in draws.items()
+            }
             in_band = [abs(m_pp) <= band, abs(m_sp) <= band]
             if not any(in_band):
                 continue
-            lo_pp = paths[PER_POINT].get(f"{quantity}_ci_low", float("nan"))
-            hi_pp = paths[PER_POINT].get(f"{quantity}_ci_high", float("nan"))
-            lo_sp = paths[SPLAT_POOL].get(f"{quantity}_ci_low", float("nan"))
-            hi_sp = paths[SPLAT_POOL].get(f"{quantity}_ci_high", float("nan"))
+            lo_pp, hi_pp = interval["pp"]
+            lo_sp, hi_sp = interval["sp"]
             excludes = lo_pp * hi_pp > 0 and lo_sp * hi_sp > 0
             same_sign = (m_pp > 0) == (m_sp > 0)
             if same_sign and excludes and all(in_band):
                 case = "both_in_band"
-                sentence = (
-                    "a small, sign-consistent effect under both evaluation paths"
-                )
+                sentence = "a small, sign-consistent effect under both evaluation paths"
             elif same_sign and excludes and sum(in_band) == 1:
                 case = "one_in_band"
                 sentence = (
@@ -431,11 +665,13 @@ def near_zero_disclosure(
                     "evaluation-path choice"
                 )
             out.append({
-                "analysis": key[0], "axis": key[1], "bin": key[2],
-                "metric": key[3], "level": key[4], "quantity": quantity,
+                "analysis": analysis_name, "bin": label, "metric": metric,
+                "level": level, "quantity": quantity,
                 "M_pp": m_pp, "M_sp": m_sp, "dM": m_pp - m_sp,
-                "M_pp_ci": [lo_pp, hi_pp], "M_sp_ci": [lo_sp, hi_sp],
+                "M_pp_ci": list(interval["pp"]), "M_sp_ci": list(interval["sp"]),
+                "dM_ci": list(interval["dM"]), "replicates": len(draws["dM"]),
                 "band": band, "case": case, "sentence": sentence,
+                **counts,
             })
     return out
 
@@ -518,48 +754,75 @@ def figure1_tax_vs_parallax(bin_rows, path_out: Path, analysis: AnalysisConfig) 
 
 
 def figure2_rotation_control(ladder_rows, gate_summary, path_out: Path) -> None:
-    """Figure 2: the pure-rotation identity check and the collision-ordering tax.
+    """Figure 2: the pure-rotation identity check under forced collision order.
 
-    The overlap of every variant with the matched Oracle ceiling is the
-    correctness control the 4.5 gates enforce; the unforced collision-ordering
-    tax is shown beside it, small and separate.
+    PROTOCOL 4.10 asks for the identity check with all variants overlapping,
+    and the check is defined under forced collision ordering: only with the
+    winner map fixed is agreement a true invariant, because discrete
+    collisions can legitimately flip which sample wins a cell. Plotting the
+    ordinary matched scores instead would show a control the protocol did not
+    ask for. The unforced collision-ordering tax is shown beside it, small and
+    separate, and is a splat-path diagnostic with no per-point counterpart.
     """
     plt = _pyplot()
-    figure, axes = plt.subplots(1, 2, figsize=(12.0, 4.4))
-    panel = axes[0]
-    labels, oracle_values, est_values = [], [], []
-    for row in ladder_rows:
-        if (row["analysis"], row["metric"], row["path"]) != ("rotation", RAW, PER_POINT):
-            continue
-        labels.append(row["level"])
-        oracle_values.append(row["matched_ceiling"])
-        est_values.append(row["estimated_score"])
-    xs = range(len(labels))
-    panel.plot(xs, oracle_values, "o", markersize=9, fillstyle="none",
-               label="matched Oracle-Transport")
-    panel.plot(xs, est_values, "x", markersize=7, label="estimated depth")
-    panel.set_xticks(list(xs))
-    panel.set_xticklabels(labels)
-    panel.set_title("pure rotation, per-point: the variants must overlap", fontsize=9)
-    panel.set_ylabel("raw cosine", fontsize=9)
+    figure, axes = plt.subplots(1, 3, figsize=(16.0, 4.4))
+
+    for panel, metric, label in (
+        (axes[0], "raw", "raw cosine"), (axes[1], "centered", "centered cosine"),
+    ):
+        oracle_key = f"forced_oracle_{metric}"
+        est_key = f"forced_estimated_{metric}"
+        labels, oracle_values, est_values, gaps = [], [], [], []
+        for row in ladder_rows:
+            if (row["analysis"], row["path"]) != ("rotation", SPLAT_POOL):
+                continue
+            if row["metric"] != (RAW if metric == "raw" else CENTERED):
+                continue
+            if not math.isfinite(row.get(oracle_key, float("nan"))):
+                continue
+            labels.append(row["level"])
+            oracle_values.append(row[oracle_key])
+            est_values.append(row[est_key])
+            gaps.append(row[f"forced_identity_gap_{metric}"])
+        positions = range(len(labels))
+        panel.plot(positions, oracle_values, "o", markersize=11, fillstyle="none",
+                   label="matched Oracle-Transport, forced order")
+        panel.plot(positions, est_values, "x", markersize=8,
+                   label="estimated depth, forced order")
+        panel.set_xticks(list(positions))
+        panel.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+        panel.set_title(
+            f"forced collision order, {label}: the variants must overlap", fontsize=9
+        )
+        panel.set_ylabel(label, fontsize=9)
+        panel.grid(alpha=0.3)
+        panel.legend(fontsize=7)
+        for position, gap in zip(positions, gaps):
+            panel.annotate(f"{gap:+.1e}", (position, oracle_values[position]),
+                           textcoords="offset points", xytext=(0, 12),
+                           ha="center", fontsize=6, color="0.35")
+
+    panel = axes[2]
+    levels = list(gate_summary["collision_tax_raw_by_level"])
+    width = 0.38
+    offsets = [p - width / 2 for p in range(len(levels))]
+    panel.bar(offsets, [gate_summary["collision_tax_raw_by_level"][l] for l in levels],
+              width=width, label="raw")
+    panel.bar([p + width for p in offsets],
+              [gate_summary["collision_tax_centered_by_level"].get(l, float("nan"))
+               for l in levels], width=width, label="centered")
+    panel.set_xticks(range(len(levels)))
+    panel.set_xticklabels(levels, rotation=20, ha="right", fontsize=8)
+    panel.axhline(0.0, color="black", linewidth=1)
+    panel.set_title("unforced collision-ordering tax, splat path only", fontsize=9)
+    panel.set_ylabel("forced score minus ordinary score", fontsize=8)
     panel.grid(alpha=0.3)
     panel.legend(fontsize=7)
 
-    panel = axes[1]
-    levels = list(gate_summary["collision_tax_raw_by_level"])
-    values = [gate_summary["collision_tax_raw_by_level"][l] for l in levels]
-    panel.bar(range(len(levels)), values)
-    panel.set_xticks(range(len(levels)))
-    panel.set_xticklabels(levels)
-    panel.axhline(0.0, color="black", linewidth=1)
-    panel.set_title(
-        "unforced collision-ordering tax, raw, splat-and-pool only", fontsize=9
-    )
-    panel.set_ylabel("forced score minus ordinary score", fontsize=8)
-    panel.grid(alpha=0.3)
     figure.suptitle(
-        "Figure 2: pure-rotation correctness control under forced collision order",
-        fontsize=11,
+        "Figure 2: pure-rotation correctness control under forced collision order. "
+        "Annotated values are the forced-order identity gap, which the 4.5 gate bounds.",
+        fontsize=10,
     )
     figure.tight_layout()
     path_out.parent.mkdir(parents=True, exist_ok=True)
@@ -626,7 +889,7 @@ def figure4_localization(ladder_rows, path_out: Path) -> None:
         (axes[1], "lowtex_minus_hightex_tax",
          "low-texture tax minus high-texture tax"),
     ):
-        labels, values, low, high = [], [], [], []
+        labels, values, low, high, unsupported = [], [], [], [], []
         for row in ladder_rows:
             if (row["analysis"], row["metric"], row["path"]) != ("pooled", CENTERED, PER_POINT):
                 continue
@@ -637,9 +900,16 @@ def figure4_localization(ladder_rows, path_out: Path) -> None:
             values.append(value)
             low.append(max(0.0, value - row[f"{quantity}_ci_low"]))
             high.append(max(0.0, row[f"{quantity}_ci_high"] - value))
+            # Support is the contrast's own, not the level's overall support:
+            # a pair contributes to a contrast only when it carries both arms,
+            # so the arms can be far thinner than the matched population and a
+            # cell can pass overall while the contrast rests on almost nothing.
+            if not row["supported"] or row[f"{quantity}_ci_replicates"] == 0:
+                unsupported.append(len(labels) - 1)
+        _band(panel, unsupported)
         panel.errorbar(range(len(labels)), values, yerr=[low, high], fmt="o", capsize=3)
         panel.set_xticks(range(len(labels)))
-        panel.set_xticklabels(labels)
+        panel.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
         panel.axhline(0.0, color="black", linewidth=1)
         panel.set_title(title, fontsize=9)
         panel.grid(alpha=0.3)
@@ -691,12 +961,22 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = args.out_dir or Path(args.eval_dir).parent
 
     rows = read_phase4_dir(args.eval_dir, analysis)
-    records = build_records(rows, analysis)
+    records, exclusions = build_records(rows, analysis)
     print(f"read {len(rows)} rows, {len(records)} paired records")
+    if exclusions["mask_mismatched_arms"]:
+        raise SystemExit(
+            f"{exclusions['mask_mismatched_arms']} matched arms carry "
+            "different sample masks, so their differences would be "
+            "differences of populations. PROTOCOL 4.6 makes every tax "
+            f"subset matched; first {exclusions['mask_mismatch_examples'][:1]}"
+        )
+    if exclusions["affine_arms_absent"]:
+        print(f"affine arms absent (failed fits): "
+              f"{exclusions['affine_arms_absent']}")
 
-    ladder = ladder_table(records, analysis)
+    ladder = ladder_table(records, analysis, exclusions["affine_arms_absent"])
     bins = bin_table(records, analysis)
-    disclosure = near_zero_disclosure(bins + ladder_with_axis(ladder), analysis)
+    disclosure = cross_path_disclosure(records, analysis)
     gates = collision_summary(records)
 
     write_table(Path(out_dir) / "tables" / "phase4_ladder.parquet", ladder)

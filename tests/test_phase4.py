@@ -192,6 +192,32 @@ def planar_authority() -> dict:
     }
 
 
+def run_phase3(root, cfg, analysis):
+    """The Phase 3 evaluation whose pair population Phase 4 inherits.
+
+    Produced by the real evaluator so the inheritance check in
+    evaluate_scene_phase4 is exercised against a genuine parquet rather than
+    a fixture that asserts against itself.
+    """
+    from lot.evaluate import (
+        EvalConfig, evaluate_scene, load_or_build_mean_vector, write_rows,
+    )
+
+    phase3 = EvalConfig(
+        experiment_name="experiment_zero", renders_root=root,
+        cache_root=root / "cache", output_root=root / "p3",
+        scenes=[SCENE], encoders=["dinov2_vitb14"], seed=cfg.seed,
+        mean_vector_scenes=[SCENE],
+    )
+    mean_vector = load_or_build_mean_vector(
+        phase3.cache_root, "dinov2_vitb14", [SCENE],
+        phase3.output_root / phase3.experiment_name,
+    )
+    rows, meta = evaluate_scene(phase3, SCENE, {"dinov2_vitb14": mean_vector}, analysis)
+    write_rows(phase3.eval_dir / f"{SCENE}.parquet", rows, meta)
+    return phase3.eval_dir, mean_vector
+
+
 @pytest.fixture(scope="module")
 def phase4_run(tmp_path_factory):
     """One end-to-end Phase 4 evaluation of the analytic scene."""
@@ -202,6 +228,8 @@ def phase4_run(tmp_path_factory):
         output_root=root / "out", scenes=[SCENE], mean_vector_dir=root / "out" / "mv",
     )
     analysis = load_analysis_config()
+    phase3_eval_dir, _ = run_phase3(root, cfg, analysis)
+    cfg.phase3_eval_dir = phase3_eval_dir
     diagnostic = convention_report(cfg, analysis)
     convention = build_convention_record(
         diagnostic, planar_authority(),
@@ -216,7 +244,8 @@ def phase4_run(tmp_path_factory):
     return {
         "root": root, "cfg": cfg, "analysis": analysis, "convention": convention,
         "rows": rows, "evidence": evidence, "mean_vector": mean_vector,
-        "n_frames": len(manifest.frames),
+        "n_frames": len(manifest.frames), "convention": convention,
+        "phase3_eval_dir": phase3_eval_dir,
     }
 
 
@@ -406,6 +435,10 @@ def depth_to_cam_coords_points(depth_map, intrinsic):
 '''
 
 
+CACHE_META = {"code_revision": "5" * 40, "weights_fingerprint": "c" * 32,
+              "weights_revision": "4" * 40}
+
+
 def test_source_authority_signature_detection(tmp_path, monkeypatch):
     """The planar signature is recognized, and a ray head is not mistaken for it."""
     import lot.phase4 as phase4
@@ -452,7 +485,7 @@ def test_one_checkpoint_one_convention_even_when_diagnostics_disagree():
                      "room_0": "planar_z", "hotel_0": "planar_z"},
         "unanimous": False,
     }
-    record = build_convention_record(diagnostic, planar_authority(), {})
+    record = build_convention_record(diagnostic, planar_authority(), CACHE_META)
     assert record["depth_convention"] == "planar_z"
     assert record["depth_convention_authority"] == "source"
     assert record["depth_convention_conversion_applied"] is False
@@ -464,7 +497,7 @@ def test_one_checkpoint_one_convention_even_when_diagnostics_disagree():
     ]
     # Every scene, including the two the diagnostic flagged, reads one value.
     for scene in diagnostic["scenes"]:
-        assert run_convention(record) == "planar_z", scene
+        assert run_convention(record, CACHE_META) == "planar_z", scene
 
 
 def test_convention_cannot_be_established_without_source_authority():
@@ -475,10 +508,14 @@ def test_convention_cannot_be_established_without_source_authority():
     # A record lacking the global decision, or claiming a non-source basis,
     # is refused rather than defaulted.
     with pytest.raises(Phase4GateError):
-        run_convention({"scenes": {"a": {"verdict": "planar_z"}}})
+        run_convention({"scenes": {"a": {"verdict": "planar_z"}}}, CACHE_META)
     with pytest.raises(Phase4GateError):
         run_convention({"depth_convention": "planar_z",
-                        "depth_convention_authority": "regression"})
+                        "depth_convention_authority": "regression"}, CACHE_META)
+    # A record written about another checkpoint does not govern this one.
+    stale = build_convention_record({"scenes": {}}, planar_authority(), CACHE_META)
+    with pytest.raises(Phase4GateError, match="does not govern|is not the"):
+        run_convention(stale, {**CACHE_META, "weights_fingerprint": "f" * 32})
 
 
 def test_authority_must_be_the_source_that_produced_the_cache():
@@ -744,7 +781,8 @@ def test_report_ladder_from_the_fixture(phase4_run):
     from lot.phase4_report import build_records, ladder_table, quantity_formulas
 
     analysis = phase4_run["analysis"]
-    records = build_records(phase4_run["rows"], analysis)
+    records, exclusions = build_records(phase4_run["rows"], analysis)
+    assert exclusions["mask_mismatched_arms"] == 0
     assert records
     ladder = ladder_table(records, analysis)
     by_key = {
@@ -766,3 +804,89 @@ def test_report_ladder_from_the_fixture(phase4_run):
                "transported_fraction": 0.9}
     assert abs(formulas["retained_fraction"](healthy) - 0.75) < 1e-12
     assert abs(formulas["depth_tax"](healthy) - 0.05) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Provenance and matching, the bug classes a code review demonstrated
+# ---------------------------------------------------------------------------
+
+def test_report_refuses_rows_from_another_measurement_config(phase4_run, tmp_path):
+    """A directory agrees with itself perfectly under any config; bind to ours."""
+    import dataclasses as dc
+
+    from lot.evaluate import write_rows
+    from lot.phase4_report import read_phase4_dir
+
+    run = phase4_run
+    analysis = run["analysis"]
+    # The fixture runs from whatever tree the suite is invoked in, and the
+    # report refuses a -dirty provenance. That refusal has its own coverage;
+    # here the subject is the measurement digest, so the record is given a
+    # clean commit to isolate it.
+    meta = {**run["evidence"]["metadata"], "git_commit": "a" * 40}
+    eval_dir = tmp_path / "eval"
+    write_rows(eval_dir / f"{SCENE}.parquet", run["rows"], meta)
+    # The honest config reads it.
+    assert read_phase4_dir(eval_dir, analysis)
+    # A different frozen validity rule is a different experiment, even though
+    # every file in the directory is internally consistent.
+    gated = dc.replace(analysis, vggt_confidence_threshold=0.5)
+    with pytest.raises(ValueError, match="measurement config"):
+        read_phase4_dir(eval_dir, gated)
+
+
+def test_report_refuses_duplicates_and_unmatched_arms(phase4_run):
+    """Subset matching is verified from the masks, not assumed."""
+    from lot.phase4_report import build_records
+
+    run = phase4_run
+    analysis = run["analysis"]
+    rows = run["rows"]
+    records, exclusions = build_records(rows, analysis)
+    assert records and exclusions["mask_mismatched_arms"] == 0
+
+    # A duplicated row would otherwise overwrite its twin and silently move
+    # the estimate; the report must refuse the directory instead.
+    duplicated = list(rows) + [dict(rows[0])]
+    with pytest.raises(ValueError, match="duplicate"):
+        build_records(duplicated, analysis)
+
+    # An arm whose mask differs from its ceiling and floor is excluded and
+    # counted: differencing it would compare two populations.
+    tampered = [dict(r) for r in rows]
+    target = next(
+        r for r in tampered
+        if r["population"] == "matched" and r["variant"].startswith("VGGT-")
+    )
+    target["sample_mask"] = bytes(len(bytes(target["sample_mask"])))
+    _, exclusions = build_records(tampered, analysis)
+    assert exclusions["mask_mismatched_arms"] >= 1
+
+
+def test_phase4_refuses_a_population_phase3_did_not_score(phase4_run, tmp_path):
+    """PROTOCOL 4.1 inherits the pairs, so a divergence is refused not averaged."""
+    import pyarrow.parquet as pq
+
+    from lot.phase4 import phase3_pair_identities
+
+    run = phase4_run
+    real = phase3_pair_identities(run["phase3_eval_dir"], SCENE)
+    assert real, "the fixture's Phase 3 run scored something"
+
+    # A Phase 3 run naming a pair this scene cannot produce must stop Phase 4.
+    table = pq.read_table(run["phase3_eval_dir"] / f"{SCENE}.parquet").to_pylist()
+    invented = dict(table[0])
+    invented["context_frame_id"] = "room_0_vp99_rotation_000"
+    forged = tmp_path / "forged"
+    forged.mkdir()
+    from lot.evaluate import write_rows
+
+    write_rows(forged / f"{SCENE}.parquet", table + [invented], {"scene": SCENE})
+    cfg = dataclasses.replace(run["cfg"], phase3_eval_dir=forged)
+    with pytest.raises(Phase4GateError, match="absent from the regenerated sample"):
+        evaluate_scene_phase4(
+            cfg, SCENE, run["mean_vector"], run["analysis"], run["convention"],
+        )
+
+    with pytest.raises(Phase4GateError, match="does not exist"):
+        phase3_pair_identities(tmp_path / "nowhere", SCENE)

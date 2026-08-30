@@ -1,0 +1,25 @@
+{
+ "scene": "apartment_0",
+ "encoder": "dinov2_vitb14",
+ "pairs": 930,
+ "rows_compared": 9300,
+ "mask_mismatches": 0,
+ "count_mismatches": 0,
+ "metric_max_abs_diff": {
+  "cosine_mean": 4.818630138236912e-07,
+  "l2_mean": 5.074373858882097e-07,
+  "cosine_centered_mean": 1.3291081490951484e-07,
+  "l2_centered_mean": 2.53621450729824e-07,
+  "cosine_intersect_mean": 1.2604773758084775e-07,
+  "cosine_centered_intersect_mean": 1.2135786942035764e-07
+ },
+ "pair_field_max_abs_diff": {
+  "rotation_deg": 3.7925218521195347e-13,
+  "parallax": 2.792490416669846e-05,
+  "covisible_fraction": 2.9800101053467642e-08
+ },
+ "mean_vector_max_abs_diff": 4.76837158203125e-07,
+ "tolerance": 0.0001,
+ "failures": [],
+ "verdict": "PASS"
+}

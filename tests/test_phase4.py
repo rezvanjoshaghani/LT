@@ -45,10 +45,12 @@ from lot.phase4 import (
     low_texture_cells,
     phase4_measurement_digest,
     resample_depth_nearest,
+    landing_flip_diagnostics,
     scene_scale_leave_target_out,
     secant_map,
     secant_regression,
     splat_plan_detail,
+    splat_structure,
     transport_prevalid,
 )
 from lot.render_replica import (
@@ -356,6 +358,96 @@ def test_forced_winners_reproduce_the_source_ordering():
         depth, K, K, T, (SIDE, SIDE), forced_winner_keys=reference.winner_keys
     )
     assert torch.equal(reference.weights, forced.weights)
+    structural = splat_plan_detail(
+        depth, K, K, T, (SIDE, SIDE), forced_structure=splat_structure(reference)
+    )
+    assert torch.equal(reference.weights, structural.weights)
+    with pytest.raises(ValueError):
+        splat_plan_detail(
+            depth, K, K, T, (SIDE, SIDE),
+            forced_winner_keys=reference.winner_keys,
+            forced_structure=splat_structure(reference),
+        )
+
+
+def test_a7_frozen_structure_survives_a_boundary_flip():
+    """A deliberately boundary-adjacent landing flips cells between the arms.
+
+    Every source pixel is engineered to land a hair past a floor(u + 0.5)
+    boundary under ground-truth depth and a hair before it under estimated
+    depth. The A7 frozen structure must still pool identically to the donor,
+    the pre-A7 membership rule must lose every winner to the flip, and the
+    landing diagnostics must count the flips at vanishing boundary margins.
+    """
+    side = 28
+    z0 = 2.0
+    K = intrinsics_from_hfov(side, side, 90.0)
+    fx = float(K[0, 0])
+    depth_gt = torch.full((side, side), z0, dtype=torch.float32)
+    # Ground truth lands every pixel at u + 0.5001; the estimated depth,
+    # scaled by five parts in ten thousand, lands it at u + 0.49985.
+    T = torch.eye(4, dtype=torch.float32)
+    T[0, 3] = 0.5001 * z0 / fx
+    depth_est = (depth_gt.to(torch.float64) * (1 + 5e-4)).to(torch.float32)
+
+    gt_detail = splat_plan_detail(depth_gt, K, K, T, (side, side))
+    est_detail = splat_plan_detail(depth_est, K, K, T, (side, side))
+    common = gt_detail.keep & est_detail.keep
+    # The ground-truth arm shifts one pixel right, so its last column leaves
+    # the image; the estimated arm keeps it. The intersection drops it.
+    assert int(common.sum()) == side * (side - 1)
+
+    gt_common = splat_plan_detail(depth_gt, K, K, T, (side, side), source_keep=common)
+    unforced_est = splat_plan_detail(depth_est, K, K, T, (side, side), source_keep=common)
+    # Both arms keep exactly the common set; the flip changes no validity.
+    assert torch.equal(gt_common.keep, unforced_est.keep)
+
+    # A7: the frozen structure pools identically to its donor even though
+    # every landing flipped.
+    structural = splat_plan_detail(
+        depth_est, K, K, T, (side, side),
+        source_keep=common, forced_structure=splat_structure(gt_common),
+    )
+    assert torch.equal(structural.weights, gt_common.weights)
+    assert np.array_equal(structural.winner_keys, gt_common.winner_keys)
+
+    # The pre-A7 membership rule evaluates Oracle keys at this arm's own
+    # landings, so the flip makes every key miss and every winner vanish.
+    membership = splat_plan_detail(
+        depth_est, K, K, T, (side, side),
+        source_keep=common, forced_winner_keys=gt_common.winner_keys,
+    )
+    assert float(membership.weights.abs().sum()) == 0.0
+
+    flips = landing_flip_diagnostics(gt_common, unforced_est, (side, side))
+    assert flips["landing_flip_count"] == int(common.sum())
+    assert flips["landing_flip_fraction"] == 1.0
+    assert flips["landing_flip_cells"] >= 1
+    # The engineered margins: 1e-4 past the boundary on one side, 1.5e-4
+    # before it on the other, both boundary-adjacent.
+    assert flips["landing_flip_margin_min_px"] <= 2e-4
+    assert flips["landing_coord_residual_max_px"] <= 1e-3
+
+    # A structure naming a source outside this arm's kept set is refused.
+    rogue_source = side * side - 1  # the dropped last-column corner
+    n_cells = side * side
+    tampered = dataclasses.replace(
+        splat_structure(gt_common),
+        winner_keys=np.sort(np.append(
+            gt_common.winner_keys, np.int64(rogue_source) * n_cells
+        )),
+    )
+    with pytest.raises(Phase4GateError, match="does not keep"):
+        splat_plan_detail(
+            depth_est, K, K, T, (side, side),
+            source_keep=common, forced_structure=tampered,
+        )
+    # And a structure from another target grid is refused before use.
+    with pytest.raises(Phase4GateError, match="different target grid"):
+        splat_plan_detail(
+            depth_est[:14, :14], K, K, T, (14, 14),
+            forced_structure=splat_structure(gt_common),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -581,12 +673,25 @@ def test_rotation_gates_pass_and_are_evidenced(phase4_run):
     assert meta["gate_checks"] > 0
     assert meta["gate_coord_max_px"] <= analysis.rotation_gate_coord_tol_px
     assert meta["gate_score_max_abs"] <= analysis.rotation_gate_score_tol
-    assert meta["gate_forced_max_abs"] <= analysis.rotation_gate_forced_tol
+    # A7: both arms run under Oracle's frozen rasterization structure, so
+    # the forced comparison is an identity, not merely inside tolerance.
+    assert meta["gate_forced_max_abs"] == 0.0
     per_point_checks = [g for g in evidence["gate_evidence"] if g["path"] == PER_POINT]
     splat_checks = [g for g in evidence["gate_evidence"] if g["path"] == SPLAT_POOL]
     assert per_point_checks and splat_checks
     for check in splat_checks:
-        assert math.isfinite(check["collision_tax_raw"])
+        assert check["forced_max_abs"] == 0.0
+        assert check["forced_max_abs_centered"] == 0.0
+        for metric in ("raw", "centered"):
+            umbrella = check[f"unforced_rasterization_tax_{metric}"]
+            assignment = check[f"landing_assignment_tax_{metric}"]
+            ordering = check[f"collision_ordering_tax_{metric}"]
+            assert math.isfinite(umbrella)
+            # The decomposition telescopes back to the umbrella.
+            assert abs(umbrella - (assignment + ordering)) <= 1e-12
+        assert check["landing_flip_count"] >= 0
+        assert math.isfinite(check["landing_flip_fraction"])
+        assert math.isfinite(check["landing_coord_residual_max_px"])
 
 
 def test_multiplicative_levels_share_transport_validity(phase4_run):

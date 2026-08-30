@@ -167,3 +167,56 @@ reads it, no diagnostic verdict reaches the conversion path, and a permanent
 test asserts the invariant against a deliberate case in which the per-scene
 diagnostic verdicts disagree. The raw regression outputs are retained as
 evidence of the diagnostic's limitation.
+
+### A7, 2026-08-30. Pure-rotation forced rasterization structure.
+
+PROTOCOL 4.5 intends the forced splat gate to separate reprojection from
+discrete rasterization and collision effects, stating that its construction
+"keeps missingness and collision ordering fully separated". Diagnostics on
+the first gates run showed the implementation did not achieve that
+separation: continuous coordinate differences well inside the
+already-passing coordinate tolerance can cross a discrete floor(u + 0.5)
+landing-cell boundary by one float32 ulp, changing candidate membership
+before the forced winner rule is applied. The forced arm then silently
+drops the winner, renormalizes the cell, and reports the loss as a score
+residual. On the 2026-08-30 gates array all 18 scenes breached the 1e-3
+forced tolerance this way, at residuals between 1.0e-3 and 2.9e-3; the
+diagnosed pair (apartment_0 rotation_001 to rotation_008, level scene) had
+exactly one flipped pixel at a boundary margin of 3.052e-05 px, one float32
+ulp, and that single dropped pixel produced the entire 1.586e-3 residual
+through a five-patch cell. Zero-baseline synthetic reproductions produce
+exactly zero residual, so the invariant itself did not fail; its
+implementation was incomplete.
+
+Therefore, on the common-valid sample set, the forced gate freezes
+Oracle-Transport's complete discrete rasterization structure for both arms:
+each sample's target-cell assignment, per-cell candidate membership, and
+the collision winner ordering. The existing coordinate gate continues to
+test continuous reprojection independently, and the existing forced-score
+tolerance rotation_gate_forced_tol is unchanged at 1e-3. No numerical
+threshold moves under this amendment.
+
+Ordinary estimated-depth rasterization remains unforced and is reported
+separately. Because the unforced difference is now proven to contain both
+landing-cell assignment changes and winner-order changes, the quantity
+PROTOCOL 4.5 and Figure 2 call the collision-ordering tax is reported under
+the umbrella name unforced rasterization tax, decomposed into a
+landing-assignment component and a collision-ordering component that
+telescope to the umbrella. Landing-cell flips are persisted as a
+non-gating diagnostic per pair and level: the flip count, the flipped
+fraction of the shared kept set, the maximum continuous coordinate
+residual, the minimum distance of a flipped sample to its rasterization
+boundary, and the count of affected cells. A real rasterization bug, a
+convention mismatch, or a resize error moves coordinates by half pixels
+and floods these counts; one-ulp float instability shows as isolated
+flips at vanishing margins.
+
+The implementation change is confined to the isolated forced-gate
+diagnostic path. The frozen transport operator is untouched, and the
+run-time assertion that the diagnostic copy with forcing disabled
+reproduces the frozen plan remains in force. A permanent test drives a
+deliberately boundary-adjacent sample across a landing boundary and
+asserts the frozen structure pools identically to its donor while the
+pre-amendment membership rule loses the winner, and that the flip is
+counted at its vanishing margin. The 18-scene breach evidence is retained
+under validation/evidence/phase4/.

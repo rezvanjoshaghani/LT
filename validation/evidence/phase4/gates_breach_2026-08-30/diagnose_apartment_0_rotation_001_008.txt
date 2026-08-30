@@ -1,0 +1,17 @@
+$ PYTHONPATH=src python validation/diagnose_forced_gate.py --config configs/phase4.yaml --scene apartment_0 --context apartment_0_vp00_rotation_001 --target apartment_0_vp00_rotation_008
+pair apartment_0_vp00_rotation_001 -> apartment_0_vp00_rotation_008
+  camera position delta (float64): 0.000e+00 m
+  relative translation norm float64: 0.000e+00 m
+  relative translation norm float32: 0.000e+00 m
+  scene scale (leave-target-out): 3.136368
+  context image scale: 2.290007
+[none] flips 0 (max boundary margin of a flipped px: n/a), lost winners 0 (flipped 0, NOT flipped 0)
+        gate cells 547, max residual raw 0.000e+00 centered 0.000e+00, cells over 0.001: raw 0 centered 0
+[scene] flips 1 (max boundary margin of a flipped px: 3.052e-05 px), lost winners 1 (flipped 1, NOT flipped 0)
+        gate cells 547, max residual raw 1.378e-03 centered 1.586e-03, cells over 0.001: raw 1 centered 1
+        cell  1014: centered residual 1.586e-03, raw 1.378e-03, source patches oracle 5 / forced 5, touched by a flip: True
+[image] flips 0 (max boundary margin of a flipped px: n/a), lost winners 0 (flipped 0, NOT flipped 0)
+        gate cells 547, max residual raw 0.000e+00 centered 0.000e+00, cells over 0.001: raw 0 centered 0
+[affine] flips 1 (max boundary margin of a flipped px: 3.052e-05 px), lost winners 1 (flipped 1, NOT flipped 0)
+        gate cells 547, max residual raw 1.378e-03 centered 1.586e-03, cells over 0.001: raw 1 centered 1
+        cell  1014: centered residual 1.586e-03, raw 1.378e-03, source patches oracle 5 / forced 5, touched by a flip: True

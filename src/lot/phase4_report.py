@@ -279,8 +279,27 @@ def build_records(
                     "n": est["n"],
                     "n_gt": est["n_gt"],
                     "transported_fraction": est["n"] / est["n_gt"] if est["n_gt"] else float("nan"),
-                    "collision_tax_raw": est.get("collision_tax_raw", float("nan")),
-                    "collision_tax_centered": est.get("collision_tax_centered", float("nan")),
+                    # A7: the unforced difference from the frozen-structure
+                    # arm is the umbrella rasterization tax, decomposed into
+                    # a landing-assignment and a collision-ordering
+                    # component; the landing-flip counts ride along as the
+                    # non-gating instability diagnostic.
+                    "unforced_rasterization_tax_raw": est.get(
+                        "unforced_rasterization_tax_raw", float("nan")),
+                    "unforced_rasterization_tax_centered": est.get(
+                        "unforced_rasterization_tax_centered", float("nan")),
+                    "landing_assignment_tax_raw": est.get(
+                        "landing_assignment_tax_raw", float("nan")),
+                    "landing_assignment_tax_centered": est.get(
+                        "landing_assignment_tax_centered", float("nan")),
+                    "collision_ordering_tax_raw": est.get(
+                        "collision_ordering_tax_raw", float("nan")),
+                    "collision_ordering_tax_centered": est.get(
+                        "collision_ordering_tax_centered", float("nan")),
+                    "landing_flip_count": est.get(
+                        "landing_flip_count", float("nan")),
+                    "landing_flip_fraction": est.get(
+                        "landing_flip_fraction", float("nan")),
                     # PROTOCOL 3.9 compares the two paths on the cells both
                     # scored. The evaluation layer computed those scores and
                     # stored them per row; the ordinary means are over each
@@ -358,6 +377,10 @@ FIELDS = (
     "tax_boundary", "tax_interior", "tax_lowtex", "tax_hightex",
     "forced_oracle_raw", "forced_estimated_raw",
     "forced_oracle_centered", "forced_estimated_centered",
+    "unforced_rasterization_tax_raw", "unforced_rasterization_tax_centered",
+    "landing_assignment_tax_raw", "landing_assignment_tax_centered",
+    "collision_ordering_tax_raw", "collision_ordering_tax_centered",
+    "landing_flip_count", "landing_flip_fraction",
 )
 
 
@@ -988,21 +1011,30 @@ def figure2_rotation_control(ladder_rows, gate_summary, path_out: Path) -> None:
                            ha="center", fontsize=6, color="0.35")
 
     panel = axes[2]
-    levels = list(gate_summary["collision_tax_raw_by_level"])
-    width = 0.38
-    offsets = [p - width / 2 for p in range(len(levels))]
-    panel.bar(offsets, [gate_summary["collision_tax_raw_by_level"][l] for l in levels],
-              width=width, label="raw")
-    panel.bar([p + width for p in offsets],
-              [gate_summary["collision_tax_centered_by_level"].get(l, float("nan"))
-               for l in levels], width=width, label="centered")
+    levels = list(gate_summary["unforced_rasterization_tax_raw_by_level"])
+    width = 0.22
+    series = (
+        ("unforced_rasterization_tax_raw_by_level", "umbrella, raw", 0),
+        ("unforced_rasterization_tax_centered_by_level", "umbrella, centered", 1),
+        ("landing_assignment_tax_raw_by_level", "landing assignment, raw", 2),
+        ("collision_ordering_tax_raw_by_level", "collision ordering, raw", 3),
+    )
+    for key, label_text, slot in series:
+        panel.bar(
+            [p + (slot - 1.5) * width for p in range(len(levels))],
+            [gate_summary[key].get(l, float("nan")) for l in levels],
+            width=width, label=label_text,
+        )
     panel.set_xticks(range(len(levels)))
     panel.set_xticklabels(levels, rotation=20, ha="right", fontsize=8)
     panel.axhline(0.0, color="black", linewidth=1)
-    panel.set_title("unforced collision-ordering tax, splat path only", fontsize=9)
+    panel.set_title(
+        "unforced rasterization tax (A7; PROTOCOL: collision-ordering tax), "
+        "splat path only", fontsize=9,
+    )
     panel.set_ylabel("forced score minus ordinary score", fontsize=8)
     panel.grid(alpha=0.3)
-    panel.legend(fontsize=7)
+    panel.legend(fontsize=6)
 
     figure.suptitle(
         "Figure 2: pure-rotation correctness control under forced collision order. "
@@ -1108,26 +1140,36 @@ def figure4_localization(ladder_rows, path_out: Path) -> None:
 
 
 def collision_summary(records: Sequence[dict]) -> dict[str, Any]:
-    """The unforced collision-ordering tax per level, splat path, rotation only."""
-    out: dict[str, Any] = {"collision_tax_raw_by_level": {},
-                           "collision_tax_centered_by_level": {}}
+    """The A7 unforced rasterization tax per level, splat path, rotation only.
+
+    The umbrella and its two components (landing assignment, collision
+    ordering) plus the landing-flip diagnostics. The pre-A7 name for the
+    umbrella was the collision-ordering tax; A7 renamed it because the
+    unforced difference was shown to carry landing-assignment changes too.
+    """
+    keys = (
+        "unforced_rasterization_tax_raw",
+        "unforced_rasterization_tax_centered",
+        "landing_assignment_tax_raw",
+        "landing_assignment_tax_centered",
+        "collision_ordering_tax_raw",
+        "collision_ordering_tax_centered",
+        "landing_flip_count",
+        "landing_flip_fraction",
+    )
+    out: dict[str, Any] = {f"{k}_by_level": {} for k in keys}
     rotation = [
         r for r in records
         if r["regime"] == "rotation" and r["path"] == SPLAT_POOL and r["metric"] == RAW
     ]
     for level, _ in LEVELS:
-        values_raw = [
-            r["collision_tax_raw"] for r in rotation
-            if r["level"] == level and math.isfinite(r["collision_tax_raw"])
-        ]
-        values_cen = [
-            r["collision_tax_centered"] for r in rotation
-            if r["level"] == level and math.isfinite(r["collision_tax_centered"])
-        ]
-        if values_raw:
-            out["collision_tax_raw_by_level"][level] = float(np.mean(values_raw))
-        if values_cen:
-            out["collision_tax_centered_by_level"][level] = float(np.mean(values_cen))
+        for key in keys:
+            values = [
+                r[key] for r in rotation
+                if r["level"] == level and math.isfinite(r[key])
+            ]
+            if values:
+                out[f"{key}_by_level"][level] = float(np.mean(values))
     return out
 
 

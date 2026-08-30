@@ -37,9 +37,9 @@ enumerates the post-freeze amendments, prints the live hashes, asserts a
 clean tree, re-reads both caches against their recorded digests, prints the
 Phase 3 and Phase 4 measurement identities, and runs the suite.
 
-Expect: frozen blobs verified; amendments A1 to A6 listed; Phase 3
+Expect: frozen blobs verified; amendments A1 to A7 listed; Phase 3
 measurement digest `27244e6481d521159e513f2ea8799482`; Phase 4 measurement
-digest `1579714398feff4771a9981e5f427c8a`; 276 passed, 3 skipped.
+digest `1579714398feff4771a9981e5f427c8a`; 277 passed, 3 skipped.
 
 On Linux the live sha256 of PROTOCOL.md and VALIDATION.md equal their frozen
 values; AMENDMENTS.md and configs/analysis.yaml differ by exactly the five
@@ -92,7 +92,11 @@ process instead, which is slower:
     ./scripts/run_phase4.sh gates
 
 Expect, at every alignment level: coordinate residual under 1e-3 px, score
-residual under 1e-5, forced-order residual under 1e-3. A breach raises
+residual under 1e-5, forced-order residual under 1e-3, which under
+Amendment A7 is an exact identity and should read 0.0. Landing-cell flips
+are reported per pair as a non-gating diagnostic; isolated flips at
+vanishing boundary margins are float rasterization instability, while a
+flood of them would indicate a real convention or resize error. A breach raises
 `Phase4GateError` naming the scene, frames, level, sample_id, both
 coordinates, both scores, and the residual, and the job exits nonzero. That
 is a stop: find the pipeline bug, do not look at translation or orbit.

@@ -194,7 +194,9 @@ def main() -> None:
             int(flipped[lost_sources].sum()) if lost_sources.size else 0
         )
 
-        # The gate comparison, exactly as evaluate_pair_phase4 runs it.
+        # The pre-A7 membership comparison, kept for localization: after
+        # Amendment A7 the production gate freezes Oracle's full structure
+        # and this arm survives only as the tax-decomposition midpoint.
         est_plan = transport_plan(est_t, K_context, K_target, T, target_hw)
         est_cov = (est_plan.coverage.reshape(-1) > 0).numpy()
         sp_scored = geometry.splat_covisible_ok & est_cov & geometry.splat_mask

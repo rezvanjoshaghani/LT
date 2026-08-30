@@ -298,3 +298,47 @@ mask and count mismatches, max metric abs diff 5.1e-07 against 1e-4. The
 twelve boundary pairs reproduce bit-for-bit under the corrected contract.
 Stream F is closed and the STOP on Phase 4 is lifted; the closure report
 is validation/evidence/phase4/closure.md.
+
+## Re-pin after Amendment A7, 2026-08-30
+
+The first gates array (job 3193085, HEAD 1eaf1601) breached the 4.5
+forced-collision-order gate on all 18 scenes, at residuals between 1.0e-3
+and 2.9e-3 scattered across levels. The instrumented decomposition of the
+first breaching pair proved the mechanism: exact-zero baseline, bitwise
+Oracle reproduction at two of four levels, and at the breaching levels
+exactly one source pixel landing one cell over at a boundary margin of
+3.052e-05 px, one float32 ulp, whose dropped winner renormalized a
+five-patch cell into the whole 1.586e-3 residual. Every lost winner was a
+flipped pixel, so the forced-key machinery was clean; the construction
+was incomplete. Evidence preserved verbatim under
+validation/evidence/phase4/gates_breach_2026-08-30/.
+
+Amendment A7 resolves it by freezing Oracle-Transport's complete discrete
+rasterization structure for both forced arms: cell assignment, candidate
+membership, and winner ordering. The gated score comparison is now the
+true invariant 4.5 promises and reads exactly 0.0; rotation_gate_forced_tol
+stays 1e-3, untouched. The pre-A7 membership arm survives as the midpoint
+of the tax decomposition: the unforced difference is reported as the
+unforced rasterization tax, split into a landing-assignment component and
+a collision-ordering component that telescope to the umbrella, and
+landing-cell flips are persisted per pair and level as a non-gating
+diagnostic (count, fraction, affected cells, max continuous coordinate
+residual, min boundary margin). The frozen transport operator is
+untouched and the forcing-disabled identity assertion remains in force.
+
+Code: splat_plan_detail gains forced_structure (exclusive with the
+membership mode) and exposes per-pixel landings, continuous coordinates,
+and boundary margins; the gate block runs four arms (oracle, frozen
+structure, membership midpoint, unforced) and hard-fails if the frozen
+structure produces weights that differ from its donor. New permanent
+test: a deliberately boundary-adjacent sample driven across a landing
+boundary, where the frozen structure pools identically to the donor while
+the membership rule loses every winner, flips are counted at their
+vanishing margins, tampered structures naming unkept sources are refused,
+and cross-grid structures are refused.
+
+Tests: 277 passed, 3 skipped.
+
+Expected on the rerun: gates PASS 18 of 18 with forced residuals exactly
+zero, flip counts of order zero to a few per pair reported in the
+evidence, and the coordinate and per-point score gates unchanged.

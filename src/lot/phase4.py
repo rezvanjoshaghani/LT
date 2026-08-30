@@ -845,18 +845,101 @@ def aligned_depth(
 # ---------------------------------------------------------------------------
 
 @dataclasses.dataclass
+class SplatStructure:
+    """Oracle's complete discrete rasterization structure, frozen for A7.
+
+    Amendment A7: under pure rotation the forced gate freezes all three
+    discrete quantities from the Oracle-Transport arm on the common-valid
+    source set: each source pixel's target-cell assignment, per-cell
+    candidate membership, and the collision winner ordering. winner_keys
+    encodes the winning (source pixel, target pixel) pairs as
+    source * n_target_pixels + target, sorted; candidate_landing holds the
+    Oracle landing pixel of every kept source, -1 elsewhere.
+    """
+
+    n_cells: int
+    winner_keys: np.ndarray        # sorted int64
+    candidate_landing: np.ndarray  # [H*W] int64, -1 where the source is not kept
+
+
+@dataclasses.dataclass
 class SplatPlanDetail:
     """A transport plan plus the internals the pure-rotation gate needs.
 
     winner_keys encodes each winning splat as source_pixel * n_target_pixels
     plus target_pixel, sorted, so a forced run can test membership with one
-    searchsorted pass instead of a Python set.
+    searchsorted pass instead of a Python set. landing_pixel, landing_uv,
+    and landing_margin_px expose this arm's own rasterization per source
+    pixel, so landing-cell instability between two arms is measurable as a
+    diagnostic (A7): the flip count, the continuous coordinate residual,
+    and each flipped pixel's distance to the floor(u + 0.5) boundary.
     """
 
     weights: Tensor             # [n_target_patches, n_source_patches] float32
     coverage: Tensor            # [Hp_out, Wp_out] float32
     keep: Tensor                # [H*W] bool over source pixels
     winner_keys: np.ndarray     # sorted int64
+    landing_pixel: np.ndarray   # [H*W] int64 own landing, -1 where not kept
+    landing_uv: np.ndarray      # [H*W, 2] float32 continuous landing
+    landing_margin_px: np.ndarray  # [H*W] float32 distance to the cell boundary
+
+
+def splat_structure(detail: SplatPlanDetail) -> SplatStructure:
+    """The A7 frozen structure of one arm, ready to impose on another."""
+    return SplatStructure(
+        n_cells=int(detail.coverage.numel()) * PATCH_SIZE * PATCH_SIZE,
+        winner_keys=detail.winner_keys,
+        candidate_landing=detail.landing_pixel,
+    )
+
+
+def landing_flip_diagnostics(
+    reference: SplatPlanDetail,
+    other: SplatPlanDetail,
+    out_hw_px: tuple[int, int],
+    patch_size: int = PATCH_SIZE,
+) -> dict[str, Any]:
+    """Landing-cell instability between two arms of one geometry (A7).
+
+    Both arms must have been built on the same source restriction. Reports
+    the discrete flips (same source pixel, different landing cell), the
+    landing-flip fraction of the shared kept set, the maximum continuous
+    coordinate residual, each flipped pixel's distance to the floor(u + 0.5)
+    rasterization boundary, and how many target patch cells the flips touch.
+    Reported, never gated: a real rasterization bug, a convention mismatch,
+    or a resize error moves coordinates by half pixels and floods this
+    count, while one-ulp float instability shows as isolated flips at
+    vanishing boundary margins. The gate's own score comparison runs under
+    the frozen structure and cannot see either; this is where they appear.
+    """
+    both = (reference.landing_pixel >= 0) & (other.landing_pixel >= 0)
+    flipped = both & (reference.landing_pixel != other.landing_pixel)
+    n_both = int(both.sum())
+    coord = np.abs(reference.landing_uv[both] - other.landing_uv[both])
+    out_width = out_hw_px[1]
+    out_patches_w = out_width // patch_size
+
+    def cells(lin_arr: np.ndarray) -> np.ndarray:
+        return ((lin_arr // out_width) // patch_size) * out_patches_w + (
+            (lin_arr % out_width) // patch_size
+        )
+
+    touched = np.union1d(
+        cells(reference.landing_pixel[flipped]), cells(other.landing_pixel[flipped])
+    )
+    margins = np.minimum(
+        reference.landing_margin_px[flipped], other.landing_margin_px[flipped]
+    )
+    return {
+        "landing_flip_count": int(flipped.sum()),
+        "landing_flip_fraction": float(flipped.sum() / n_both) if n_both else 0.0,
+        "landing_flip_cells": int(touched.size),
+        "landing_coord_residual_max_px": float(coord.max()) if coord.size else 0.0,
+        "landing_flip_margin_min_px": (
+            float(margins.min()) if margins.size else float("nan")
+        ),
+        "flipped_cells": touched,
+    }
 
 
 def splat_plan_detail(
@@ -868,18 +951,33 @@ def splat_plan_detail(
     patch_size: int = PATCH_SIZE,
     source_keep: Tensor | None = None,
     forced_winner_keys: np.ndarray | None = None,
+    forced_structure: SplatStructure | None = None,
 ) -> SplatPlanDetail:
     """The transport plan with optional source restriction and forced winners.
 
     A documented copy of lot.transport.transport_plan, existing so the frozen
-    default path is never modified. With source_keep and forced_winner_keys
-    both None it reproduces the default plan exactly;
+    default path is never modified. With every forcing argument None it
+    reproduces the default plan exactly;
     assert_forcing_disabled_matches_default checks that at run time and the
-    suite checks it permanently. Forcing replaces the z-buffer winner rule
-    with an externally supplied (source pixel, target pixel) key set, which
-    is how the gate imposes Oracle's collision ordering on estimated-depth
-    transport under pure rotation.
+    suite checks it permanently.
+
+    Two forcing modes exist and are mutually exclusive:
+
+    - forced_winner_keys replaces the z-buffer winner rule with membership in
+      an externally supplied (source pixel, target pixel) key set, evaluated
+      at this arm's own landings. A one-ulp landing flip makes a winner's key
+      miss, so this mode conflates landing-cell instability with collision
+      ordering; it is kept as the midpoint of the A7 tax decomposition, not
+      as the gate.
+    - forced_structure (Amendment A7) imposes the donor arm's complete
+      discrete rasterization structure: winners land where the donor landed
+      them, so cell assignment, candidate membership, and winner ordering
+      are all frozen and the gated score comparison is a true invariant.
+      This arm's own landings are still computed and returned, which is what
+      makes landing flips measurable as a diagnostic.
     """
+    if forced_winner_keys is not None and forced_structure is not None:
+        raise ValueError("forced_winner_keys and forced_structure are exclusive")
     height, width = depth_ctx_px.shape
     patches_h, patches_w = height // patch_size, width // patch_size
     out_height, out_width = out_hw_px
@@ -912,25 +1010,58 @@ def splat_plan_detail(
     z_keep = z_tgt.reshape(-1)[keep_flat]
     n_cells = out_height * out_width
 
-    if forced_winner_keys is None:
-        zbuffer = torch.full((n_cells,), torch.inf, dtype=dtype)
-        zbuffer.scatter_reduce_(0, lin, z_keep, reduce="amin", include_self=True)
-        winners = z_keep <= zbuffer[lin] * (1 + TIE_RELATIVE_EPS)
-    else:
-        keys = source_index.numpy().astype(np.int64) * np.int64(n_cells) + lin.numpy()
-        position = np.searchsorted(forced_winner_keys, keys)
-        position = np.clip(position, 0, len(forced_winner_keys) - 1)
-        winners = torch.from_numpy(
-            (len(forced_winner_keys) > 0) & (forced_winner_keys[position] == keys)
+    # This arm's own rasterization, exposed for the A7 landing diagnostics.
+    landing_pixel = np.full(height * width, -1, dtype=np.int64)
+    landing_pixel[keep_flat.numpy()] = lin.numpy()
+    fu = (safe_uv[..., 0] + 0.5) - torch.floor(safe_uv[..., 0] + 0.5)
+    fv = (safe_uv[..., 1] + 0.5) - torch.floor(safe_uv[..., 1] + 0.5)
+    landing_margin = torch.minimum(
+        torch.minimum(fu, 1 - fu), torch.minimum(fv, 1 - fv)
+    ).reshape(-1).numpy().astype(np.float32)
+    landing_margin[~keep_flat.numpy()] = np.float32(np.nan)
+
+    if forced_structure is not None:
+        if forced_structure.n_cells != n_cells:
+            raise Phase4GateError(
+                "A7 structure was built for a different target grid: "
+                f"{forced_structure.n_cells} cells versus {n_cells}"
+            )
+        winner_src = (forced_structure.winner_keys // n_cells).astype(np.int64)
+        if not np.all(keep_flat.numpy()[winner_src]):
+            raise Phase4GateError(
+                "A7 structure names a winner source this arm does not keep; "
+                "the structure must be built on the common-valid set"
+            )
+        # The donor's assignment, membership, and ordering, verbatim: winners
+        # land where the donor landed them. Nothing depth-dependent survives.
+        lin_w = torch.from_numpy(
+            (forced_structure.winner_keys % n_cells).astype(np.int64)
         )
-    lin_w = lin[winners]
-    src_w = source_index[winners]
+        src_w = torch.from_numpy(winner_src)
+    else:
+        if forced_winner_keys is None:
+            zbuffer = torch.full((n_cells,), torch.inf, dtype=dtype)
+            zbuffer.scatter_reduce_(0, lin, z_keep, reduce="amin", include_self=True)
+            winners = z_keep <= zbuffer[lin] * (1 + TIE_RELATIVE_EPS)
+        else:
+            keys = source_index.numpy().astype(np.int64) * np.int64(n_cells) + lin.numpy()
+            position = np.searchsorted(forced_winner_keys, keys)
+            position = np.clip(position, 0, len(forced_winner_keys) - 1)
+            winners = torch.from_numpy(
+                (len(forced_winner_keys) > 0) & (forced_winner_keys[position] == keys)
+            )
+        lin_w = lin[winners]
+        src_w = source_index[winners]
 
     source_patch = (
         (torch.arange(height) // patch_size)[:, None] * patches_w
         + (torch.arange(width) // patch_size)[None, :]
     )
-    source_of_winner = source_patch.reshape(-1)[keep_flat][winners]
+    # Indexed by the winners' global source pixels, which is the same values
+    # the earlier [keep_flat][winners] chain produced and is defined for the
+    # A7 structure path, whose winners come from the donor rather than from a
+    # boolean over this arm's kept pixels.
+    source_of_winner = source_patch.reshape(-1)[src_w]
 
     count = torch.zeros((n_cells,), dtype=torch.float32)
     count.index_add_(0, lin_w, torch.ones_like(lin_w, dtype=torch.float32))
@@ -957,6 +1088,9 @@ def splat_plan_detail(
         coverage=hits_per_patch / float(patch_size * patch_size),
         keep=keep_flat,
         winner_keys=winner_keys,
+        landing_pixel=landing_pixel,
+        landing_uv=uv_tgt.reshape(-1, 2).to(torch.float32).numpy(),
+        landing_margin_px=landing_margin,
     )
 
 
@@ -1172,9 +1306,22 @@ def evaluate_pair_phase4(
         "forced_estimated_raw": nan,
         "forced_oracle_centered": nan,
         "forced_estimated_centered": nan,
-        "collision_tax_raw": nan,
-        "collision_tax_centered": nan,
+        # A7: the unforced difference is the umbrella rasterization tax, and
+        # it decomposes into a landing-assignment component and a
+        # collision-ordering component, which telescope back to the umbrella.
+        "unforced_rasterization_tax_raw": nan,
+        "unforced_rasterization_tax_centered": nan,
+        "landing_assignment_tax_raw": nan,
+        "landing_assignment_tax_centered": nan,
+        "collision_ordering_tax_raw": nan,
+        "collision_ordering_tax_centered": nan,
         "collision_gate_cells": 0,
+        # A7 landing-cell instability diagnostics, reported and never gated.
+        "landing_flip_count": nan,
+        "landing_flip_fraction": nan,
+        "landing_flip_cells": nan,
+        "landing_coord_residual_max_px": nan,
+        "landing_flip_margin_min_px": nan,
     }
 
     def emit(path: str, level: str, population: str, variant: str, mask: np.ndarray,
@@ -1479,9 +1626,18 @@ def evaluate_pair_phase4(
         if cells_v.size:
             targets_v = flat_target[:, cells_v].T
             if is_rotation and gt_detail is not None:
-                # PROTOCOL 4.5 forced-collision-order gate. The common source
-                # set is the intersection of both methods' kept splats;
-                # Oracle's winner ordering is built on it and imposed on both.
+                # PROTOCOL 4.5 forced-collision-order gate, under Amendment
+                # A7. The common source set is the intersection of both
+                # methods' kept splats. Oracle's complete discrete
+                # rasterization structure is frozen on it: every winner's
+                # cell assignment, per-cell candidate membership, and the
+                # collision winner ordering. Both arms run under that frozen
+                # structure, so the gated score comparison is the true
+                # invariant 4.5 promises; a one-ulp landing flip can no
+                # longer masquerade as an ordering difference. What the
+                # estimated arm's own geometry does to landings is measured
+                # separately below as the landing-flip diagnostics, reported
+                # and never gated.
                 est_detail = splat_plan_detail(
                     torch.from_numpy(data.context_aligned).to(torch_dtype),
                     K_context, K_target, T_target_from_context, target_hw,
@@ -1491,28 +1647,52 @@ def evaluate_pair_phase4(
                     depth_context_gt, K_context, K_target, T_target_from_context,
                     target_hw, source_keep=common,
                 )
+                structure = splat_structure(gt_common)
                 forced_est = splat_plan_detail(
+                    torch.from_numpy(data.context_aligned).to(torch_dtype),
+                    K_context, K_target, T_target_from_context, target_hw,
+                    source_keep=common, forced_structure=structure,
+                )
+                if not torch.equal(forced_est.weights, gt_common.weights):
+                    raise Phase4GateError(
+                        "A7 frozen-structure transport produced weights that "
+                        "differ from the structure donor's; the forced "
+                        "machinery is defective"
+                    )
+                # The decomposition midpoint: Oracle winner membership tested
+                # at this arm's own landings, which is the pre-A7 forced
+                # construction. Its gap to the frozen-structure arm is the
+                # landing-assignment component of the rasterization tax; its
+                # gap to plain z-buffering is the collision-ordering
+                # component. The two telescope to the umbrella.
+                ordering_forced = splat_plan_detail(
                     torch.from_numpy(data.context_aligned).to(torch_dtype),
                     K_context, K_target, T_target_from_context, target_hw,
                     source_keep=common, forced_winner_keys=gt_common.winner_keys,
                 )
                 # The unforced arm runs on the same common source population as
-                # the forced one. Comparing forced-on-common against the
+                # the forced ones. Comparing forced-on-common against the
                 # unrestricted estimated plan would let estimated-only sources
                 # enter or win cells in one arm and not the other, so the
-                # difference would carry missingness as well as ordering and
-                # would not be the collision-ordering tax PROTOCOL 4.5 isolates.
+                # difference would carry missingness as well as rasterization.
                 unforced_common = splat_plan_detail(
                     torch.from_numpy(data.context_aligned).to(torch_dtype),
                     K_context, K_target, T_target_from_context, target_hw,
                     source_keep=common,
                 )
+                flips = landing_flip_diagnostics(
+                    gt_common, unforced_common, target_hw
+                )
+                flipped_cells = flips.pop("flipped_cells")
+                sp_gate_cols.update(flips)
                 pooled_oracle = flat_context @ gt_common.weights.mT
                 pooled_forced = flat_context @ forced_est.weights.mT
+                pooled_ordering = flat_context @ ordering_forced.weights.mT
                 pooled_unforced = flat_context @ unforced_common.weights.mT
                 both_covered = (
                     (gt_common.coverage.reshape(-1) > 0)
                     & (forced_est.coverage.reshape(-1) > 0)
+                    & (ordering_forced.coverage.reshape(-1) > 0)
                     & (unforced_common.coverage.reshape(-1) > 0)
                 ).numpy()
                 gate_cells = np.flatnonzero(data.sp_scored & both_covered)
@@ -1521,6 +1701,7 @@ def evaluate_pair_phase4(
                     scores = {}
                     for label, pooled in (("oracle", pooled_oracle),
                                           ("forced", pooled_forced),
+                                          ("ordering", pooled_ordering),
                                           ("unforced", pooled_unforced)):
                         for metric, centre in (("raw", None), ("centered", center)):
                             scores[(label, metric)] = _per_sample_cosine(
@@ -1543,13 +1724,22 @@ def evaluate_pair_phase4(
                     sp_gate_cols["forced_estimated_centered"] = float(
                         scores[("forced", "centered")].mean()
                     )
-                    sp_gate_cols["collision_tax_raw"] = float(
-                        (scores[("forced", "raw")] - scores[("unforced", "raw")]).mean()
-                    )
-                    sp_gate_cols["collision_tax_centered"] = float(
-                        (scores[("forced", "centered")]
-                         - scores[("unforced", "centered")]).mean()
-                    )
+                    for metric in ("raw", "centered"):
+                        umbrella = float(
+                            (scores[("forced", metric)]
+                             - scores[("unforced", metric)]).mean()
+                        )
+                        assignment = float(
+                            (scores[("forced", metric)]
+                             - scores[("ordering", metric)]).mean()
+                        )
+                        ordering_part = float(
+                            (scores[("ordering", metric)]
+                             - scores[("unforced", metric)]).mean()
+                        )
+                        sp_gate_cols[f"unforced_rasterization_tax_{metric}"] = umbrella
+                        sp_gate_cols[f"landing_assignment_tax_{metric}"] = assignment
+                        sp_gate_cols[f"collision_ordering_tax_{metric}"] = ordering_part
                     sp_gate_cols["collision_gate_cells"] = int(gate_cells.size)
                     gate_evidence.append(
                         {
@@ -1558,8 +1748,20 @@ def evaluate_pair_phase4(
                             "path": SPLAT_POOL,
                             "forced_max_abs": forced_max,
                             "forced_max_abs_centered": forced_max_cen,
-                            "collision_tax_raw": sp_gate_cols["collision_tax_raw"],
-                            "collision_tax_centered": sp_gate_cols["collision_tax_centered"],
+                            "unforced_rasterization_tax_raw":
+                                sp_gate_cols["unforced_rasterization_tax_raw"],
+                            "unforced_rasterization_tax_centered":
+                                sp_gate_cols["unforced_rasterization_tax_centered"],
+                            "landing_assignment_tax_raw":
+                                sp_gate_cols["landing_assignment_tax_raw"],
+                            "landing_assignment_tax_centered":
+                                sp_gate_cols["landing_assignment_tax_centered"],
+                            "collision_ordering_tax_raw":
+                                sp_gate_cols["collision_ordering_tax_raw"],
+                            "collision_ordering_tax_centered":
+                                sp_gate_cols["collision_ordering_tax_centered"],
+                            **flips,
+                            "flipped_cells": flipped_cells.tolist()[:32],
                             "n_cells": int(gate_cells.size),
                         }
                     )

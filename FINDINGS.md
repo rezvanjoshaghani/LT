@@ -247,6 +247,46 @@ property of the representations, not of the transport implementation.
 Nothing in this section is a Phase 3 result. The results section below remains
 withdrawn until Stream D's figures are produced and audited.
 
+## Phase 4 methodology: the depth-convention diagnostic is confounded (2026-08-29)
+
+PROTOCOL 4.1's deterministic secant regression produced scene- and
+view-dependent classifications within fixed-checkpoint rotation sequences. In
+office_1 the verdict runs from ray_distance to planar_z across the eight
+in-place-rotation frames of one viewpoint; in room_0 it runs the other way
+across the same kind of sequence; in hotel_0 the regression statistic moves
+strongly with the fraction and spatial distribution of valid ground-truth
+pixels, from -1.07 at 48 percent valid to -0.14 at 98 percent.
+
+A depth convention is a property of the network's output semantics under a
+fixed checkpoint. It cannot change because the camera yaw changed. The
+supported conclusion is therefore about the diagnostic and not about VGGT:
+the secant procedure exhibits strong scene- and view-dependent
+field-angle-correlated structure, is confounded by the evaluated residual and
+ground-truth-validity population, and cannot reliably identify the depth
+convention on these data. PROTOCOL 4.1 anticipated exactly this when it
+called the test a decision heuristic rather than a proof.
+
+The authoritative VGGT source establishes planar camera-z semantics, so the
+run uses planar-z globally and retains the secant outputs as diagnostic
+evidence only. The decision threshold was not changed; changing it until the
+flags disappeared would have converted a documented limitation into an
+invisible one. Evidence: outputs/phase4_rung1/evidence/secant_diagnostic.json,
+source_authority.json, and convention_record.json.
+
+What is deliberately not claimed here is that VGGT has a strong intrinsic
+radial depth error. This diagnostic does not isolate that. Candidate
+contributors include VGGT depth error, spatially nonuniform ground-truth
+missingness, scene geometry, the depth and range distribution, heteroscedastic
+error, and their interaction with field angle. Where estimated-geometry error
+actually localizes is what the preregistered Phase 4 structural analyses of
+4.8 are for. Any later angle or radial analysis is exploratory and non-gating
+unless it is frozen elsewhere first.
+
+A conformance defect surfaced with it and is recorded in AMENDMENTS.md as A6:
+the implementation selected the conversion per scene, so one checkpoint could
+have carried two depth semantics inside one table. No Phase 4 scientific
+output had been produced when the stop fired, so nothing required discarding.
+
 ## Phase 3: Experiment Zero, corrected verdict (Stream D, 2026-08-27)
 
 Eighteen scenes, two frozen encoders, 33,772 comparisons, both evaluation

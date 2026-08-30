@@ -132,10 +132,38 @@ camera-z from the installed VGGT source. `vggt/utils/geometry.py`'s
 `unproject_depth_map_to_point_map` uses to turn `predictions["depth"]` into
 points, assigns `z_cam = depth_map` directly with `x_cam` and `y_cam` scaled
 by depth over focal length, term for term the same as `lot.geometry.unproject`.
-A ray-distance head would have to divide by the secant of the pixel angle
-there and does not. The deterministic secant regression of 4.1 is therefore
-run as a consistency check, with the verdict passed in as `--doc-verdict
-planar_z`. Evidence: outputs/phase4_rung1/evidence/vggt_source_inspection.txt.
+A ray-distance head would have to rescale along the ray there and does not.
+Evidence: outputs/phase4_rung1/evidence/vggt_source_inspection.txt and, from
+the corrected implementation, source_authority.json.
+
+## Re-pin after the depth-convention closure, 2026-08-29
+
+The first `convention` run stopped: the secant regression disagreed with the
+source on 5 of 18 scenes. Diagnosing it showed the regression is unstable
+within a single scene across camera rotations, and that the implementation
+was selecting the conversion per scene. The closure changed pinned Phase 4
+measurement code, so the state is re-pinned here.
+
+- Previous pinned HEAD: `31227b5`.
+- Bug-fix and closure commit: the commit containing this section.
+- Normative freeze commit: unchanged, `d4ed1017bd2daca2871da28900b5b4a6a7ff92b6`.
+- Applicable amendment: A6, global depth-convention application.
+- Convention decision: `planar_z`, authority `source`, no cosine conversion.
+- Threshold `depth_convention_slope_threshold`: unchanged at 0.05.
+- Discarded outputs: none. The stop fired before any alignment level ran, so
+  no Phase 4 eval parquet, table, or figure existed. The historical
+  `convention_report.json` from the stopped run is preserved unmodified; the
+  corrected stage writes `secant_diagnostic.json`, `source_authority.json`,
+  and `convention_record.json` under new names rather than overwriting it.
+- Tests: 267 passed, 3 skipped, including five new convention tests. The
+  invariant test drives a deliberate case in which per-scene diagnostic
+  verdicts disagree and asserts the applied convention stays globally
+  identical, plus that the planar-z path applies no conversion where the
+  conversion would have moved the map materially.
+- Unrelated Phase 4 code: unchanged. The diff touches only the convention
+  path in `src/lot/phase4.py`; transport, alignment, masking, binning,
+  scoring, and feature code are untouched, and `src/lot/phase4_report.py` is
+  not modified.
 
 ## Cluster execution order (all modes refuse a dirty worktree)
 

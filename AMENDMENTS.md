@@ -135,3 +135,35 @@ transport-validity notion (finite and positive depth), which is the notion
 positive scaling provably cannot change. Landing can change with scale when
 translation is nonzero, so the scored sets are reported as coverage, never
 asserted equal.
+
+### A6, 2026-08-29. Global depth-convention application.
+
+Where authoritative model source establishes the depth-output convention
+under PROTOCOL 4.1, that convention applies globally to every frame produced
+by the pinned checkpoint and run. Per-scene or per-frame consistency-diagnostic
+verdicts may not control conversion. The secant regression remains diagnostic
+evidence only when source authority is definitive.
+
+Why this needs saying rather than being left implicit. PROTOCOL 4.1 runs its
+deterministic test "for the first rotation-program frame of every scene",
+which is a per-scene computation, and it does not state in the same breath
+that the decision the test informs is single. The implementation read that
+phrasing literally and selected a conversion per scene, so one checkpoint
+could have been given planar semantics in some scenes and ray-distance
+semantics in others inside one table. A depth convention is a property of the
+network's output semantics; it cannot vary by scene, frame, camera program,
+camera angle, or dataset. The frozen text arguably entails as much, but it
+did not say it, and what it did say produced the defect. Making the global
+application referee-visible is the point of this entry.
+
+This amendment does not alter the convention decision threshold, does not
+redefine the regression, does not claim the observed data selected a
+convention, and introduces no new outcome-dependent diagnostic. The threshold
+depth_convention_slope_threshold is unchanged at 0.05.
+
+The corresponding implementation change is a conformance bug fix, not a
+method change: the run establishes one convention from source, every scene
+reads it, no diagnostic verdict reaches the conversion path, and a permanent
+test asserts the invariant against a deliberate case in which the per-scene
+diagnostic verdicts disagree. The raw regression outputs are retained as
+evidence of the diagnostic's limitation.

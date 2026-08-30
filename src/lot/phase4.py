@@ -236,6 +236,249 @@ def load_depth_archive(cache_root: Path, encoder: str, scene: str) -> dict[str, 
     return {"depth": depth, "conf": conf, "meta": meta}
 
 
+# ---------------------------------------------------------------------------
+# Depth-convention authority, PROTOCOL 4.1
+# ---------------------------------------------------------------------------
+
+# PROTOCOL 4.1 gives the model's own source primary authority over the depth
+# head's convention and demotes the secant regression to a consistency check
+# when the source is definitive. A depth convention is a property of the
+# network's output semantics, so exactly one decision applies to every frame a
+# pinned checkpoint produces; Amendment A6 makes that global application
+# explicit after a per-scene reading was found in this implementation.
+DECISIVE_FUNCTION = "depth_to_cam_coords_points"
+DECISIVE_MODULE = "utils/geometry.py"
+# Anything that would rescale depth along the ray before assigning z. Their
+# absence inside the decisive function is part of what makes planar z
+# unambiguous rather than merely plausible.
+RAY_MARKERS = ("sec(", "np.sqrt", "torch.sqrt", "norm(", "normalize", "/ cos", "cos(")
+
+
+def vggt_package_roots() -> list[Path]:
+    """Directories of the installed vggt package.
+
+    VGGT installs as a namespace package, so __file__ is None and __path__ is
+    the only way to the source. Reading __file__ alone raised on the cluster.
+    """
+    import vggt
+
+    roots = [Path(p) for p in getattr(vggt, "__path__", [])]
+    if getattr(vggt, "__file__", None):
+        roots.append(Path(vggt.__file__).parent)
+    return sorted({root for root in roots if root.is_dir()})
+
+
+def vggt_source_revision() -> dict[str, Any]:
+    """The immutable revision of the installed vggt source, if it has one.
+
+    PROTOCOL 3.12's pin rule applies to the authority as much as to the
+    weights: a floating branch name is not a pin. The commit comes from the
+    installer's own record of what it built, which is the same value the
+    feature cache recorded as code_revision when it produced the depth.
+    """
+    from importlib import metadata
+
+    out: dict[str, Any] = {"distribution": None, "version": None, "commit": None,
+                           "url": None, "pinned": False}
+    try:
+        distribution = metadata.distribution("vggt")
+    except metadata.PackageNotFoundError:
+        return out
+    out["distribution"] = "vggt"
+    try:
+        out["version"] = metadata.version("vggt")
+    except metadata.PackageNotFoundError:
+        pass
+    try:
+        raw = distribution.read_text("direct_url.json")
+    except OSError:
+        raw = None
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = {}
+        out["url"] = payload.get("url")
+        info = payload.get("vcs_info") or {}
+        commit = info.get("commit_id")
+        if isinstance(commit, str) and len(commit) == 40:
+            out["commit"] = commit
+            out["pinned"] = True
+    return out
+
+
+def extract_function(source: str, name: str) -> tuple[int, list[str]] | None:
+    """The source lines of one top-level function, with its starting line."""
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(f"def {name}"):
+            end = index + 1
+            while end < len(lines) and not lines[end].startswith(("def ", "class ")):
+                end += 1
+            while end > index + 1 and not lines[end - 1].strip():
+                end -= 1
+            return index + 1, lines[index:end]
+    return None
+
+
+def source_authority() -> dict[str, Any]:
+    """Establish the depth convention from the installed VGGT source.
+
+    The decisive evidence is how VGGT itself turns its predicted depth into
+    camera-frame points. depth_to_cam_coords_points is the function that
+    unproject_depth_map_to_point_map calls to do exactly that. A planar
+    camera-z head assigns z from the depth map directly and scales x and y by
+    depth over focal length; a ray-distance head would have to rescale along
+    the ray first. This checks the structure rather than trusting a claim, and
+    returns unambiguous False when it cannot read the signature it expects.
+    """
+    evidence: dict[str, Any] = {
+        "verdict": "ambiguous",
+        "unambiguous": False,
+        "function": DECISIVE_FUNCTION,
+        "module": None,
+        "first_line": None,
+        "lines": [],
+        "checks": {},
+        "revision": vggt_source_revision(),
+        "roots": [],
+        "reason": None,
+    }
+    try:
+        roots = vggt_package_roots()
+    except ImportError:
+        evidence["reason"] = "vggt is not installed in this environment"
+        return evidence
+    evidence["roots"] = [str(root) for root in roots]
+    for root in roots:
+        path = root / DECISIVE_MODULE
+        if not path.is_file():
+            continue
+        extracted = extract_function(path.read_text(encoding="utf-8", errors="replace"),
+                                     DECISIVE_FUNCTION)
+        if extracted is None:
+            continue
+        first_line, body = extracted
+        evidence["module"] = str(path)
+        evidence["first_line"] = first_line
+        evidence["lines"] = body
+        code = [
+            line.split("#", 1)[0].strip()
+            for line in body
+            if line.split("#", 1)[0].strip()
+        ]
+        joined = " ".join(code)
+        assigns_z_directly = any(
+            line.replace(" ", "").startswith("z_cam=") and "depth_map" in line
+            and not any(marker.replace(" ", "") in line.replace(" ", "")
+                        for marker in RAY_MARKERS)
+            for line in code
+        )
+        scales_xy_by_depth = sum(
+            1 for line in code
+            if line.replace(" ", "").startswith(("x_cam=", "y_cam="))
+            and "*depth_map/" in line.replace(" ", "")
+        ) == 2
+        no_ray_rescale = not any(marker in joined for marker in RAY_MARKERS)
+        evidence["checks"] = {
+            "assigns_z_from_depth_directly": bool(assigns_z_directly),
+            "scales_x_and_y_by_depth_over_focal": bool(scales_xy_by_depth),
+            "no_ray_rescaling_in_function": bool(no_ray_rescale),
+        }
+        if assigns_z_directly and scales_xy_by_depth and no_ray_rescale:
+            evidence["verdict"] = "planar_z"
+            evidence["unambiguous"] = True
+        else:
+            evidence["reason"] = (
+                "the decisive function does not carry the planar-z signature; "
+                "read the recorded lines before deciding"
+            )
+        return evidence
+    evidence["reason"] = (
+        f"{DECISIVE_MODULE}:{DECISIVE_FUNCTION} was not found in the installed vggt"
+    )
+    return evidence
+
+
+def build_convention_record(
+    diagnostic: dict[str, Any], authority: dict[str, Any], depth_meta: dict[str, Any]
+) -> dict[str, Any]:
+    """One convention decision for the whole run, with its authority.
+
+    Amendment A6: where authoritative model source establishes the convention
+    under PROTOCOL 4.1, that decision applies globally to every frame the
+    pinned checkpoint produced, and no per-scene diagnostic verdict may
+    control conversion. The secant results travel inside the record as
+    evidence of the check having run, and of what it found.
+    """
+    verdict = authority.get("verdict")
+    if not (authority.get("unambiguous") and verdict in ("planar_z", "ray_distance")):
+        raise Phase4GateError(
+            "the pinned VGGT source does not establish the depth convention "
+            f"unambiguously: {authority.get('reason')}. PROTOCOL 4.1 makes the "
+            "source the primary authority; without it the convention is "
+            "unresolved and Phase 4 does not run."
+        )
+    # The source cited as authority must be the source that produced the
+    # cached depth. The caching job pinned its inference revision as a full
+    # commit, so a missing or differing revision here means the semantics
+    # being cited were read from something other than what ran.
+    cache_revision = depth_meta.get("code_revision")
+    if isinstance(cache_revision, str) and len(cache_revision) == 40:
+        source_revision = authority["revision"].get("commit")
+        if source_revision != cache_revision:
+            raise Phase4GateError(
+                "the VGGT source cited as authority is not the source that "
+                f"produced the depth cache: installed {source_revision!r} "
+                f"against the cache's recorded inference revision "
+                f"{cache_revision!r}. A convention read from other code is "
+                "not evidence about these predictions."
+            )
+    scenes = diagnostic.get("scenes", {})
+    verdicts = {scene: value.get("verdict") for scene, value in scenes.items()}
+    return {
+        "depth_convention": verdict,
+        "depth_convention_authority": "source",
+        "depth_convention_source_commit": authority["revision"].get("commit"),
+        "depth_convention_source_pinned": bool(authority["revision"].get("pinned")),
+        "depth_convention_source_module": authority.get("module"),
+        "depth_convention_source_function": authority.get("function"),
+        "depth_convention_source_first_line": authority.get("first_line"),
+        "depth_convention_conversion_applied": verdict == "ray_distance",
+        "secant_regression_role": "diagnostic_only",
+        "checkpoint_weights_fingerprint": depth_meta.get("weights_fingerprint"),
+        "checkpoint_weights_revision": depth_meta.get("weights_revision"),
+        "checkpoint_code_revision": depth_meta.get("code_revision"),
+        "authority_evidence": authority,
+        "secant_diagnostic": diagnostic,
+        "secant_diagnostic_verdicts": verdicts,
+        "secant_diagnostic_disagrees_with_authority": sorted(
+            scene for scene, value in verdicts.items() if value != verdict
+        ),
+    }
+
+
+def run_convention(record: dict[str, Any]) -> str:
+    """The single convention every scene of a run reads.
+
+    Never keyed by scene, frame, camera program, angle, or diagnostic verdict.
+    A record without a global decision is refused rather than defaulted.
+    """
+    verdict = record.get("depth_convention")
+    if verdict not in ("planar_z", "ray_distance"):
+        raise Phase4GateError(
+            "the convention record carries no global depth_convention; a run "
+            "must establish exactly one convention for the pinned checkpoint"
+        )
+    if record.get("depth_convention_authority") != "source":
+        raise Phase4GateError(
+            "the convention was not established from source authority; "
+            "PROTOCOL 4.1 and Amendment A6 admit no other basis for the "
+            "global decision"
+        )
+    return verdict
+
+
 def resample_depth_nearest(
     depth: np.ndarray, dst_hw: tuple[int, int]
 ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -1208,15 +1451,21 @@ def evaluate_scene_phase4(
     if regimes is not None:
         pairs = [p for p in pairs if p.regime in regimes]
 
-    verdict = convention["scenes"][scene]["verdict"]
-    if verdict not in ("planar_z", "ray_distance"):
-        raise Phase4GateError(f"{scene}: depth convention unresolved: {verdict!r}")
+    # One checkpoint, one convention. The verdict comes from the run-level
+    # record and never from this scene's diagnostic entry: reading a per-scene
+    # verdict here let the same checkpoint be given different depth semantics
+    # in different scenes, which would mix two incompatible interpretations
+    # into one table. Amendment A6; the invariant is tested permanently.
+    verdict = run_convention(convention)
     depth_cache = load_depth_archive(cfg.cache_root, cfg.depth_encoder, scene)
 
     cache = _SceneCache(scene_root, cfg.cache_root, [cfg.feature_encoder], scene, manifest)
     est_maps: dict[str, np.ndarray] = {}
     calibrations: dict[str, FrameCalibration] = {}
     resample_records: dict[str, dict[str, Any]] = {}
+    # Every frame of the scene must have been treated under one convention.
+    # Collected rather than assumed, and asserted after the loop.
+    conversions: set[str] = set()
     boundary_by_frame: dict[str, np.ndarray] = {}
     lowtex_by_frame: dict[str, np.ndarray] = {}
 
@@ -1229,6 +1478,7 @@ def evaluate_scene_phase4(
                 resampled / secant_map(frame.K, frame.height, frame.width)
             ).astype(np.float32)
         est_maps[frame.frame_id] = resampled
+        conversions.add(verdict)
         conf_raw = depth_cache["conf"][frame.frame_id]
         conf = (
             resample_depth_nearest(conf_raw, (frame.height, frame.width))[0]
@@ -1238,6 +1488,11 @@ def evaluate_scene_phase4(
         prevalid = transport_prevalid(resampled, conf, analysis)
         calibrations[frame.frame_id] = frame_calibration(
             resampled, cache.depth(frame.depth_path).numpy(), prevalid
+        )
+    if len(conversions) > 1:
+        raise Phase4GateError(
+            f"{scene}: frames were treated under {sorted(conversions)}; one "
+            "checkpoint carries one depth convention"
         )
 
     rows: list[dict[str, Any]] = []
@@ -1337,7 +1592,17 @@ def evaluate_scene_phase4(
         "gate_forced_max_abs": max(
             (g.get("forced_max_abs", 0.0) for g in gate_evidence), default=0.0
         ),
-        "depth_convention": convention["scenes"][scene],
+        # The run-level convention and its authority, per Amendment A6. The
+        # scene's own secant entry rides along as diagnostic evidence and
+        # decided nothing.
+        "depth_convention": verdict,
+        "depth_convention_authority": convention.get("depth_convention_authority"),
+        "depth_convention_source_commit": convention.get("depth_convention_source_commit"),
+        "depth_convention_conversion_applied": verdict == "ray_distance",
+        "secant_regression_role": "diagnostic_only",
+        "secant_diagnostic_this_scene": (
+            convention.get("secant_diagnostic", {}).get("scenes", {}).get(scene)
+        ),
         "resample": next(iter(resample_records.values())) if resample_records else None,
         "git_commit": git_commit(),
         "seed": cfg.seed,
@@ -1436,27 +1701,49 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     cfg.evidence_dir.mkdir(parents=True, exist_ok=True)
-    convention_path = cfg.evidence_dir / "convention_report.json"
+    # The historical stop evidence keeps its own name and is never rewritten;
+    # the record evaluation reads is a separate file carrying the global
+    # decision. Preserving the failed consistency check is part of the audit
+    # trail, not clutter.
+    convention_path = cfg.evidence_dir / "convention_record.json"
 
     if args.convention:
-        report = convention_report(cfg, analysis)
-        if args.doc_verdict is not None:
-            report["documentation_verdict"] = args.doc_verdict
-            disagree = [
-                scene for scene, v in report["verdicts"].items()
-                if v in ("planar_z", "ray_distance") and v != args.doc_verdict
-            ]
-            report["documentation_disagrees_scenes"] = disagree
-            if disagree:
-                convention_path.write_text(json.dumps(report, indent=1))
-                raise SystemExit(
-                    "the documented VGGT convention and the deterministic "
-                    f"regression disagree on {len(disagree)} scenes; both are "
-                    f"recorded in {convention_path}. STOP."
-                )
-        convention_path.write_text(json.dumps(report, indent=1))
-        print(json.dumps(report["verdicts"], indent=1))
-        print(f"unanimous: {report['unanimous']} -> {convention_path}")
+        diagnostic = convention_report(cfg, analysis)
+        authority = source_authority()
+        (cfg.evidence_dir / "secant_diagnostic.json").write_text(
+            json.dumps(diagnostic, indent=1)
+        )
+        (cfg.evidence_dir / "source_authority.json").write_text(
+            json.dumps(authority, indent=1)
+        )
+        if not authority.get("unambiguous"):
+            raise SystemExit(
+                "the pinned VGGT source does not establish the depth "
+                f"convention unambiguously: {authority.get('reason')}. "
+                f"Evidence in {cfg.evidence_dir / 'source_authority.json'}. STOP."
+            )
+        if args.doc_verdict is not None and args.doc_verdict != authority["verdict"]:
+            raise SystemExit(
+                f"the source establishes {authority['verdict']} but "
+                f"--doc-verdict says {args.doc_verdict}. Resolve the "
+                "disagreement rather than overriding the source. STOP."
+            )
+        depth_meta = load_cache_meta(cfg.cache_root, cfg.depth_encoder, cfg.scenes[0])
+        record = build_convention_record(diagnostic, authority, depth_meta)
+        convention_path.write_text(json.dumps(record, indent=1))
+        disagree = record["secant_diagnostic_disagrees_with_authority"]
+        print(f"depth_convention: {record['depth_convention']} "
+              f"(authority: source, commit "
+              f"{record['depth_convention_source_commit']})")
+        print(f"  {record['depth_convention_source_module']}:"
+              f"{record['depth_convention_source_first_line']} "
+              f"{record['depth_convention_source_function']}")
+        print(f"  checks: {json.dumps(authority['checks'])}")
+        print(f"  conversion applied: {record['depth_convention_conversion_applied']}")
+        print(f"  secant regression: diagnostic only, disagrees on "
+              f"{len(disagree)} of {len(record['secant_diagnostic_verdicts'])} "
+              f"scenes {disagree}")
+        print(f"-> {convention_path}")
         return
 
     if not convention_path.exists():

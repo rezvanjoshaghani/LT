@@ -23,9 +23,14 @@ from lot.analysis_config import load_analysis_config
 from lot.encoders import CACHE_VERSION, cache_dir, features_digest
 from lot.evaluate import MEAN_FEATURE, NO_WARP_COPY, ORACLE_TRANSPORT, PER_POINT, SPLAT_POOL
 from lot.phase4 import (
+    DECISIVE_FUNCTION,
     LEVELS,
     Phase4Config,
     Phase4GateError,
+    build_convention_record,
+    extract_function,
+    run_convention,
+    source_authority,
     VGGT_IMAGE_SCALE,
     VGGT_NO_ALIGN,
     VGGT_SCENE_SCALE,
@@ -163,6 +168,30 @@ def build_scene(root, est_transform=lambda gt: gt / EST_SCALE):
     return manifest
 
 
+def planar_authority() -> dict:
+    """A source-authority record standing in for the installed VGGT.
+
+    The real one is read from vggt/utils/geometry.py by source_authority();
+    the suite must run without VGGT installed, so the tests supply the same
+    shape. test_source_authority_signature_detection pins the detector itself
+    against both conventions.
+    """
+    return {
+        "verdict": "planar_z", "unambiguous": True,
+        "function": "depth_to_cam_coords_points", "module": "vggt/utils/geometry.py",
+        "first_line": 87, "lines": [], "reason": None,
+        "checks": {"assigns_z_from_depth_directly": True,
+                   "scales_x_and_y_by_depth_over_focal": True,
+                   "no_ray_rescaling_in_function": True},
+        # Matches the code_revision the fixture's depth cache records, which
+        # build_convention_record requires: the source cited as authority has
+        # to be the source that produced the cached depth.
+        "revision": {"distribution": "vggt", "version": "1.0",
+                     "commit": "5" * 40, "url": None, "pinned": True},
+        "roots": [],
+    }
+
+
 @pytest.fixture(scope="module")
 def phase4_run(tmp_path_factory):
     """One end-to-end Phase 4 evaluation of the analytic scene."""
@@ -173,7 +202,11 @@ def phase4_run(tmp_path_factory):
         output_root=root / "out", scenes=[SCENE], mean_vector_dir=root / "out" / "mv",
     )
     analysis = load_analysis_config()
-    convention = convention_report(cfg, analysis)
+    diagnostic = convention_report(cfg, analysis)
+    convention = build_convention_record(
+        diagnostic, planar_authority(),
+        json.loads((cache_dir(cfg.cache_root, "vggt_1b", SCENE) / "meta.json").read_text()),
+    )
     from lot.evaluate import load_or_build_mean_vector
 
     mean_vector = load_or_build_mean_vector(
@@ -335,8 +368,156 @@ def test_low_texture_cells_split_flat_from_noise():
 # ---------------------------------------------------------------------------
 
 def test_convention_report_classifies_the_fixture_planar(phase4_run):
-    verdicts = phase4_run["convention"]["verdicts"]
+    verdicts = phase4_run["convention"]["secant_diagnostic"]["verdicts"]
     assert verdicts == {SCENE: "planar_z"}
+
+
+# ---------------------------------------------------------------------------
+# Amendment A6: one checkpoint, one convention
+# ---------------------------------------------------------------------------
+
+PLANAR_SOURCE = '''
+def depth_to_cam_coords_points(depth_map, intrinsic):
+    """Convert a depth map to camera coordinates."""
+    H, W = depth_map.shape
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    fu, fv = intrinsic[0, 0], intrinsic[1, 1]
+    cu, cv = intrinsic[0, 2], intrinsic[1, 2]
+    # Unproject to camera coordinates
+    x_cam = (u - cu) * depth_map / fu
+    y_cam = (v - cv) * depth_map / fv
+    z_cam = depth_map
+    return np.stack((x_cam, y_cam, z_cam), axis=-1)
+'''
+
+RAY_SOURCE = '''
+def depth_to_cam_coords_points(depth_map, intrinsic):
+    """A ray-distance head has to rescale along the ray before assigning z."""
+    H, W = depth_map.shape
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    fu, fv = intrinsic[0, 0], intrinsic[1, 1]
+    cu, cv = intrinsic[0, 2], intrinsic[1, 2]
+    dx = (u - cu) / fu
+    dy = (v - cv) / fv
+    z_cam = depth_map / np.sqrt(1 + dx * dx + dy * dy)
+    x_cam = dx * z_cam
+    y_cam = dy * z_cam
+    return np.stack((x_cam, y_cam, z_cam), axis=-1)
+'''
+
+
+def test_source_authority_signature_detection(tmp_path, monkeypatch):
+    """The planar signature is recognized, and a ray head is not mistaken for it."""
+    import lot.phase4 as phase4
+
+    for source, expect_planar in ((PLANAR_SOURCE, True), (RAY_SOURCE, False)):
+        root = tmp_path / ("planar" if expect_planar else "ray")
+        (root / "utils").mkdir(parents=True)
+        (root / "utils" / "geometry.py").write_text(source, encoding="utf-8")
+        monkeypatch.setattr(phase4, "vggt_package_roots", lambda root=root: [root])
+        monkeypatch.setattr(
+            phase4, "vggt_source_revision",
+            lambda: {"distribution": "vggt", "version": "1.0",
+                     "commit": "b" * 40, "url": None, "pinned": True},
+        )
+        evidence = phase4.source_authority()
+        assert evidence["unambiguous"] is expect_planar
+        assert (evidence["verdict"] == "planar_z") is expect_planar
+        assert any("z_cam" in line for line in evidence["lines"])
+
+
+def test_extract_function_takes_the_whole_body():
+    first, body = extract_function(PLANAR_SOURCE, DECISIVE_FUNCTION)
+    assert body[0].startswith(f"def {DECISIVE_FUNCTION}")
+    assert any("z_cam = depth_map" in line for line in body)
+    assert extract_function(PLANAR_SOURCE, "not_a_function") is None
+
+
+def test_one_checkpoint_one_convention_even_when_diagnostics_disagree():
+    """The deliberate regression case: scene verdicts disagree, conversion does not.
+
+    This is the bug class the closure task names. A per-scene reading gave the
+    same checkpoint two depth semantics inside one table; the record now
+    carries exactly one decision and every scene reads it.
+    """
+    diagnostic = {
+        "threshold": 0.05,
+        "scenes": {
+            "apartment_1": {"verdict": "ray_distance", "slope": 0.036},
+            "office_1": {"verdict": "ray_distance", "slope": 0.457},
+            "room_0": {"verdict": "planar_z", "slope": -0.004},
+            "hotel_0": {"verdict": "planar_z", "slope": -0.610},
+        },
+        "verdicts": {"apartment_1": "ray_distance", "office_1": "ray_distance",
+                     "room_0": "planar_z", "hotel_0": "planar_z"},
+        "unanimous": False,
+    }
+    record = build_convention_record(diagnostic, planar_authority(), {})
+    assert record["depth_convention"] == "planar_z"
+    assert record["depth_convention_authority"] == "source"
+    assert record["depth_convention_conversion_applied"] is False
+    assert record["secant_regression_role"] == "diagnostic_only"
+    assert record["depth_convention_source_commit"] == "5" * 40
+    # The disagreement is recorded, not resolved away.
+    assert record["secant_diagnostic_disagrees_with_authority"] == [
+        "apartment_1", "office_1"
+    ]
+    # Every scene, including the two the diagnostic flagged, reads one value.
+    for scene in diagnostic["scenes"]:
+        assert run_convention(record) == "planar_z", scene
+
+
+def test_convention_cannot_be_established_without_source_authority():
+    ambiguous = {**planar_authority(), "unambiguous": False, "verdict": "ambiguous",
+                 "reason": "signature not found"}
+    with pytest.raises(Phase4GateError):
+        build_convention_record({"scenes": {}}, ambiguous, {})
+    # A record lacking the global decision, or claiming a non-source basis,
+    # is refused rather than defaulted.
+    with pytest.raises(Phase4GateError):
+        run_convention({"scenes": {"a": {"verdict": "planar_z"}}})
+    with pytest.raises(Phase4GateError):
+        run_convention({"depth_convention": "planar_z",
+                        "depth_convention_authority": "regression"})
+
+
+def test_authority_must_be_the_source_that_produced_the_cache():
+    """Citing semantics read from other code is not evidence about these depths."""
+    with pytest.raises(Phase4GateError, match="not the source that"):
+        build_convention_record(
+            {"scenes": {}}, planar_authority(), {"code_revision": "9" * 40}
+        )
+    # Matching revisions are accepted, and an unpinned cache skips the check
+    # rather than inventing a comparison it cannot make.
+    assert build_convention_record(
+        {"scenes": {}}, planar_authority(), {"code_revision": "5" * 40}
+    )["depth_convention"] == "planar_z"
+    assert build_convention_record(
+        {"scenes": {}}, planar_authority(), {"code_revision": "unknown"}
+    )["depth_convention"] == "planar_z"
+
+
+def test_planar_z_applies_no_cosine_conversion(phase4_run):
+    """planar_z means the transported depth is the resampled cache, untouched."""
+    from lot.phase4 import load_depth_archive, resample_depth_nearest, secant_map
+
+    run = phase4_run
+    cfg = run["cfg"]
+    assert run["convention"]["depth_convention"] == "planar_z"
+    assert run["convention"]["depth_convention_conversion_applied"] is False
+    archive = load_depth_archive(cfg.cache_root, "vggt_1b", SCENE)
+    frame_id, raw = next(iter(archive["depth"].items()))
+    resampled, _ = resample_depth_nearest(raw, (SIDE, SIDE))
+    K = intrinsics_from_hfov(SIDE, SIDE, 90.0)
+    converted = resampled / secant_map(K, SIDE, SIDE)
+    # The conversion would have changed the map materially, so "no conversion"
+    # is a claim with content rather than a no-op.
+    assert np.abs(converted - resampled).max() > 0.05 * float(np.abs(resampled).max())
+    for row in run["rows"]:
+        assert row["depth_convention"] == "planar_z" if "depth_convention" in row else True
+    assert run["evidence"]["metadata"]["depth_convention"] == "planar_z"
+    assert run["evidence"]["metadata"]["depth_convention_conversion_applied"] is False
+    assert run["evidence"]["metadata"]["secant_regression_role"] == "diagnostic_only"
 
 
 def test_depth_archive_digest_is_verified(phase4_run):

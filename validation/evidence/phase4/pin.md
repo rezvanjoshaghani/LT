@@ -231,3 +231,64 @@ scene evaluated by the real pipeline: 280 of 280 rows reproduced with
 bit-identical masks and every metric within 7.6e-7 of the frozen 1e-4
 tolerance (validation/borah_check_2_3.py docstring records the independence
 boundary).
+
+## Validator 2.3 arithmetic-contract fix, 2026-08-29
+
+The full apartment_0 audit returned FAIL with a proven mechanism: 918 of 930
+pairs reproduced bit-identically, and 12 pairs each differed by one sample
+sitting on a decision boundary. The diagnosed case (cell 1365) had its warp coordinate one float32 ulp outside the
+sampling-box edge, margin -3.052e-05 px against edge 510.5, which is exactly
+the spacing of float32 at that magnitude. Every one of the 24 metric
+failures was Neighbor-Patch on those same near-edge coordinates: a one-ulp
+option coordinate flips the admissible set, the hash ranks a different
+number of options, and the direction lands elsewhere.
+
+Root cause, in the validator and not the pipeline: three mask-deciding
+computations still ran outside the run's arithmetic contract. The pose
+inverse was computed in float64 and rounded (the run inverts the float32
+matrix with the float32 block formula), the depth-at-center bilinear read
+ran in float64 and rounded (the run interpolates in float32), and the
+[N, 3] point transform went through numpy's matmul (the run's kernel is
+torch's). Each lands one ulp away from the run at some coordinates; only
+coordinates that straddle a boundary become visible, which is why 98.7
+percent of pairs still matched.
+
+Fix, entirely inside validation/borah_check_2_3.py: every computation that
+decides a mask now runs under the run's declared contract, float32 with the
+run's operation order, through torch kernels where rounding is at the
+library's discretion. Covisibility, the one-surface test, the sampling-box
+warp, the neighbour options, the splat landing chain including z-buffer
+ties, and the per-patch covisible fraction are all mirrored; the formulas
+remain this script's own, written from the protocol text, per VALIDATION.md
+ground rule 4. Score accumulation is unchanged: independent float64 under
+the frozen 1e-4. No tolerance moved, and no mask slack was added; the mask
+comparison stays bit-for-bit.
+
+Evidence the fix holds and the check keeps its teeth, both in
+tests/test_borah_check_2_3.py against a parquet written by the real
+evaluator on the analytic scene:
+
+- audit_scene returns PASS with zero mask and count mismatches over every
+  scored pair, all metrics within 1e-4.
+- The mirrored chain is bit-identical to the pipeline per pair: covisible
+  mask, per-point and splat selections, every warp coordinate, the
+  admissible neighbour sets, and the Neighbor-Patch locations, compared
+  with array equality on float32 bits.
+- Teeth check (run once, not committed): re-injecting the float64 bilinear
+  makes the bitwise test fail at 3.8e-06 max drift, the same ulp mechanism
+  as the Borah failure.
+
+One clarification the test surfaced: the analytic fixture stores float64
+depth on disk, and evaluate_scene casts every depth map to geometry_dtype
+float32 on read, so the run's chain is float32 regardless of storage. The
+validator applies the same cast. On Borah the stored renders are float32
+and the cast is a no-op.
+
+Tests: 276 passed, 3 skipped.
+
+Next on Borah: git pull, then rerun
+    ./scripts/run_phase4.sh validate23
+in full. If the twelve pairs now reproduce bit-for-bit, 2.3 closes as PASS
+with no residual to classify. Any remaining disagreement gets --diagnose
+and a severity classification under the frozen VALIDATION.md rules, decided
+with the user, before Phase 4 resumes at Stream H.

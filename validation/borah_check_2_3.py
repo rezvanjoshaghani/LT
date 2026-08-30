@@ -19,9 +19,23 @@ Independence boundary, per VALIDATION.md ground rule 4 and 2.3:
   not re-using pipeline math. Everything that transforms coordinates, decides
   visibility or eligibility, pools, masks, or scores is reimplemented here or
   in validation/independent.py, from the protocol text.
-- Geometry runs in float32 to match the run's declared geometry dtype, since
-  a landing decision at a cell boundary is part of what one row is; score
-  accumulation runs in float64.
+- The mask-deciding computations run under the run's arithmetic contract:
+  float32, the run's declared geometry_dtype, with the same operation order,
+  and through the same kernel provider (torch on CPU) wherever the rounding
+  of an operation is at a library's discretion (matmul, matrix-vector). The
+  formulas below are this script's own, written from the protocol text; what
+  is mirrored is only how they are rounded. The reason is the comparison
+  contract itself: persisted sample masks are compared bit-for-bit, and a
+  float32 eligibility decision at a sampling-box edge or a z-buffer tie is
+  reproducible bit-for-bit only by executing the same rounding sequence.
+  A float64 rederivation lands one ulp away from the run at such an edge and
+  misreports its own coordinate noise as pipeline disagreement, which the
+  apartment_0 diagnosis showed concretely: a warp coordinate one float32 ulp
+  outside the box (margin -3e-05 px) flipped one sample in twelve pairs.
+- Score accumulation stays independent and runs in float64 over per-sample
+  float32 values, judged under the frozen 1e-4 tolerance. Independence of
+  the audit lives in this file's code and in the comparison, not in freedom
+  to round differently from the run it audits.
 
 Usage (Borah, from the repo root, clean tree):
     python validation/borah_check_2_3.py \
@@ -39,6 +53,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(1, str(Path(__file__).resolve().parents[1] / "src"))
@@ -59,6 +74,12 @@ METRIC_COLUMNS = (
 )
 NEIGHBOR_OFFSETS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 TOL = 1e-4
+
+# Invalid context depths are replaced by this sentinel before the co-visibility
+# read, so a sample landing on a depth hole fails the tolerance test.
+INVALID_DEPTH_SENTINEL = 1e30
+# Relative epsilon under which z-buffer ties are averaged, PROTOCOL 3.5.
+TIE_RELATIVE_EPS = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +125,140 @@ def recompute_mean_vector(cache: Path, encoder: str, scenes: list[str]) -> np.nd
 
 
 # ---------------------------------------------------------------------------
+# The arithmetic-contract mirror: float32, the run's operation order, torch
+# kernels. Every function here decides masks; none of them scores anything.
+# ---------------------------------------------------------------------------
+
+def pixel_grid32(height: int, width: int) -> torch.Tensor:
+    """[H, W, 2] of (u, v) float32, pixel centers at integers."""
+    v = torch.arange(height, dtype=torch.float32)
+    u = torch.arange(width, dtype=torch.float32)
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    return torch.stack((uu, vv), dim=-1)
+
+
+def invert_se3_t(T: torch.Tensor) -> torch.Tensor:
+    """Block-formula inverse of a rigid transform, in T's own dtype."""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    out = torch.eye(4, dtype=T.dtype)
+    out[:3, :3] = R.mT
+    out[:3, 3] = -(R.mT @ t)
+    return out
+
+
+def relative_pose32(T_world_from_target: np.ndarray, T_world_from_context: np.ndarray) -> torch.Tensor:
+    """T_target_from_context under the run's contract: float64 block-formula
+    inverse and compose, then one rounding to float32."""
+    A = torch.from_numpy(np.asarray(T_world_from_target, dtype=np.float64))
+    B = torch.from_numpy(np.asarray(T_world_from_context, dtype=np.float64))
+    return (invert_se3_t(A) @ B).to(torch.float32)
+
+
+def unproject32(uv: torch.Tensor, depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    x = (uv[..., 0] - K[0, 2]) * depth / K[0, 0]
+    y = (uv[..., 1] - K[1, 2]) * depth / K[1, 1]
+    return torch.stack((x, y, depth), dim=-1)
+
+
+def transform32(T: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+    return points @ T[:3, :3].mT + T[:3, 3]
+
+
+def project32(points: torch.Tensor, K: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    z = points[..., 2]
+    u = K[0, 0] * points[..., 0] / z + K[0, 2]
+    v = K[1, 1] * points[..., 1] / z + K[1, 2]
+    return torch.stack((u, v), dim=-1), z
+
+
+def bilinear32(grid: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
+    """Bilinear on an [H, W] float32 grid, cell centers at integers, border clamped."""
+    height, width = grid.shape
+    x = xy[..., 0].clamp(0, width - 1)
+    y = xy[..., 1].clamp(0, height - 1)
+    x0 = x.floor().clamp(max=max(width - 2, 0)).long()
+    y0 = y.floor().clamp(max=max(height - 2, 0)).long()
+    x1 = (x0 + 1).clamp(max=width - 1)
+    y1 = (y0 + 1).clamp(max=height - 1)
+    wx = x - x0
+    wy = y - y0
+    return (
+        grid[y0, x0] * (1 - wx) * (1 - wy)
+        + grid[y0, x1] * wx * (1 - wy)
+        + grid[y1, x0] * (1 - wx) * wy
+        + grid[y1, x1] * wx * wy
+    )
+
+
+def nearest32(grid: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
+    """Nearest-cell read on an [H, W] grid, floor(x + 0.5), border clamped."""
+    height, width = grid.shape
+    x = torch.floor(xy[..., 0] + 0.5).long().clamp(0, width - 1)
+    y = torch.floor(xy[..., 1] + 0.5).long().clamp(0, height - 1)
+    return grid[y, x]
+
+
+def covisible32(
+    depth_tgt: torch.Tensor,
+    depth_ctx: torch.Tensor,
+    K_tgt: torch.Tensor,
+    K_ctx: torch.Tensor,
+    T_tgt_from_ctx: torch.Tensor,
+    rel_tol: float,
+) -> torch.Tensor:
+    """Ground-truth co-visibility on the target grid, [H, W] bool.
+
+    A valid target pixel is co-visible when its surface point, mapped into the
+    context camera, lands inside the physical image extent with positive depth
+    and the context z-buffer at the nearest cell records the same depth within
+    rel_tol. The read is nearest-cell: a depth map is a z-buffer, and a value
+    interpolated across an edge lies on no surface.
+    """
+    T_ctx_from_tgt = invert_se3_t(T_tgt_from_ctx)
+    height, width = depth_tgt.shape
+    ctx_height, ctx_width = depth_ctx.shape
+    uv = pixel_grid32(height, width)
+    valid = (depth_tgt > 0) & torch.isfinite(depth_tgt)
+    points_tgt = unproject32(uv, depth_tgt, K_tgt)
+    points_ctx = transform32(T_ctx_from_tgt, points_tgt)
+    uv_ctx, z_ctx = project32(points_ctx, K_ctx)
+    u = uv_ctx[..., 0]
+    v = uv_ctx[..., 1]
+    in_frustum = (
+        valid
+        & (z_ctx > 0)
+        & torch.isfinite(u)
+        & torch.isfinite(v)
+        & (u >= -0.5)
+        & (u < ctx_width - 0.5)
+        & (v >= -0.5)
+        & (v < ctx_height - 0.5)
+    )
+    d = torch.where(
+        (depth_ctx > 0) & torch.isfinite(depth_ctx),
+        depth_ctx,
+        torch.full_like(depth_ctx, INVALID_DEPTH_SENTINEL),
+    )
+    safe_uv = torch.where(in_frustum[..., None], uv_ctx, torch.zeros_like(uv_ctx))
+    seen = nearest32(d, safe_uv)
+    agrees = (z_ctx - seen).abs() <= rel_tol * z_ctx
+    return in_frustum & agrees
+
+
+def patch_fraction32(mask: torch.Tensor) -> np.ndarray:
+    """Fraction of set pixels per patch, float32 mean, [cells] row major."""
+    height, width = mask.shape
+    return (
+        mask.to(torch.float32)
+        .reshape(height // PATCH, PATCH, width // PATCH, PATCH)
+        .mean(dim=(1, 3))
+        .reshape(-1)
+        .numpy()
+    )
+
+
+# ---------------------------------------------------------------------------
 # Independent per-pair reconstruction
 # ---------------------------------------------------------------------------
 
@@ -122,52 +277,51 @@ def in_box(uv: np.ndarray, box) -> np.ndarray:
     )
 
 
-def splat_internals(depth_ctx: np.ndarray, K_ctx, K_tgt, T, out_hw):
-    """Winner splat internals in float32: per-cell source-patch weights.
+def splat_internals(depth_ctx: torch.Tensor, K_ctx: torch.Tensor, K_tgt: torch.Tensor,
+                    T: torch.Tensor, out_hw: tuple[int, int]):
+    """Winner splat internals: per-cell source-patch weights and coverage.
 
     Reimplements PROTOCOL's pixel-level z-buffered splat and patch pooling
     from the text: every valid context pixel carries its patch's feature to
     the nearest target pixel, the per-pixel depth minimum wins with ties
-    averaged at relative 1e-6, hit pixels average into patches. Returns
+    averaged at relative 1e-6, hit pixels average into patches. The landing
+    chain runs under the arithmetic contract above, because which pixel wins
+    a near-tie is part of what one row is. The weights themselves feed only
+    tolerance-checked scores and accumulate in float64. Returns
     (weights [cells, source_patches] float64, coverage [cells]).
     """
     h, w = depth_ctx.shape
     hp, wp = h // PATCH, w // PATCH
     oh, ow = out_hw
     ohp, owp = oh // PATCH, ow // PATCH
-    # The whole landing chain runs in float32, matching the run's declared
-    # geometry dtype, so near-tie z-buffer winners resolve the same way. The
-    # formulas are this script's own; only the precision mirrors the pipeline.
-    depth32 = depth_ctx.astype(np.float32)
-    Ks = K_ctx.astype(np.float32)
-    Kd = K_tgt.astype(np.float32)
-    Tf = T.astype(np.float32)
-    uv = ind.pixel_grid(h, w).astype(np.float32).reshape(-1, 2)
-    z = depth32.reshape(-1)
-    x = (uv[:, 0] - Ks[0, 2]) * z / Ks[0, 0]
-    y = (uv[:, 1] - Ks[1, 2]) * z / Ks[1, 1]
-    pts = np.stack((x, y, z), axis=-1) @ Tf[:3, :3].T + Tf[:3, 3]
-    z_t = pts[:, 2]
-    uv_t = np.stack(
-        (Kd[0, 0] * pts[:, 0] / z_t + Kd[0, 2], Kd[1, 1] * pts[:, 1] / z_t + Kd[1, 2]),
-        axis=-1,
+
+    uv = pixel_grid32(h, w)
+    z = depth_ctx
+    points_ctx = unproject32(uv, z, K_ctx)
+    points_tgt = transform32(T, points_ctx)
+    uv_t, z_t = project32(points_tgt, K_tgt)
+    keep = (
+        (z > 0) & torch.isfinite(z) & (z_t > 0) & torch.isfinite(z_t)
+        & torch.isfinite(uv_t).all(dim=-1)
     )
-    keep = (z > 0) & np.isfinite(z) & (z_t > 0) & np.isfinite(z_t)
-    keep &= np.isfinite(uv_t).all(axis=-1)
-    iu = np.floor(uv_t[:, 0] + 0.5).astype(np.int64)
-    iv = np.floor(uv_t[:, 1] + 0.5).astype(np.int64)
+    safe_uv = torch.where(keep[..., None], uv_t, torch.zeros_like(uv_t))
+    iu = torch.floor(safe_uv[..., 0] + 0.5).long()
+    iv = torch.floor(safe_uv[..., 1] + 0.5).long()
     keep &= (iu >= 0) & (iu < ow) & (iv >= 0) & (iv < oh)
 
-    lin = (iv * ow + iu)[keep]
-    zk = z_t[keep].astype(np.float32)
+    keep_flat = keep.reshape(-1)
+    lin_t = (iv * ow + iu).reshape(-1)[keep_flat]
+    zk = z_t.reshape(-1)[keep_flat]
+    zbuffer = torch.full((oh * ow,), torch.inf, dtype=torch.float32)
+    zbuffer.scatter_reduce_(0, lin_t, zk, reduce="amin", include_self=True)
+    winners = zk <= zbuffer[lin_t] * (1 + TIE_RELATIVE_EPS)
+
     source_patch = (
         (np.arange(h) // PATCH)[:, None] * wp + (np.arange(w) // PATCH)[None, :]
-    ).reshape(-1)[keep]
-
-    zbuffer = np.full(oh * ow, np.inf, dtype=np.float32)
-    np.minimum.at(zbuffer, lin, zk)
-    winners = zk <= zbuffer[lin] * np.float32(1 + 1e-6)
-    lin_w, src_w = lin[winners], source_patch[winners]
+    ).reshape(-1)[keep_flat.numpy()]
+    lin = lin_t.numpy()
+    winners_np = winners.numpy()
+    lin_w, src_w = lin[winners_np], source_patch[winners_np]
 
     count = np.zeros(oh * ow, dtype=np.float64)
     np.add.at(count, lin_w, 1.0)
@@ -183,11 +337,6 @@ def splat_internals(depth_ctx: np.ndarray, K_ctx, K_tgt, T, out_hw):
     return weights, coverage
 
 
-def covisible_fraction_per_cell(covisible: np.ndarray) -> np.ndarray:
-    h, w = covisible.shape
-    return covisible.reshape(h // PATCH, PATCH, w // PATCH, PATCH).mean(axis=(1, 3)).reshape(-1)
-
-
 def pack_mask(mask: np.ndarray) -> bytes:
     return np.packbits(mask.astype(np.uint8)).tobytes()
 
@@ -196,18 +345,20 @@ def reconstruct_pair(scene, ctx_id, tgt_id, frames, depths, features, center, re
                      min_covisible_fraction):
     """Every row of one (pair, encoder) from first principles. Returns rows dict."""
     ctx, tgt = frames[ctx_id], frames[tgt_id]
-    K_ctx, K_tgt = ctx["K"].astype(np.float32), tgt["K"].astype(np.float32)
-    T = ind.relative(tgt["T"], ctx["T"]).astype(np.float32)
-    T_inv = ind.invert_pose(T.astype(np.float64)).astype(np.float32)
+    K_ctx = torch.from_numpy(ctx["K"]).to(torch.float32)
+    K_tgt = torch.from_numpy(tgt["K"]).to(torch.float32)
+    T = relative_pose32(tgt["T"], ctx["T"])
+    T_inv = invert_se3_t(T)
     depth_ctx = depths[ctx_id].astype(np.float32)
     depth_tgt = depths[tgt_id].astype(np.float32)
+    depth_ctx_t = torch.from_numpy(depth_ctx)
+    depth_tgt_t = torch.from_numpy(depth_tgt)
     h, w = depth_tgt.shape
     hp, wp = h // PATCH, w // PATCH
     size = hp * wp
 
-    covisible, _, _ = ind.covisible_mask(
-        depth_tgt, depth_ctx, K_tgt, K_ctx, T, rel_tol=rel_tol
-    )
+    covisible_t = covisible32(depth_tgt_t, depth_ctx_t, K_tgt, K_ctx, T, rel_tol)
+    covisible = covisible_t.numpy()
 
     # Per-point candidates: target patch centers whose four surrounding pixels
     # are co-visible and share one surface within the frozen tolerance.
@@ -217,57 +368,54 @@ def reconstruct_pair(scene, ctx_id, tgt_id, frames, depths, features, center, re
         indexing="ij",
     )
     centers = np.stack((uu.reshape(-1), vv.reshape(-1)), axis=-1).astype(np.float32)
-    x0 = np.floor(centers[:, 0]).astype(int)
-    y0 = np.floor(centers[:, 1]).astype(int)
-    corners = np.stack(
-        (depth_tgt[y0, x0], depth_tgt[y0, x0 + 1], depth_tgt[y0 + 1, x0],
-         depth_tgt[y0 + 1, x0 + 1]), axis=-1,
+    centers_t = torch.from_numpy(centers)
+    x0 = centers_t[:, 0].floor().long()
+    y0 = centers_t[:, 1].floor().long()
+    corners = torch.stack(
+        (depth_tgt_t[y0, x0], depth_tgt_t[y0, x0 + 1], depth_tgt_t[y0 + 1, x0],
+         depth_tgt_t[y0 + 1, x0 + 1]), dim=-1,
     )
-    lo, hi = corners.min(axis=-1), corners.max(axis=-1)
-    one_surface = (lo > 0) & np.isfinite(hi) & ((hi - lo) <= rel_tol * lo)
+    lo = corners.amin(dim=-1)
+    hi = corners.amax(dim=-1)
+    one_surface = (lo > 0) & torch.isfinite(hi) & ((hi - lo) <= rel_tol * lo)
     keep = (
-        covisible[y0, x0] & covisible[y0, x0 + 1]
-        & covisible[y0 + 1, x0] & covisible[y0 + 1, x0 + 1] & one_surface
-    )
+        covisible_t[y0, x0] & covisible_t[y0, x0 + 1]
+        & covisible_t[y0 + 1, x0] & covisible_t[y0 + 1, x0 + 1] & one_surface
+    ).numpy()
     box_t = sampling_box((h, w))
     box_c = sampling_box(depth_ctx.shape)
     keep &= in_box(centers, box_t) & in_box(centers, box_c)
 
-    depth_at = ind.sample_bilinear(depth_tgt, centers).astype(np.float32)
+    depth_at = bilinear32(depth_tgt_t, centers_t).numpy()
     keep &= (depth_at > 0) & np.isfinite(depth_at)
 
-    # The warp chain runs in float32 to match the run's declared geometry
-    # dtype. The formulas are this script's own; only the precision mirrors
-    # the pipeline, because a score defined on float32 coordinates carries
-    # float32 coordinate noise that a float64 rederivation would misattribute
-    # to disagreement.
-    def warp32(uv, depth, K_src, K_dst, T_dst_from_src):
-        uv = uv.astype(np.float32)
-        depth = depth.astype(np.float32)
-        Ks = K_src.astype(np.float32)
-        Kd = K_dst.astype(np.float32)
-        Tf = T_dst_from_src.astype(np.float32)
-        x = (uv[:, 0] - Ks[0, 2]) * depth / Ks[0, 0]
-        y = (uv[:, 1] - Ks[1, 2]) * depth / Ks[1, 1]
-        pts = np.stack((x, y, depth), axis=-1)
-        pts = pts @ Tf[:3, :3].T + Tf[:3, 3]
-        z = pts[:, 2]
-        u = Kd[0, 0] * pts[:, 0] / z + Kd[0, 2]
-        v = Kd[1, 1] * pts[:, 1] / z + Kd[1, 2]
-        return np.stack((u, v), axis=-1), z
+    # The ground-truth warp of the surviving candidates, at the shapes the run
+    # used: the eligible set is filtered first and the [M, 3] chain runs on it.
+    sel = np.flatnonzero(keep)
+    sel_t = torch.from_numpy(sel)
+    points_sel = unproject32(centers_t[sel_t], torch.from_numpy(depth_at[sel]), K_tgt)
+    uv_warp_sel_t, z_sel_t = project32(transform32(T_inv, points_sel), K_ctx)
+    uv_warp_sel = uv_warp_sel_t.numpy()
+    z_sel = z_sel_t.numpy()
 
-    uv_warp, z_c = warp32(centers, depth_at, K_tgt, K_ctx, T_inv)
-    keep &= (z_c > 0) & in_box(uv_warp, box_c)
+    uv_warp = np.full((size, 2), np.nan, dtype=np.float32)
+    uv_warp[sel] = uv_warp_sel
+    keep[sel] &= (z_sel > 0) & in_box(uv_warp_sel, box_c)
 
-    import torch
+    # A full-grid warp of every candidate, for diagnostics only: the margins of
+    # a cell the run excluded are still worth printing. Values at kept cells
+    # are overwritten with the exact-chain ones above.
+    points_all = unproject32(centers_t, torch.from_numpy(depth_at), K_tgt)
+    uv_warp_all = project32(transform32(T_inv, points_all), K_ctx)[0].numpy()
+    uv_warp_all[sel] = uv_warp_sel
 
     ids_universe = sample_ids(
         scene, ctx_id, tgt_id, torch.from_numpy(centers.astype(np.float64))
     )
 
     # Splat internals, weights, and the splat-side neighbour admissibility.
-    weights, coverage = splat_internals(depth_ctx, K_ctx, K_tgt, T, (h, w))
-    covis_cells = covisible_fraction_per_cell(covisible)
+    weights, coverage = splat_internals(depth_ctx_t, K_ctx, K_tgt, T, (h, w))
+    covis_cells = patch_fraction32(covisible_t)
     splat_mask = (covis_cells >= min_covisible_fraction) & (coverage > 0)
 
     chp, cwp = depth_ctx.shape[0] // PATCH, depth_ctx.shape[1] // PATCH
@@ -285,7 +433,8 @@ def reconstruct_pair(scene, ctx_id, tgt_id, frames, depths, features, center, re
         splat_option_ok[:, index] = leaked <= 0
 
     # Per-point neighbour admissibility intersected with the splat rule at the
-    # sampled cells; the direction is one hash over the intersection.
+    # sampled cells; the direction is one hash over the intersection. Excluded
+    # cells carry NaN warps, which fail in_box, and are never consulted.
     options = uv_warp[:, None, :] + np.array(
         [[dx * PATCH, dy * PATCH] for dx, dy in NEIGHBOR_OFFSETS], dtype=np.float32
     )[None, :, :]
@@ -437,15 +586,17 @@ def reconstruct_pair(scene, ctx_id, tgt_id, frames, depths, features, center, re
         **score_mean_feature(targets_sp, in_shared_sp),
     }
 
-    baseline = float(np.linalg.norm(T[:3, 3]))
+    baseline = float(torch.linalg.vector_norm(T[:3, 3]))
     covis_depths = depth_tgt[covisible & np.isfinite(depth_tgt) & (depth_tgt > 0)]
     parallax = baseline / float(np.median(covis_depths)) if covis_depths.size else float("nan")
     internals = {
         "per_point_mask": per_point_mask,
         "splat_mask": splat_mask,
+        "covisible": covisible,
         "cell_of_sample": cell_of_sample,
         "chosen": chosen,
-        "uv_warp_all": uv_warp,
+        "uv_warp_all": uv_warp_all,
+        "uv_neighbor": uv_n_s,
         "centers": centers,
         "box_context": box_c,
         "option_ok": ok_s,
@@ -463,42 +614,32 @@ def reconstruct_pair(scene, ctx_id, tgt_id, frames, depths, features, center, re
 # Comparison driver
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--renders", type=Path, required=True)
-    parser.add_argument("--cache", type=Path, required=True)
-    parser.add_argument("--eval-dir", type=Path, required=True)
-    parser.add_argument("--scene", type=str, default="apartment_0")
-    parser.add_argument("--encoder", type=str, default="dinov2_vitb14")
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--max-pairs", type=int, default=None,
-                        help="audit only the first N pairs, for a smoke pass")
-    parser.add_argument(
-        "--diagnose", nargs=2, metavar=("CONTEXT", "TARGET"), default=None,
-        help="localize one pair's disagreement instead of auditing the scene: "
-        "name the samples the two implementations select differently and show "
-        "how close each sits to a decision boundary",
-    )
-    args = parser.parse_args()
+def audit_scene(
+    renders: Path,
+    cache: Path,
+    eval_dir: Path,
+    scene: str,
+    encoder: str,
+    rel_tol: float,
+    min_covisible_fraction: float,
+    max_pairs: int | None = None,
+) -> dict:
+    """Reconstruct every audited pair and compare against the shipped parquet.
 
-    import yaml
-
-    analysis = yaml.safe_load(Path("configs/analysis.yaml").read_text())
-    rel_tol = analysis["covisible_relative_depth_tol"]
-    min_cf = analysis["min_covisible_fraction"]
-
-    frames = load_manifest(args.renders / args.scene / "manifest.json")
+    Returns the summary dict; the caller decides what to do with the verdict.
+    """
+    frames = load_manifest(renders / scene / "manifest.json")
     depths = {
-        fid: np.load(args.renders / args.scene / frame["depth_path"])
+        fid: np.load(renders / scene / frame["depth_path"])
         for fid, frame in frames.items()
     }
-    features = load_features(args.cache, args.encoder, args.scene)
-    rows = [r for r in load_rows(args.eval_dir, args.scene) if r["encoder"] == args.encoder]
+    features = load_features(cache, encoder, scene)
+    rows = [r for r in load_rows(eval_dir, scene) if r["encoder"] == encoder]
 
-    record_path = args.eval_dir.parent / f"mean_vector_{args.encoder}.json"
+    record_path = eval_dir.parent / f"mean_vector_{encoder}.json"
     stored_record = json.loads(record_path.read_text(encoding="utf-8"))
-    center = recompute_mean_vector(args.cache, args.encoder, stored_record["scenes"])
-    stored_vector = np.load(args.eval_dir.parent / f"mean_vector_{args.encoder}.npy")
+    center = recompute_mean_vector(cache, encoder, stored_record["scenes"])
+    stored_vector = np.load(eval_dir.parent / f"mean_vector_{encoder}.npy")
     mean_vector_diff = float(np.abs(center - stored_vector.astype(np.float32)).max())
 
     by_pair: dict[tuple, dict] = {}
@@ -507,53 +648,12 @@ def main() -> None:
             (row["context_frame_id"], row["target_frame_id"]), {}
         )[(row["path"], row["variant"])] = row
 
-    if args.diagnose:
-        ctx_id, tgt_id = args.diagnose
-        shipped = by_pair[(ctx_id, tgt_id)]
-        _, _, internals = reconstruct_pair(
-            args.scene, ctx_id, tgt_id, frames, depths, features, center,
-            rel_tol, min_cf,
-        )
-        size = internals["size"]
-        theirs_pp = np.unpackbits(
-            np.frombuffer(bytes(shipped[("per_point", "Oracle-Transport")]["sample_mask"]),
-                          dtype=np.uint8)
-        )[:size].astype(bool)
-        mine_pp = internals["per_point_mask"]
-        only_mine = np.flatnonzero(mine_pp & ~theirs_pp)
-        only_theirs = np.flatnonzero(theirs_pp & ~mine_pp)
-        print(f"pair {ctx_id} -> {tgt_id}")
-        print(f"  per-point selected: mine {int(mine_pp.sum())}, "
-              f"pipeline {int(theirs_pp.sum())}")
-        print(f"  only mine: {only_mine.tolist()}   only pipeline: {only_theirs.tolist()}")
-        u_min, u_max, v_min, v_max = internals["box_context"]
-        centers = internals["centers"]
-        uv_warp = internals["uv_warp_all"]
-        patches_w = frames[tgt_id]["width"] // PATCH
-        for cell in list(only_mine) + list(only_theirs):
-            row, col = divmod(int(cell), patches_w)
-            centre = np.array([col * PATCH + (PATCH - 1) / 2.0,
-                               row * PATCH + (PATCH - 1) / 2.0], dtype=np.float32)
-            index = int(np.argmin(np.abs(centers - centre).sum(axis=1)))
-            warp = uv_warp[index]
-            margins = {
-                "u-lo": float(warp[0] - u_min), "hi-u": float(u_max - warp[0]),
-                "v-lo": float(warp[1] - v_min), "hi-v": float(v_max - warp[1]),
-            }
-            closest = min(margins, key=margins.get)
-            side = "mine only" if cell in set(only_mine.tolist()) else "pipeline only"
-            print(f"  cell {int(cell):>5} ({side}) centre={centre.tolist()} "
-                  f"warp=({warp[0]:.6f}, {warp[1]:.6f})")
-            print(f"        distance to the nearest sampling-box edge: "
-                  f"{closest} = {margins[closest]:.3e} px")
-        return
-
     pairs = sorted(by_pair)
-    if args.max_pairs:
-        pairs = pairs[: args.max_pairs]
+    if max_pairs:
+        pairs = pairs[:max_pairs]
 
     summary = {
-        "scene": args.scene, "encoder": args.encoder, "pairs": len(pairs),
+        "scene": scene, "encoder": encoder, "pairs": len(pairs),
         "rows_compared": 0, "mask_mismatches": 0, "count_mismatches": 0,
         "metric_max_abs_diff": {c: 0.0 for c in METRIC_COLUMNS},
         "pair_field_max_abs_diff": {"rotation_deg": 0.0, "parallax": 0.0,
@@ -566,8 +666,8 @@ def main() -> None:
     for pair_index, (ctx_id, tgt_id) in enumerate(pairs):
         shipped = by_pair[(ctx_id, tgt_id)]
         mine, pair_fields, _ = reconstruct_pair(
-            args.scene, ctx_id, tgt_id, frames, depths, features, center,
-            rel_tol, min_cf,
+            scene, ctx_id, tgt_id, frames, depths, features, center,
+            rel_tol, min_covisible_fraction,
         )
         any_row = next(iter(shipped.values()))
         for field in ("rotation_deg", "parallax", "covisible_fraction"):
@@ -613,6 +713,94 @@ def main() -> None:
 
     summary["verdict"] = "PASS" if not summary["failures"] else "FAIL"
     summary["failures"] = summary["failures"][:50]
+    return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--renders", type=Path, required=True)
+    parser.add_argument("--cache", type=Path, required=True)
+    parser.add_argument("--eval-dir", type=Path, required=True)
+    parser.add_argument("--scene", type=str, default="apartment_0")
+    parser.add_argument("--encoder", type=str, default="dinov2_vitb14")
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--max-pairs", type=int, default=None,
+                        help="audit only the first N pairs, for a smoke pass")
+    parser.add_argument(
+        "--diagnose", nargs=2, metavar=("CONTEXT", "TARGET"), default=None,
+        help="localize one pair's disagreement instead of auditing the scene: "
+        "name the samples the two implementations select differently and show "
+        "how close each sits to a decision boundary",
+    )
+    args = parser.parse_args()
+
+    import yaml
+
+    analysis = yaml.safe_load(Path("configs/analysis.yaml").read_text())
+    rel_tol = analysis["covisible_relative_depth_tol"]
+    min_cf = analysis["min_covisible_fraction"]
+
+    if args.diagnose:
+        frames = load_manifest(args.renders / args.scene / "manifest.json")
+        depths = {
+            fid: np.load(args.renders / args.scene / frame["depth_path"])
+            for fid, frame in frames.items()
+        }
+        features = load_features(args.cache, args.encoder, args.scene)
+        rows = [r for r in load_rows(args.eval_dir, args.scene)
+                if r["encoder"] == args.encoder]
+        record_path = args.eval_dir.parent / f"mean_vector_{args.encoder}.json"
+        stored_record = json.loads(record_path.read_text(encoding="utf-8"))
+        center = recompute_mean_vector(args.cache, args.encoder, stored_record["scenes"])
+        by_pair: dict[tuple, dict] = {}
+        for row in rows:
+            by_pair.setdefault(
+                (row["context_frame_id"], row["target_frame_id"]), {}
+            )[(row["path"], row["variant"])] = row
+        ctx_id, tgt_id = args.diagnose
+        shipped = by_pair[(ctx_id, tgt_id)]
+        _, _, internals = reconstruct_pair(
+            args.scene, ctx_id, tgt_id, frames, depths, features, center,
+            rel_tol, min_cf,
+        )
+        size = internals["size"]
+        theirs_pp = np.unpackbits(
+            np.frombuffer(bytes(shipped[("per_point", "Oracle-Transport")]["sample_mask"]),
+                          dtype=np.uint8)
+        )[:size].astype(bool)
+        mine_pp = internals["per_point_mask"]
+        only_mine = np.flatnonzero(mine_pp & ~theirs_pp)
+        only_theirs = np.flatnonzero(theirs_pp & ~mine_pp)
+        print(f"pair {ctx_id} -> {tgt_id}")
+        print(f"  per-point selected: mine {int(mine_pp.sum())}, "
+              f"pipeline {int(theirs_pp.sum())}")
+        print(f"  only mine: {only_mine.tolist()}   only pipeline: {only_theirs.tolist()}")
+        u_min, u_max, v_min, v_max = internals["box_context"]
+        centers = internals["centers"]
+        uv_warp = internals["uv_warp_all"]
+        patches_w = frames[tgt_id]["width"] // PATCH
+        for cell in list(only_mine) + list(only_theirs):
+            row, col = divmod(int(cell), patches_w)
+            centre = np.array([col * PATCH + (PATCH - 1) / 2.0,
+                               row * PATCH + (PATCH - 1) / 2.0], dtype=np.float32)
+            index = int(np.argmin(np.abs(centers - centre).sum(axis=1)))
+            warp = uv_warp[index]
+            margins = {
+                "u-lo": float(warp[0] - u_min), "hi-u": float(u_max - warp[0]),
+                "v-lo": float(warp[1] - v_min), "hi-v": float(v_max - warp[1]),
+            }
+            closest = min(margins, key=margins.get)
+            side = "mine only" if cell in set(only_mine.tolist()) else "pipeline only"
+            print(f"  cell {int(cell):>5} ({side}) centre={centre.tolist()} "
+                  f"warp=({warp[0]:.6f}, {warp[1]:.6f})")
+            print(f"        distance to the nearest sampling-box edge: "
+                  f"{closest} = {margins[closest]:.3e} px")
+        return
+
+    summary = audit_scene(
+        args.renders, args.cache, args.eval_dir, args.scene, args.encoder,
+        rel_tol, min_cf, max_pairs=args.max_pairs,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(summary, indent=1))
     print(json.dumps({k: v for k, v in summary.items() if k != "failures"}, indent=1))

@@ -292,3 +292,9 @@ in full. If the twelve pairs now reproduce bit-for-bit, 2.3 closes as PASS
 with no residual to classify. Any remaining disagreement gets --diagnose
 and a severity classification under the frozen VALIDATION.md rules, decided
 with the user, before Phase 4 resumes at Stream H.
+
+Rerun verdict, 2026-08-29: PASS at c1bed4b. 930 pairs, 9300 rows, zero
+mask and count mismatches, max metric abs diff 5.1e-07 against 1e-4. The
+twelve boundary pairs reproduce bit-for-bit under the corrected contract.
+Stream F is closed and the STOP on Phase 4 is lifted; the closure report
+is validation/evidence/phase4/closure.md.

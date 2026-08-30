@@ -17,7 +17,7 @@ the repository.
     export SLURM_ACCOUNT=<account>
     export SLURM_PARTITION=<partition>
     export LOT_ENV=lot-encode            # the Phase 2/3 env, unchanged
-    export MAMBA_ROOT_PREFIX=$HOME/micromamba
+    export MAMBA_ROOT_PREFIX=/bsuscratch/$USER/micromamba  # the root holding lot-encode
 
 `LOT_DINOV2_REVISION` and `LOT_VGGT_REVISION` are needed only by the caching
 job and by the `smoke` mode. Phase 4 consumes the existing caches and does
@@ -37,9 +37,9 @@ enumerates the post-freeze amendments, prints the live hashes, asserts a
 clean tree, re-reads both caches against their recorded digests, prints the
 Phase 3 and Phase 4 measurement identities, and runs the suite.
 
-Expect: frozen blobs verified; amendments A1 to A5 listed; Phase 3
+Expect: frozen blobs verified; amendments A1 to A6 listed; Phase 3
 measurement digest `27244e6481d521159e513f2ea8799482`; Phase 4 measurement
-digest `1579714398feff4771a9981e5f427c8a`; 262 passed, 3 skipped.
+digest `1579714398feff4771a9981e5f427c8a`; 276 passed, 3 skipped.
 
 On Linux the live sha256 of PROTOCOL.md and VALIDATION.md equal their frozen
 values; AMENDMENTS.md and configs/analysis.yaml differ by exactly the five

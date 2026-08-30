@@ -440,11 +440,23 @@ def reconstruct_pair(scene, ctx_id, tgt_id, frames, depths, features, center, re
     baseline = float(np.linalg.norm(T[:3, 3]))
     covis_depths = depth_tgt[covisible & np.isfinite(depth_tgt) & (depth_tgt > 0)]
     parallax = baseline / float(np.median(covis_depths)) if covis_depths.size else float("nan")
+    internals = {
+        "per_point_mask": per_point_mask,
+        "splat_mask": splat_mask,
+        "cell_of_sample": cell_of_sample,
+        "chosen": chosen,
+        "uv_warp_all": uv_warp,
+        "centers": centers,
+        "box_context": box_c,
+        "option_ok": ok_s,
+        "direction": direction,
+        "size": size,
+    }
     return rows, {
         "rotation_deg": ind.rotation_deg(ind.relative(tgt["T"], ctx["T"])[:3, :3]),
         "parallax": parallax,
         "covisible_fraction": float(covisible.mean()),
-    }
+    }, internals
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +473,12 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--max-pairs", type=int, default=None,
                         help="audit only the first N pairs, for a smoke pass")
+    parser.add_argument(
+        "--diagnose", nargs=2, metavar=("CONTEXT", "TARGET"), default=None,
+        help="localize one pair's disagreement instead of auditing the scene: "
+        "name the samples the two implementations select differently and show "
+        "how close each sits to a decision boundary",
+    )
     args = parser.parse_args()
 
     import yaml
@@ -489,6 +507,47 @@ def main() -> None:
             (row["context_frame_id"], row["target_frame_id"]), {}
         )[(row["path"], row["variant"])] = row
 
+    if args.diagnose:
+        ctx_id, tgt_id = args.diagnose
+        shipped = by_pair[(ctx_id, tgt_id)]
+        _, _, internals = reconstruct_pair(
+            args.scene, ctx_id, tgt_id, frames, depths, features, center,
+            rel_tol, min_cf,
+        )
+        size = internals["size"]
+        theirs_pp = np.unpackbits(
+            np.frombuffer(bytes(shipped[("per_point", "Oracle-Transport")]["sample_mask"]),
+                          dtype=np.uint8)
+        )[:size].astype(bool)
+        mine_pp = internals["per_point_mask"]
+        only_mine = np.flatnonzero(mine_pp & ~theirs_pp)
+        only_theirs = np.flatnonzero(theirs_pp & ~mine_pp)
+        print(f"pair {ctx_id} -> {tgt_id}")
+        print(f"  per-point selected: mine {int(mine_pp.sum())}, "
+              f"pipeline {int(theirs_pp.sum())}")
+        print(f"  only mine: {only_mine.tolist()}   only pipeline: {only_theirs.tolist()}")
+        u_min, u_max, v_min, v_max = internals["box_context"]
+        centers = internals["centers"]
+        uv_warp = internals["uv_warp_all"]
+        patches_w = frames[tgt_id]["width"] // PATCH
+        for cell in list(only_mine) + list(only_theirs):
+            row, col = divmod(int(cell), patches_w)
+            centre = np.array([col * PATCH + (PATCH - 1) / 2.0,
+                               row * PATCH + (PATCH - 1) / 2.0], dtype=np.float32)
+            index = int(np.argmin(np.abs(centers - centre).sum(axis=1)))
+            warp = uv_warp[index]
+            margins = {
+                "u-lo": float(warp[0] - u_min), "hi-u": float(u_max - warp[0]),
+                "v-lo": float(warp[1] - v_min), "hi-v": float(v_max - warp[1]),
+            }
+            closest = min(margins, key=margins.get)
+            side = "mine only" if cell in set(only_mine.tolist()) else "pipeline only"
+            print(f"  cell {int(cell):>5} ({side}) centre={centre.tolist()} "
+                  f"warp=({warp[0]:.6f}, {warp[1]:.6f})")
+            print(f"        distance to the nearest sampling-box edge: "
+                  f"{closest} = {margins[closest]:.3e} px")
+        return
+
     pairs = sorted(by_pair)
     if args.max_pairs:
         pairs = pairs[: args.max_pairs]
@@ -506,7 +565,7 @@ def main() -> None:
 
     for pair_index, (ctx_id, tgt_id) in enumerate(pairs):
         shipped = by_pair[(ctx_id, tgt_id)]
-        mine, pair_fields = reconstruct_pair(
+        mine, pair_fields, _ = reconstruct_pair(
             args.scene, ctx_id, tgt_id, frames, depths, features, center,
             rel_tol, min_cf,
         )

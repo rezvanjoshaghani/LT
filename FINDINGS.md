@@ -287,6 +287,135 @@ the implementation selected the conversion per scene, so one checkpoint could
 have carried two depth semantics inside one table. No Phase 4 scientific
 output had been produced when the stop fired, so nothing required discarding.
 
+## Phase 4 rung 1: the estimated-geometry tax (2026-08-30)
+
+Run: 18 scenes, 16,884 camera pairs, 2,221,455 rows, 266,808 paired
+records, evaluated on the inherited Phase 3 population and reconciled row
+by row against it. The 4.5 gates passed on all 18 scenes under Amendment
+A7 with the forced identity gap exactly zero at every alignment level.
+Numbers below are centered cosine on the per-point path unless said
+otherwise; the tables carry raw and both paths. Evidence:
+outputs/phase4_rung1/tables/phase4_ladder.parquet, phase4_bins.parquet,
+phase4_near_zero.json.
+
+### The pure-rotation invariant holds as a measurement, not only as a gate
+
+In-place rotation pays a depth tax of exactly 0.0000 at every alignment
+level, on 4,108 camera pairs, with retained fraction 1.0000 and
+transported fraction 1.0000, and it stays exactly zero in every rotation
+bin from 0-10 through 50-plus degrees. Estimated depth cannot move a
+correspondence when the cameras only rotate, and the study now shows that
+on real data rather than deriving it. The splat path reads -0.0001
+uniformly: the unforced rasterization tax of A7, small and marginally in
+favour of estimated depth.
+
+### Scale is most of the tax, and unaligned transport is worse than not transporting
+
+Translation, per-point: the tax falls 0.2690 (no alignment) to 0.0444
+(leave-target-out scene scale) to 0.0305 (context-image scale) to 0.0296
+(affine). One global scalar removes about five sixths of it. At no
+alignment the retained fraction is -1.24: the estimated-depth score sits
+below the No-Warp-Copy floor, so transporting features with wrongly
+scaled depth is worse than not transporting them at all. What survives
+correct scale is small, roughly 0.03 against an oracle margin near 0.12,
+so about three quarters of the transportable signal survives estimated
+geometry once its scale is fixed. The affine shift buys almost nothing
+over a pure scale (0.0305 to 0.0296), which says the residual error is
+multiplicative and structural rather than an offset.
+
+### The tax grows with parallax, and alignment collapses it hardest where parallax is small
+
+Translation, per-point, context-image scale, by parallax bin: 0.0039,
+0.0060, 0.0166, 0.0641, 0.0747. Unaligned over the same bins: 0.1803,
+0.2059, 0.2917, 0.3731, 0.2954. This is PROTOCOL 4.7's translation
+prediction. Two features are recorded without explanation: the unaligned
+level falls in the top bin while the aligned levels keep rising, and the
+top bin is open-ended, so it is not a fixed-parallax cell. Ceiling
+compression at extreme parallax is a candidate and is not tested here.
+
+### The two evaluation paths disagree about what Level 2 buys
+
+At context-image scale the splat path pays 0.0113 where the per-point
+path pays 0.0305; at scene scale the two agree (0.0405 against 0.0444).
+This follows the frozen design rather than contradicting it. Amendment A4
+applies the alignment to the context map on the splat path and to the
+target map on the per-point path, while Level 2's scalar is fitted from
+the context image. The splat path therefore receives a scalar matched to
+the map it transforms, and the per-point path receives a context-fitted
+scalar applied to the target map. The reading is a hypothesis; testing it
+would need a target-image scalar fitted and compared, which is not in the
+frozen ladder and is not run here.
+
+### Under orbit, Level 2 buys nothing on the per-point path
+
+Orbit, per-point: 0.0500 at scene scale, 0.0497 at context-image scale,
+0.0488 at affine. The per-image scalar that removes a third of the
+per-point tax under translation removes nothing under orbit. The joint
+grid shows this is not uniform but mixed cell by cell: in the 0.4-plus
+parallax column, context-image scale is worse than scene scale at every
+rotation bin, for example 0.0708 against 0.0400 at 10-20 degrees. On the
+splat path the same alignment still helps under orbit, 0.0527 to 0.0143.
+This is the same context-versus-target asymmetry as above, largest where
+the two views differ most.
+
+### Anomaly against PLAN.md: low-texture surfaces pay less, not more
+
+PLAN.md expects the drop to be concentrated at depth edges and
+low-texture surfaces. Depth edges behave as expected and weakly: boundary
+minus interior is +0.0051 [+0.0020, +0.0081] under translation and
++0.0146 [+0.0107, +0.0186] under orbit at context-image scale. Low
+texture goes the other way, with intervals excluding zero: low-texture
+minus high-texture is -0.0120 [-0.0143, -0.0094] under translation and
+-0.0283 [-0.0330, -0.0241] under orbit. The tax concentrates in
+high-texture regions.
+
+Nothing was tuned in response. The mechanism is not established. The
+interpretation that fits the metric is that a feature-agreement tax
+measures displacement multiplied by local feature sensitivity: where the
+feature map is flat, putting a feature in the wrong place costs little,
+whatever the depth error there is. If that is right, this contrast
+localizes where the metric can see error rather than where depth
+estimation is worst, and those are different questions. Separating them
+needs a geometric error measure by texture class, depth error or
+reprojection displacement rather than feature agreement. That analysis is
+frozen nowhere and would be exploratory and non-gating.
+
+### The orbit prediction is not testable at this binning
+
+PROTOCOL 4.7 predicts that after controlling for parallax, rotation adds
+no depth-estimation tax. The joint grid does not answer it. At
+context-image scale the tax falls with rotation inside the 0.2-0.4
+parallax column (zero 0.1075, 0-10 0.0945, 10-20 0.0517, 20-30 0.0402,
+30-40 0.0334) and rises with rotation inside the 0.4-plus column (zero
+0.0273, 0-10 0.0324, 10-20 0.0708, 20-30 0.0808, 30-40 0.0807, 40-50
+0.0887). A rotation effect whose sign reverses between adjacent parallax
+columns is the signature of residual within-cell parallax composition,
+not of a rotation effect. The top bin is open-ended and is therefore not
+a fixed-parallax control at all. Two further observations belong with it:
+the zero-rotation orbit cells do not match the translation regime at the
+same nominal parallax bin, so the two programs are not exchangeable at
+this resolution; and about 13 percent of orbit pairs carry zero relative
+rotation, which is worth understanding before any orbit statement is
+made. No re-binning was performed. Changing bin edges after seeing this
+grid would convert a stated limitation into a result.
+
+### Resolution floor and population accounting
+
+The near-zero disclosure flags 225 cells: 130 not robust, 92 small and
+sign-consistent under both paths, 3 path-sensitive in magnitude. The 130
+sit at the scale of evaluation-path choice and must not be read as
+effects. The selection differential is small and negative everywhere,
+-0.0139 at no alignment and at most -0.003 elsewhere, so the points
+surviving estimated-depth validity are slightly easier than the full
+co-visible set and every tax above is measured on a marginally favourable
+population; the number is reported rather than assumed away. Transported
+fraction moves across alignment levels, 0.858, 0.970 and 0.957 pooled
+per-point. That is the landing-dependent scored fraction, which Amendment
+A5 permits to move with scale under nonzero translation; the 4.4 identity
+is asserted on transport validity and passed per pair. Affine fits failed
+for 236 pairs on the per-point path and 215 on the splat path, reported
+per scope rather than skipped.
+
 ## Phase 3: Experiment Zero, corrected verdict (Stream D, 2026-08-27)
 
 Eighteen scenes, two frozen encoders, 33,772 comparisons, both evaluation

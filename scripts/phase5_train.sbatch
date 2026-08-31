@@ -1,0 +1,65 @@
+#!/bin/bash
+# SLURM template for Phase 5 training: one task per (fold, seed).
+#
+# Three folds and three seeds is nine tasks, indexed 0 to 8 with
+#   fold = index / 3, seed_index = index % 3
+# computed inside lot.train's entry point from the frozen seed list, so the
+# mapping lives with the frozen config rather than in this template.
+#
+#   sbatch --account "${SLURM_ACCOUNT:?}" \
+#          --partition "${SLURM_PARTITION:?}" \
+#          --array 0-8 scripts/phase5_train.sbatch configs/phase5.yaml
+#
+# Run scripts/run_phase5.sh check, gates, and tiny first. The tiny-subset
+# overfit gate is a stop condition: a predictor that cannot fit eight pairs
+# cannot support a scientific reading of its later underperformance, so
+# training refuses to start until it has passed.
+#
+# GPU shape, unlike Phase 4's evaluation array. The job reads cached features
+# and cached VGGT depth and never loads an encoder, but it does train.
+#
+#SBATCH --job-name=lot-phase5-train
+#SBATCH --time=08:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --gres=gpu:1
+#SBATCH --output=slurm-%x-%A_%a.out
+
+set -euo pipefail
+
+CONFIG="${1:?usage: sbatch ... scripts/phase5_train.sbatch <config.yaml>}"
+LOT_ENV="${LOT_ENV:-lot-encode}"
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
+
+if [ -n "${LOT_MODULES:-}" ] && command -v module >/dev/null 2>&1; then
+    module load $LOT_MODULES
+fi
+
+MM="${MAMBA_EXE:-}"
+if [ -z "$MM" ]; then
+    if command -v micromamba >/dev/null 2>&1; then
+        MM="$(command -v micromamba)"
+    else
+        MM="$HOME/.local/bin/micromamba"
+    fi
+fi
+
+cd "$SLURM_SUBMIT_DIR"
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# Refuse a dirty worktree. Every checkpoint must name the commit that made it.
+if [ -n "$(git status --porcelain)" ]; then
+    echo "refusing to run from a dirty worktree:" >&2
+    git status --porcelain | head -20 >&2
+    exit 1
+fi
+echo "clean worktree at commit $(git rev-parse HEAD)"
+
+# One task per (fold, seed). The task never sees a test scene: the fold object
+# exposes train and val only, and lot.train asserts the seal inside its loop.
+"$MM" run -n "$LOT_ENV" python -m lot.phase5 \
+    --config "$CONFIG" \
+    --mode train \
+    --task-index "${SLURM_ARRAY_TASK_ID:-0}"

@@ -81,8 +81,12 @@ execution commit, so no analysis constant has moved since Phase 4 ran.
 - Scene-split (fold) digest: `25f0c03f72d58cc8e3ff2d8d4123241f6459d4ed50d3c303c5dc108bb0e19865`
   over the three folds in `src/lot/phase5_folds.py`, asserted against the
   executable rule by `tests/test_phase5_folds.py`.
-- Architecture and training-config digest: recorded in `configs/phase5.yaml`
-  and re-derived by `check`. See that file for every frozen value.
+- Architecture and training-config digest:
+  `19d903812e4c366693717e48e81dba938cd5b87e94ead1d90bab8a38cba03ce1`
+  over the model, training, tiny-overfit, and primary-level sections of
+  configs/phase5.yaml, asserted by tests/test_phase5_config.py. It excludes
+  the output paths, because moving a directory does not change what was
+  measured. Predictor parameter count 16,680,960, also asserted.
 
 ## Cluster-resident, filled by `run_phase5.sh check`
 

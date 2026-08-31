@@ -106,8 +106,13 @@ def check_affine(eval_dir: Path, ladder: list[dict]) -> tuple[bool, list[str]]:
         per_path[row["path"]] = value
     for path_name, value in sorted(per_path.items()):
         notes.append(f"    pairs in scope with no affine arm on {path_name}: {value}")
-    notes.append("    those two differ by path because a pair can be scored "
-                 "at one level and not another; the fit itself does not")
+    run_total = {r.get("affine_arms_absent_run_total") for r in ladder
+                 if r.get("affine_arms_absent_run_total") is not None}
+    if run_total:
+        notes.append(f"    (pair, path) slots with no affine arm, run total: "
+                     f"{sorted(run_total)[0]}")
+    notes.append("    the last two are path dependent because a pair can be "
+                 "scored at one level and not another; the fit is not")
     return True, notes
 
 

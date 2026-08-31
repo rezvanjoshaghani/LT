@@ -1281,7 +1281,10 @@ def main(argv: list[str] | None = None) -> None:
             f"subset matched; first {exclusions['mask_mismatch_examples'][:1]}"
         )
     if exclusions["affine_arms_absent"]:
-        print(f"affine arms absent (failed fits): "
+        # (scene, pair, path) slots with no affine arm. Not a fit-failure
+        # count: the fit is per context image and path independent, and the
+        # run records carry it as affine_failed_pairs.
+        print(f"affine arms absent, per (pair, path): "
               f"{exclusions['affine_arms_absent']}")
 
     ladder = ladder_table(records, analysis, exclusions["affine_arms_absent"])

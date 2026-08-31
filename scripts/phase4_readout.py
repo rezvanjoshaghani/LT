@@ -150,6 +150,32 @@ def main() -> None:
                   f"lowtex-hightex {fmt(row.get('lowtex_minus_hightex_tax'))} "
                   f"{interval(row, 'lowtex_minus_hightex_tax')}")
 
+    print()
+    print("--- ORBIT JOINT GRID (4.7: rotation adds no tax at fixed parallax) ---")
+    joint = [b for b in bins if b["axis"] == "rotation_bin x parallax_bin"
+             and b["metric"] == metric and b["path"] == "per_point"]
+    for level in ("none", "scene", "image", "affine"):
+        rows = [b for b in joint if b["level"] == level]
+        if not rows:
+            continue
+        pbins = sorted({b["bin"].split(" x ")[1] for b in rows})
+        rbins = sorted({b["bin"].split(" x ")[0] for b in rows})
+        print()
+        print(f"  level {level}: depth_tax, rows rotation / cols parallax")
+        print(f"    {'':9s}" + "".join(f"{p[:13]:>15s}" for p in pbins))
+        for rlabel in rbins:
+            cells = []
+            for plabel in pbins:
+                row = next((b for b in rows if b["bin"] == f"{rlabel} x {plabel}"), None)
+                if row is None:
+                    cells.append(f"{'':>15s}")
+                    continue
+                mark = "*" if not row.get("supported") else " "
+                cell = f"{fmt(row.get('depth_tax'), 7)}{mark} n={row.get('n_camera_pairs')}"
+                cells.append(f"{cell:>15s}")
+            print(f"    {rlabel:9s}" + "".join(cells))
+    print("    * unsupported cell")
+
     print("\n--- NEAR-ZERO DISCLOSURE " + "-" * 53)
     cases: dict[str, int] = {}
     for entry in near_zero:

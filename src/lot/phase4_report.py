@@ -695,11 +695,17 @@ def ladder_table(
         scoped = [r for r in records if regime is None or r["regime"] == regime]
         # Attempted counts are the scope's own. A run-wide total reused per
         # regime reported failures that never happened in that regime.
+        #
+        # The denominator is every camera pair the scope scored at any level,
+        # not the pairs the unaligned level happened to score. Under nonzero
+        # translation a pair's landing set moves with the alignment scale
+        # (Amendment A5), so the unaligned level is not a superset of the
+        # affine one: using it as the denominator reported more affine pairs
+        # contributing than were attempted, and floored every failure count
+        # to zero.
         attempted = {
             key: len({r["camera_pair"] for r in cell})
-            for key, cell in group_by(
-                [r for r in scoped if r["level"] == "none"], ("metric", "path")
-            ).items()
+            for key, cell in group_by(scoped, ("metric", "path")).items()
         }
         affine_seen: set[tuple] = set()
         for key, cell in sorted(group_by(scoped, ("metric", "path", "level")).items()):
@@ -892,6 +898,11 @@ def cross_path_disclosure(
                 )
                 for name, values in draws.items()
             }
+            # A cell enters the disclosure only when at least one path puts
+            # the quantity inside the operator band; a cell large on both
+            # paths is an ordinary reported effect and needs no disclosure.
+            # That filter makes "neither in band" unreachable here, so the
+            # remaining cases are exhaustive over what survives it.
             in_band = [abs(m_pp) <= band, abs(m_sp) <= band]
             if not any(in_band):
                 continue
@@ -908,9 +919,6 @@ def cross_path_disclosure(
                     "an effect present under both evaluation paths whose "
                     "magnitude is path-sensitive"
                 )
-            elif same_sign and excludes:
-                case = "neither_in_band"
-                sentence = ""
             else:
                 case = "not_robust"
                 sentence = (
@@ -1282,8 +1290,17 @@ def main(argv: list[str] | None = None) -> None:
     figure3_orbit(bins, Path(out_dir) / "figures" / "phase4_figure3_orbit.png", analysis)
     figure4_localization(ladder, Path(out_dir) / "figures" / "phase4_figure4_localization.png")
     print(f"tables and figures -> {out_dir}")
-    flagged = [d for d in disclosure if d["case"] != "neither_in_band"]
-    print(f"near-zero disclosure: {len(flagged)} flagged cells -> phase4_near_zero.json")
+    # Every disclosed cell is one the band filter admitted, so the count is
+    # the list's own length; the earlier filter here tested a case that the
+    # filter upstream had already made unreachable.
+    kinds: dict[str, int] = {}
+    for entry in disclosure:
+        kinds[entry["case"]] = kinds.get(entry["case"], 0) + 1
+    detail = ", ".join(f"{kind} {count}" for kind, count in sorted(kinds.items()))
+    print(
+        f"near-zero disclosure: {len(disclosure)} flagged cells "
+        f"({detail}) -> phase4_near_zero.json"
+    )
 
 
 def ladder_with_axis(ladder: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:

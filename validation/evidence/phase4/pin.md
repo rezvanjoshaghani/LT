@@ -399,3 +399,24 @@ outputs/phase4_rung1/figures/phase4_figure1_tax_vs_parallax.png and
 phase4_figure4_localization.png, regenerable from the tables alone.
 Results and the two recorded anomalies are in FINDINGS.md under Phase 4
 rung 1.
+
+## Acceptance conditions verified, 2026-08-30
+
+scripts/phase4_acceptance_check.py, run against the regenerated tables,
+passes all five. The 4.4 transport-valid invariant holds over 33,730
+(pair, path) groups with none differing. Affine fits that failed, from
+the context-image calibration and independent of path, number 215 over
+18 scenes; the per-path arms-absent counts are 215 on splat and 236 on
+per-point, the 21-pair excess being pairs whose fit succeeded and whose
+per-point path then scored nothing at that level, and the 453 run total
+is those two summed. Both metrics cover the same 32 ladder and 248 bin
+cells. The bootstrap ran at 1000 resamples, seed 20260825, confidence
+0.95, with scene and camera-pair intervals on all 64 ladder rows.
+Validator 2.3 stands at PASS.
+
+The near-zero disclosure decomposes to 169 selection-differential cells,
+55 depth-tax cells and 1 estimated-margin cell; 96 of the 225 sit in
+pure rotation where the tax is zero by invariant. Outside rotation only
+7 depth-tax cells are near the operator band, and the translation depth
+tax never enters the disclosure at any multiplicative level, so both
+paths put it outside the band there.

@@ -1,0 +1,127 @@
+# PLAN Phase 5 / Rung 2: the learned-versus-explicit transformation limitation.
+#
+# Every value below is frozen before any Phase 5 model is trained and before any
+# Phase 5 test metric exists. Nothing here may be revised in response to a test
+# outcome; a test-driven change to any of it invalidates the affected run under
+# Stream S step 9.
+#
+# Order on the cluster, each mode gated on a clean worktree:
+#   ./scripts/run_phase5.sh check      # pins, hashes, folds, config digest, suite
+#   ./scripts/run_phase5.sh gates      # Stream R on real pure-rotation pairs
+#   ./scripts/run_phase5.sh tiny       # Stream U step 14, the overfit gate
+#   sbatch --array 0-8 scripts/phase5_train.sbatch configs/phase5.yaml
+#   ./scripts/run_phase5.sh controls   # Stream U step 17, pose and depth shuffle
+#   ./scripts/run_phase5.sh evaluate   # Streams V and W
+#   ./scripts/run_phase5.sh report     # Stream AC tables and figures
+
+experiment_name: phase5_rung2
+renders_root: data/replica_renders
+cache_root: cache/features
+output_root: outputs
+feature_encoder: dinov2_vitb14
+depth_encoder: vggt_1b
+# The Phase 3 run whose provenance-validated global mean vector is reused, so
+# the centering statistic and the floors are identical to Phase 3 and Phase 4.
+mean_vector_dir: outputs/experiment_zero
+# The accepted Phase 4 run whose context-image-scale scored-cell masks define
+# the secondary operational support and the formulation-diagnostic population.
+phase4_dir: outputs/phase4_rung1
+analysis_config: configs/analysis.yaml
+
+# --- Stream Q: geometry condition -------------------------------------------
+# Phase 4 Level 2, context-image oracle scale, applied to the context frame's
+# map. Recomputed by calling lot.phase4.frame_calibration and
+# lot.phase4.aligned_depth, so both headline methods consume values identical
+# to Phase 4's by construction rather than by comparison.
+primary_alignment_level: image
+# Predeclared, run only after the primary result is frozen and interpreted.
+sensitivity_alignment_levels: [affine]
+# Optional systems diagnostic, secondary, never replaces the primary.
+diagnostic_alignment_levels: [none]
+
+# --- Stream T step 12: the frozen architecture ------------------------------
+model:
+  name: predict_with_depth
+  d_model: 384
+  n_blocks: 6
+  n_heads: 6
+  ffn_dim: 1536
+  dropout: 0.1
+  # DINOv2 ViT-B/14 feature width. The output projection returns this.
+  feature_dim: 768
+  # Context tokens carry the frozen feature, a learned 2D positional embedding,
+  # a depth embedding, and depth validity. The depth embedding consumes every
+  # aligned depth pixel of the patch, as a learned 14x14 filter over log depth
+  # plus its validity plane: 196 + 196 inputs. It computes no target-space
+  # projective geometry, which is the line Stream T step 11 draws.
+  depth_embedding: log_depth_patch_pixels_with_validity
+  # Camera parameterization, frozen numerically: the 9 entries of the relative
+  # rotation, the 3 of the relative translation in meters, its norm, and the
+  # four normalized intrinsics of each camera as (fx/W, fy/H, cx/W, cy/H).
+  camera_features: 21
+  camera_encoding: mlp_2layer
+  # One learned query per target patch coordinate, carrying a learned target 2D
+  # positional embedding and the global camera vector. No target image content.
+  target_query: learned_per_patch_position
+  # The network predicts centered features. Raw-cosine evaluation adds the
+  # frozen Phase 3 global mean back before scoring.
+  predict_centered: true
+  # Persisted per Stream T step 12, and asserted by tests/test_predictors.py so
+  # a silent widening of the trunk fails the suite rather than the review.
+  parameter_count: 16680960
+
+# --- Stream U step 15: the frozen training configuration --------------------
+training:
+  optimizer: adamw
+  learning_rate: 3.0e-4
+  weight_decay: 0.05
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  grad_clip_norm: 1.0
+  # Pairs per optimizer step. Every supported sample of a pair contributes to
+  # that pair's loss, so the effective supervision per step is far larger than
+  # the pair count; effective_batch_pairs records the product with accumulation.
+  batch_pairs: 8
+  grad_accumulation_steps: 1
+  effective_batch_pairs: 8
+  max_steps: 20000
+  warmup_steps: 500
+  scheduler: cosine
+  final_learning_rate: 3.0e-5
+  # float32 storage. TF32 matmuls are permitted because the training arithmetic
+  # is not part of any measurement identity; every evaluation path runs under
+  # the frozen float32 contract regardless of what trained the weights.
+  precision: fp32
+  allow_tf32: true
+  validation_every_steps: 500
+  # Patience counted in validations, not steps.
+  early_stopping_patience: 10
+  checkpoint_selection: best_validation_centered_cosine
+  seeds: [0, 1, 2]
+  # Stream T step 13. Supervision is scored where the fair explicit comparator
+  # can attempt the map and ground truth can referee it, read at exactly the
+  # locations evaluation reads, so no train-versus-test readout mismatch exists.
+  loss: one_minus_centered_cosine
+  supervision: context_lift_landings_gt_covisible
+
+# --- Stream U step 14: the tiny-subset overfit gate -------------------------
+# Frozen before the gate is run. Failure is a stop: a predictor that cannot
+# represent the mapping on eight pairs cannot support any scientific reading of
+# its underperformance at scale.
+tiny_overfit:
+  n_pairs: 8
+  # Drawn from training scenes only, spanning the three camera regimes.
+  regimes: [rotation, translation, orbit]
+  threshold_centered_cosine: 0.98
+  max_steps: 2000
+  seed: 0
+
+# --- Stream U step 17: input-use controls ----------------------------------
+# Diagnostics on validation scenes, never acceptance thresholds.
+controls:
+  pose_shuffle: true
+  depth_shuffle: true
+  seed: 20260830
+
+seed: 0

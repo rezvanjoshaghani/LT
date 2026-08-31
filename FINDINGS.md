@@ -298,6 +298,13 @@ otherwise; the tables carry raw and both paths. Evidence:
 outputs/phase4_rung1/tables/phase4_ladder.parquet, phase4_bins.parquet,
 phase4_near_zero.json.
 
+Phase 4 accepted 2026-08-30. PLAN.md asks for the ladder's first two
+rungs plotted together and an error-localization visualization; both
+exist and regenerate from the tables alone. Addendum E closed with it:
+validator 2.3 reproduced apartment_0 row by row (930 pairs, zero mask
+and count mismatches, worst residual 5.1e-07 against 1e-4), and the
+PROTOCOL 3.1 real-weight encoder tests passed on GPU.
+
 ### The pure-rotation invariant holds as a measurement, not only as a gate
 
 In-place rotation pays a depth tax of exactly 0.0000 at every alignment

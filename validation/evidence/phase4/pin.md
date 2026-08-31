@@ -374,3 +374,28 @@ over the records. Each field still accumulates in record order, so that
 one is bit identical.
 
 Tests: 279 passed, 3 skipped.
+
+## Addendum E closed, 2026-08-30
+
+Both closure items pass. Validator 2.3: PASS on apartment_0, 930 pairs,
+9300 rows, zero mask and count mismatches, worst metric residual 5.1e-07
+against the frozen 1e-4. Encoder smoke on a GPU node inside an
+allocation: 3 passed, the PROTOCOL 3.1 permanent real-weight tests,
+DINOv2 grid orientation and shape, VGGT sees one frame at a time, and
+VGGT batching does not mix frames. Evidence:
+outputs/phase4_rung1/evidence/encoder_smoke.txt and
+validation/evidence/reaudit/borah_check_2_3.json.
+
+The first smoke attempt failed for a reason outside the repository: srun
+inherited the interactive session's task count and started sixteen copies
+of the suite on one device, which exhausted its memory before VGGT
+loaded. Rerun with an explicit single task, it passes. The runbook now
+carries the flag.
+
+Phase 4 rung 1 is complete. PLAN.md's acceptance for this phase is the
+first two ladder rungs plotted together and an error-localization
+visualization; both exist as
+outputs/phase4_rung1/figures/phase4_figure1_tax_vs_parallax.png and
+phase4_figure4_localization.png, regenerable from the tables alone.
+Results and the two recorded anomalies are in FINDINGS.md under Phase 4
+rung 1.

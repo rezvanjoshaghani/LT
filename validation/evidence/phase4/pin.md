@@ -342,3 +342,35 @@ Tests: 277 passed, 3 skipped.
 Expected on the rerun: gates PASS 18 of 18 with forced residuals exactly
 zero, flip counts of order zero to a few per pair reported in the
 evidence, and the coordinate and per-point score gates unchanged.
+
+## Reporting-layer bootstrap vectorization, 2026-08-30
+
+The 18-scene evaluation array completed and the figures step was
+intractable: 2,221,455 rows, 266,808 paired records, and roughly 16,675
+camera pairs. The camera-pair bootstrap ran a Python loop over units per
+replicate, at 153 s per pooled cell measured at that shape, which put the
+whole reporting step at hours. The scene bootstrap over 18 units was
+0.1 s and never mattered.
+
+The bootstrap is now vectorized: per-unit sums and counts become arrays
+once per cell, a block of replicates becomes a multiplicity matrix, and
+sum-of-sums over sum-of-counts is two matrix products. Measured 0.55 s
+for the 16,675-unit cell, 278 times faster.
+
+Nothing about the resample changed. The draw is still successive
+integers(0, n, size=n) from a generator seeded with bootstrap_seed; a
+batched call reproduces that stream bit for bit, pinned by a test at
+three sizes. The matmul accumulates in a different order from sequential
+Python addition, so replicate means agree to floating-point rounding
+rather than bit for bit; the same test pins the agreement at 1e-9
+relative against a reference loop, and a second test pins that an
+all-empty cell resamples to nan rather than to zero over zero. Point
+estimates are untouched: they still come from pooled_means. No table,
+figure, or threshold existed before this change, so nothing published
+moved.
+
+weighted_means was also restructured from one pass per field to one pass
+over the records. Each field still accumulates in record order, so that
+one is bit identical.
+
+Tests: 279 passed, 3 skipped.

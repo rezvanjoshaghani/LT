@@ -882,6 +882,60 @@ def test_a_mislabelled_rotation_pair_trips_the_coordinate_gate(phase4_run):
     cache.close()
 
 
+def test_bootstrap_vectorization_reproduces_the_reference_loop():
+    """The vectorized bootstrap resamples the same units and means the same.
+
+    Two contracts, both load bearing. The draw: one batched integers call
+    must reproduce the stream of successive per-replicate calls exactly, or
+    the resample itself would have changed. The arithmetic: a replicate's
+    mean is sum-of-sums over sum-of-counts, so the multiplicity matmul must
+    agree with the straightforward loop to floating-point rounding.
+    """
+    from lot.phase4_report import FIELDS, bootstrap_means, pooled_means
+
+    rng = np.random.default_rng(11)
+    for n_units, resamples in ((3, 64), (37, 128), (260, 300)):
+        aggregates = {
+            f"u{i:04d}": {
+                field: (float(rng.normal(scale=5.0)), int(rng.integers(1, 40)))
+                for field in FIELDS
+            }
+            for i in range(n_units)
+        }
+        # A unit with nothing finite in it, which the reference divides as
+        # zero over zero and the vectorized form has to call nan too.
+        aggregates["u9999"] = {field: (0.0, 0) for field in FIELDS}
+        units = sorted(aggregates, key=repr)
+        seed = 20260825
+
+        reference = []
+        loop_rng = np.random.default_rng(seed)
+        for _ in range(resamples):
+            picked = [units[i] for i in loop_rng.integers(0, len(units), size=len(units))]
+            reference.append(pooled_means(aggregates, picked))
+        got = bootstrap_means(aggregates, units, resamples, seed, chunk=64)
+
+        assert got.shape == (resamples, len(FIELDS))
+        for replicate, expected in enumerate(reference):
+            for column, field in enumerate(FIELDS):
+                a, b = expected[field], float(got[replicate, column])
+                if math.isnan(a):
+                    assert math.isnan(b), (n_units, replicate, field)
+                else:
+                    assert abs(a - b) <= 1e-9 * max(1.0, abs(a)), (
+                        n_units, replicate, field, a, b
+                    )
+
+
+def test_bootstrap_all_empty_unit_gives_nan_not_zero():
+    """A cell whose every unit is empty must resample to nan, not to 0/0=0."""
+    from lot.phase4_report import FIELDS, bootstrap_means
+
+    aggregates = {f"u{i}": {field: (0.0, 0) for field in FIELDS} for i in range(4)}
+    got = bootstrap_means(aggregates, sorted(aggregates), 8, 1)
+    assert np.isnan(got).all()
+
+
 def test_report_ladder_from_the_fixture(phase4_run):
     from lot.phase4_report import build_records, ladder_table, quantity_formulas
 

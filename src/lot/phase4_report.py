@@ -421,16 +421,22 @@ def weighted_means(records: Sequence[dict]) -> dict[str, float]:
     between the weighted and unweighted numbers measures how much of a
     reported quantity rides on that weighting.
     """
-    out: dict[str, float] = {}
-    for field in FIELDS:
-        total, weight = 0.0, 0.0
-        for record in records:
+    totals = {field: 0.0 for field in FIELDS}
+    weights = {field: 0.0 for field in FIELDS}
+    # One pass over the records rather than one pass per field. Each field
+    # still accumulates its own values in record order, so the arithmetic is
+    # unchanged; only the loop nesting is.
+    for record in records:
+        weight = record["n"]
+        for field in FIELDS:
             value = record[field]
             if isinstance(value, (int, float)) and math.isfinite(value):
-                total += float(value) * record["n"]
-                weight += record["n"]
-        out[field] = total / weight if weight else float("nan")
-    return out
+                totals[field] += float(value) * weight
+                weights[field] += weight
+    return {
+        field: (totals[field] / weights[field] if weights[field] else float("nan"))
+        for field in FIELDS
+    }
 
 
 def pooled_means(
@@ -446,6 +452,66 @@ def pooled_means(
             count += scene_count
         means[field] = total / count if count else float("nan")
     return means
+
+
+def aggregate_arrays(
+    aggregates: dict[Any, dict[str, tuple[float, int]]], units: Sequence[Any]
+) -> tuple[np.ndarray, np.ndarray]:
+    """One cell's per-unit sums and counts as [n_units, n_fields] arrays."""
+    sums = np.zeros((len(units), len(FIELDS)), dtype=np.float64)
+    counts = np.zeros((len(units), len(FIELDS)), dtype=np.float64)
+    for row, unit in enumerate(units):
+        fields = aggregates[unit]
+        for column, field in enumerate(FIELDS):
+            total, count = fields[field]
+            sums[row, column] = total
+            counts[row, column] = count
+    return sums, counts
+
+
+def bootstrap_means(
+    aggregates: dict[Any, dict[str, tuple[float, int]]],
+    units: Sequence[Any],
+    resamples: int,
+    seed: int,
+    chunk: int = 256,
+) -> np.ndarray:
+    """Every replicate's field means for one cell. [resamples, n_fields].
+
+    The draw is exactly the one a per-replicate loop makes: successive
+    integers(0, n, size=n) calls from a generator seeded once. Drawing them
+    in one batched call reproduces that stream bit for bit, which the suite
+    pins, so vectorizing changes which arithmetic runs and not which units
+    are resampled.
+
+    A replicate's mean is sum-of-sums over sum-of-counts, and a resample is
+    a multiplicity vector over the units, so a whole block of replicates is
+    two matrix products instead of a Python loop over units. That is the
+    difference between a second and three minutes for a cell holding every
+    camera pair in the study, and the bootstrap is otherwise the dominant
+    cost of the entire reporting layer.
+
+    The matmul accumulates in a different order from sequential Python
+    addition, so replicate means agree with the loop to floating-point
+    rounding rather than bit for bit; the suite pins the agreement.
+    """
+    sums, counts = aggregate_arrays(aggregates, units)
+    n_units = len(units)
+    rng = np.random.default_rng(seed)
+    picks = rng.integers(0, n_units, size=(resamples, n_units))
+    out = np.empty((resamples, len(FIELDS)), dtype=np.float64)
+    for start in range(0, resamples, chunk):
+        block = picks[start : start + chunk]
+        rows = block.shape[0]
+        flat = block + (np.arange(rows) * n_units)[:, None]
+        multiplicity = np.bincount(
+            flat.reshape(-1), minlength=rows * n_units
+        ).reshape(rows, n_units).astype(np.float64)
+        total = multiplicity @ sums
+        weight = multiplicity @ counts
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[start : start + rows] = np.where(weight > 0, total / weight, np.nan)
+    return out
 
 
 def quantity_formulas(analysis: AnalysisConfig) -> dict[str, Callable[[dict[str, float]], float]]:
@@ -545,11 +611,12 @@ def cell_summary(
     for unit, prefix in (("scene", ""), ("camera_pair", "pair_")):
         aggregates_u = aggregates if unit == "scene" else unit_aggregates(records, unit)
         units = sorted(aggregates_u, key=repr)
-        rng = np.random.default_rng(analysis.bootstrap_seed)
+        replicates = bootstrap_means(
+            aggregates_u, units, analysis.bootstrap_resamples, analysis.bootstrap_seed
+        )
         draws: dict[str, list[float]] = {name: [] for name in with_ci}
-        for _ in range(analysis.bootstrap_resamples):
-            picked = [units[i] for i in rng.integers(0, len(units), size=len(units))]
-            means = pooled_means(aggregates_u, picked)
+        for row in replicates:
+            means = dict(zip(FIELDS, row))
             for name in with_ci:
                 value = formulas[name](means)
                 if math.isfinite(value):

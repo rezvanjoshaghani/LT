@@ -68,10 +68,12 @@ def ladder_block(ladder, scope, metric, path):
             f"{fmt(row.get('selection_differential'), 9)} "
             f"{'y' if row.get('supported') else 'n'}"
         )
-        if row["level"] == "affine" and row.get("affine_pairs_attempted") is not None:
-            print(f"      affine fits: {row.get('affine_pairs_contributed')} of "
-                  f"{row.get('affine_pairs_attempted')} contributed, "
-                  f"{row.get('affine_pairs_failed')} failed")
+        if row["level"] == "affine" and row.get("affine_pairs_in_scope") is not None:
+            print(f"      affine arm: {row.get('affine_pairs_contributed')} of "
+                  f"{row.get('affine_pairs_in_scope')} pairs in scope, "
+                  f"{row.get('affine_pairs_not_contributing')} without one "
+                  f"(failed fit or no scored cells on this path; the "
+                  f"path-independent fit-failure count is in the run records)")
 
 
 def bins_block(bins, regime, axis, metric, path, level_filter=None):

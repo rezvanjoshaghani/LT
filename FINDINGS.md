@@ -287,6 +287,193 @@ the implementation selected the conversion per scene, so one checkpoint could
 have carried two depth semantics inside one table. No Phase 4 scientific
 output had been produced when the stop fired, so nothing required discarding.
 
+## Phase 4 rung 1: the estimated-geometry tax (2026-08-30)
+
+Run: 18 scenes, 16,884 camera pairs, 2,221,455 rows, 266,808 paired
+records, evaluated on the inherited Phase 3 population and reconciled row
+by row against it. The 4.5 gates passed on all 18 scenes under Amendment
+A7 with the forced identity gap exactly zero at every alignment level.
+Numbers are centered cosine; the tables carry raw as well, and both
+evaluation paths. Evidence: outputs/phase4_rung1/tables/, and
+scripts/phase4_acceptance_check.py re-verifies the acceptance conditions
+from the shipped artifacts.
+
+Phase 4 accepted 2026-08-30. PLAN.md asks for the ladder's first two
+rungs plotted together and an error-localization visualization; both
+exist and regenerate from the tables alone. Addendum E closed with it:
+validator 2.3 reproduced apartment_0 row by row (930 pairs, zero mask and
+count mismatches, worst residual 5.1e-07 against 1e-4), and the PROTOCOL
+3.1 real-weight encoder tests passed on GPU.
+
+A tax is reported here against the transportable signal it is a tax on,
+not as a bare score difference. The margin available in a cell is the
+matched Oracle ceiling minus the matched No-Warp-Copy floor, and the
+retained fraction is the share of that margin the estimated-depth method
+keeps. An absolute tax of 0.03 means different things against a margin of
+0.12 and a margin of 0.5, and the ladder's cells differ in exactly that.
+
+### The pure-rotation control is the cleanest result in the phase
+
+In-place rotation pays a depth tax of exactly 0.0000 at every alignment
+level, on 4,108 camera pairs, with retained fraction 1.0000 and
+transported fraction 1.0000, and it stays exactly zero in every rotation
+bin from 0-10 through 50-plus degrees. The A7 forced identity gap is
+exactly zero at all four levels. The splat path reads -0.0001 uniformly,
+the unforced rasterization tax of A7.
+
+This is not only an implementation check. It establishes the conceptual
+decomposition the study rests on: depth enters through translational
+parallax, rather than different depth numbers producing different feature
+scores by some other route. It is the correctness statement to lead with.
+
+### Native VGGT depth is bad, and almost all of it is scale
+
+Scene-level oracle scale removes about 84 percent of the native tax under
+translation (0.2690 to 0.0444 per-point, 0.2548 to 0.0405 splat) and
+about 78 percent under orbit (0.2425 to 0.0500, 0.2431 to 0.0527). At no
+alignment the retained fraction is negative, -1.24 for translation
+per-point: transporting features with natively scaled VGGT depth scores
+below the No-Warp-Copy floor, so it is worse than not transporting at
+all. Reporting raw estimated depth without calibration would therefore
+overstate the failure of estimated geometry by a large factor, and most
+of what it measured would be scale ambiguity rather than structure.
+
+### After calibration a real residual remains, and its size depends on which question is asked
+
+Translation, after context-image scale: the per-point tax is 0.0305
+[0.0259, 0.0354] against a margin of 0.1209, which retains 75 percent;
+the splat-pool tax is 0.0113 [0.0080, 0.0148] against a margin of 0.1233,
+which retains 91 percent. Under orbit the split is wider: per-point 0.0497
+retaining 64 percent, splat-pool 0.0143 retaining 90 percent. Affine
+preserves the split (0.0296 against 0.0087 under translation).
+
+The two paths ask related but different questions. The per-point path
+asks how wrong individual transported correspondences are. The splat path
+asks how much of that error survives the rasterize-and-pool operator that
+a system would actually run. The depth is identical in both; the operator
+is more tolerant than the correspondence. That is a result about operator
+robustness, and it should not be described as better depth or summarized
+into one number for the phase.
+
+### The parallax structure is the main scientific figure
+
+Translation, per-point, after context-image scale, by parallax bin:
+0.0039, 0.0060, 0.0166, 0.0641, 0.0747. The affine row is nearly
+identical: 0.0028, 0.0049, 0.0150, 0.0643, 0.0729. There is a clear
+transition between the 0.1-0.2 and 0.2-0.4 bins, 0.0166 to 0.0641.
+
+So the pooled 0.0305 averages two regimes rather than describing one. At
+low parallax the calibrated tax is nearly negligible; at high parallax it
+is not, and calling the overall figure small would hide that. Read with
+the rotation control, the causal structure is strong: zero tax where
+projection does not depend on depth, and a tax that grows sharply where
+it does.
+
+### Affine adds almost nothing, so the residual is structural
+
+Adding a fitted shift to the per-image scale moves the per-point tax from
+0.0305 to 0.0296 under translation and from 0.0497 to 0.0488 under orbit.
+On the splat path the relative change is larger but the absolute change
+is about 0.0025. Once a per-image multiplicative scale is fixed, an
+additive bias explains essentially none of the remaining correspondence
+error: what is left is structural depth error, not a calibration the
+ladder failed to apply.
+
+### Depth boundaries carry more of the tax, after image-level calibration
+
+Boundary minus interior is +0.0051 [+0.0020, +0.0081] under translation
+and +0.0146 [+0.0107, +0.0186] under orbit at context-image scale, with
+affine essentially the same. The one exception is translation at scene
+scale, +0.0028 [-0.0009, +0.0065], whose interval includes zero, so the
+claim is about image-level calibration and not about every level. This is
+where depth error is expected to break correspondence: occlusion
+boundaries, thin geometry, sharp transitions.
+
+### Anomaly against PLAN.md: low-texture surfaces pay less, not more
+
+PLAN.md expects the drop concentrated at depth edges and low-texture
+surfaces. Low texture goes the other way, with intervals excluding zero:
+low-texture minus high-texture is -0.0120 [-0.0143, -0.0094] under
+translation and -0.0283 [-0.0330, -0.0241] under orbit at context-image
+scale. High-texture regions carry more feature-transport tax.
+
+Nothing was tuned in response, and the result is not evidence that VGGT
+depth is worse in textured regions. What is measured is feature-transport
+tax, not metric depth error. The reading that fits is
+
+    transport tax = geometric error times local feature sensitivity,
+
+because DINOv2 features on a blank wall barely change under a two-pixel
+misregistration while features on a detailed edge change substantially.
+If that is right, the contrast localizes where the metric can see error
+rather than where depth estimation is worst, which is a different and
+more interesting statement than the preregistered one. It remains a
+hypothesis: testing it needs depth error itself, or reprojection
+displacement, measured by texture class. That analysis is frozen nowhere
+and would be exploratory and non-gating.
+
+### The orbit expectation is not supported at this conditioning
+
+PROTOCOL 4.7 predicts that after controlling for parallax, rotation adds
+little further depth-estimation tax. The joint grid shows substantial
+residual structure instead. In the 0.4-plus parallax column at
+context-image scale the tax runs 0.0324, 0.0708, 0.0808, 0.0807, 0.0887
+as rotation rises, and scene scale runs 0.0289, 0.0400, 0.0684, 0.0781,
+0.0871.
+
+The supported conclusion is about the conditioning, not about rotation:
+pair-level median parallax does not fully explain the orbit geometry tax,
+and the preregistered expectation of little residual rotation dependence
+is not supported by this grid. It does not license the conclusion that
+rotation causes additional depth tax. The conditioning variable is a
+single scalar, median baseline over depth, and within a bin, especially
+the open-ended top bin, pairs still differ in true parallax magnitude,
+translation direction, depth distribution, visibility, and where the
+geometry sits in frame. The sign of the rotation trend reverses between
+adjacent parallax columns, which is what residual within-cell composition
+looks like. No bin edge was moved after seeing this grid. A continuous
+model in parallax and rotation would say more and would be exploratory.
+
+### Selection and coverage do not explain the result
+
+After calibration the selection differential is a few thousandths:
+translation at image scale is -0.0021 per-point and -0.0002 splat, orbit
+-0.0025 and -0.0002. The matched Oracle ceiling barely moves when
+estimated-depth validity filters the population, so the tax is not an
+artifact of estimated depth discarding the difficult points. This is what
+the matched-ceiling machinery was built for and it worked.
+
+Coverage rises with calibration rather than trading against quality: the
+transported fraction goes from roughly 0.76-0.86 natively to roughly
+0.93-0.995 after calibration. One distinction must be kept explicit,
+because the numbers invite the wrong reading. The transported fraction is
+the landing-dependent scored set, which Amendment A5 permits to move with
+scale under nonzero translation, since scaling depth moves where a point
+lands. The 4.4 invariant is asserted on the source transport-valid set,
+finite and positive depth, which positive scaling provably cannot change;
+the evaluation layer asserted set equality per pair at run time and the
+acceptance check re-verifies the persisted counts. Reading 0.8064 to
+0.9660 to 0.9677 as a Step 10 failure would be reading the wrong set.
+
+### Accounting, stated precisely
+
+The affine fit is computed once per context image, before any evaluation
+path, so its failures are path independent; the run records carry that
+count as affine_failed_pairs. The ladder's per-scope column is a
+different quantity, pairs the scope scored at some level and not at
+affine, which is path dependent because a level can have no scored cells
+on one path; it reads 236 on the per-point path and 215 on the splat
+path. An earlier version of this file called those fit failures, which
+was wrong.
+
+The near-zero disclosure flags 225 cells, 130 not robust, 92 small and
+sign-consistent under both paths, 3 path-sensitive in magnitude. That
+total should not be quoted as a summary: it mixes the pure-rotation
+zeros, which the protocol predicts as an invariant, with genuinely
+ambiguous small effects such as low-parallax calibrated tax. The
+acceptance check decomposes it by regime, level, and quantity, and that
+decomposition is what belongs in any write-up.
+
 ## Phase 3: Experiment Zero, corrected verdict (Stream D, 2026-08-27)
 
 Eighteen scenes, two frozen encoders, 33,772 comparisons, both evaluation

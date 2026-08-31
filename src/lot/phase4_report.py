@@ -719,11 +719,20 @@ def ladder_table(
                 affine_seen.add((metric, path))
                 contributed = len({r["camera_pair"] for r in cell})
                 total = attempted.get((metric, path), contributed)
-                row["affine_pairs_attempted"] = total
+                row["affine_pairs_in_scope"] = total
                 row["affine_pairs_contributed"] = contributed
-                row["affine_pairs_failed"] = max(0, total - contributed)
-                row["affine_failure_reason"] = (
-                    "fitted scale nonpositive or calibration population too small"
+                row["affine_pairs_not_contributing"] = max(0, total - contributed)
+                # Not a fit-failure count. The affine fit is computed once per
+                # context image, before any evaluation path, so its failures
+                # cannot depend on the path; the run records carry that number
+                # as affine_failed_pairs. What this column counts is pairs the
+                # scope scored at some level and not at affine, which a failed
+                # fit causes and so does a level whose scored set is empty on
+                # this path. Naming it a failure count made a path-independent
+                # quantity look path-dependent.
+                row["affine_not_contributing_reason"] = (
+                    "failed fit (nonpositive scale or too few calibration "
+                    "pixels), or no scored cells at this level on this path"
                 )
             table.append(row)
         # A scope whose every affine fit failed still owes the reader a row:
@@ -736,12 +745,12 @@ def ladder_table(
                 "analysis": scope_name, "metric": metric, "path": path,
                 "level": "affine", "n_scenes": 0, "n_camera_pairs": 0,
                 "n_feature_comparisons": 0, "supported": False,
-                "affine_pairs_attempted": total,
+                "affine_pairs_in_scope": total,
                 "affine_pairs_contributed": 0,
-                "affine_pairs_failed": total,
-                "affine_failure_reason": (
-                    "every affine fit in this scope failed: fitted scale "
-                    "nonpositive or calibration population too small"
+                "affine_pairs_not_contributing": total,
+                "affine_not_contributing_reason": (
+                    "no affine arm anywhere in this scope: every fit failed, "
+                    "or no level scored cells on this path"
                 ),
             })
     if affine_absent:

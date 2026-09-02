@@ -394,7 +394,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", type=Path, default=Path("configs/phase5.yaml"))
     parser.add_argument(
         "--mode",
-        choices=("describe", "train", "tiny", "controls", "evaluate"),
+        choices=("describe", "check", "overfit", "train", "controls", "evaluate"),
         default="describe",
     )
     parser.add_argument("--task-index", type=int, default=0)
@@ -427,9 +427,22 @@ def main(argv: list[str] | None = None) -> None:
             print(f"task {index}: fold {fold.index} seed {seed}")
         return
 
+    if args.mode == "check":
+        from .phase5_check import format_report
+        from .phase5_gate import run_integration_gate
+
+        report = run_integration_gate(cfg, analysis)
+        destination = cfg.evidence_dir / "integration_gate.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(report.to_json(), encoding="utf-8")
+        print(format_report(report))
+        print(f"\nevidence written to {destination}")
+        raise SystemExit(0 if report.passed else 1)
+
     raise SystemExit(
         f"mode {args.mode!r} needs the caches and the accepted Phase 4 artifacts, "
-        "which are cluster resident. Run it from Borah via scripts/run_phase5.sh."
+        "which are cluster resident, and is only permitted after the integration "
+        "gate passes. Run it from Borah via scripts/run_phase5.sh."
     )
 
 

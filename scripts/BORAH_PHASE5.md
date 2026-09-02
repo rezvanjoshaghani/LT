@@ -31,15 +31,28 @@ secondary operational support and the formulation-diagnostic population).
 
 Phase 5 re-encodes nothing. It consumes the existing caches.
 
-## 1. Verify the pin and the inputs
+## 1. The integration gate
 
     ./scripts/run_phase5.sh check
 
-Verifies the four frozen blobs against FREEZE.md at the freeze commit,
-enumerates the amendments, asserts a clean tree, re-reads both caches against
-their recorded digests, confirms the Phase 3 and Phase 4 measurement
-identities, recomputes the manifest-set hash, prints the fold digest and the
-architecture and training-config digests, and runs the suite.
+A hard gate with no training side effects, and the only thing permitted to run
+first. It verifies the frozen blobs against FREEZE.md, asserts a clean tree,
+prints the identities, then runs sixteen steps that connect the frozen design
+to the real artifacts: resolve and hash them, verify the real schemas against
+what the frozen loaders assume, build real scene inputs across three scene
+families, build one real example per regime and assert no forbidden field is
+reachable, check the landing-location semantics the headline rests on, build
+the primary support and prove an all-nonfinite predictor cannot move it, check
+the formulation cells, re-derive the splat-pool symmetry audit against the
+shipped source, run the real-data geometry checks, verify the folds against the
+real inventory, dry-run one real batch through forward, loss, and backward,
+probe resources against the frozen batch, prove the test seal, and complete the
+deferred pin.
+
+A failure prints the failing step, the exact evidence, and a classification:
+`missing_artifact`, `implementation_bug`, or `frozen_design_mismatch`. Only the
+last may justify touching the frozen design, and then only as an amendment with
+a written rationale.
 
 Expect: frozen blobs verified; A1 to A7 listed; Phase 3 measurement digest
 `27244e6481d521159e513f2ea8799482`; Phase 4 measurement digest
@@ -50,33 +63,18 @@ green.
 `check` is also where the cluster-resident pin fields are filled: the per-scene
 DINOv2 and VGGT cache digests, the aligned context-depth digest, and the Phase 4
 artifact hashes. It writes them to
-`outputs/phase5_rung2/evidence/pin_cluster.txt`, which is the file that closes
+`outputs/phase5_rung2/evidence/pin_cluster.json`, which is the file that closes
 the deferrals `validation/evidence/phase5/pin.md` records.
 
 A frozen-blob mismatch, a cache-digest mismatch, or a measurement-identity
 mismatch stops everything.
 
-## 2. Validate the new comparator on real geometry
+## 2. The tiny-subset overfit gate
 
-    ./scripts/run_phase5.sh gates
+    ./scripts/run_phase5.sh overfit
 
-Stream R step 6 on the real pure-rotation regime, not only on the analytic
-scenes the suite covers. For every rotation pair, Context-Lift Transport-Only's
-landing must equal the analytic rotational homography within the already-frozen
-`rotation_gate_coord_tol_px`, and must be unchanged when the depth map it is
-given is replaced by a different one, because a zero-translation map is depth
-free.
-
-This is the gate that licenses using the comparator scientifically. A failure
-is a stop: it would mean the forward map is wrong, and every headline number
-would be measuring that instead of the science.
-
-Expect: PASS on all 18 scenes, residuals far below the tolerance, and exact
-invariance to the substituted depth.
-
-## 3. The tiny-subset overfit gate
-
-    ./scripts/run_phase5.sh tiny
+Refuses to run until `check` has passed, read from the gate's own receipt
+rather than from memory.
 
 Stream U step 14. Eight pairs from training scenes only, spanning the three
 camera regimes, at the frozen threshold of centered cosine 0.98.
@@ -87,10 +85,17 @@ learning the transformation costs accuracy, and a trunk that cannot fit eight
 pairs would answer a different question. The gate makes the later comparison
 interpretable rather than making it look good.
 
-## 4. Train
+## 3. Train
+
+    ./scripts/run_phase5.sh train
+
+which submits
 
     sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
            --array 0-8 scripts/phase5_train.sbatch configs/phase5.yaml
+
+and refuses unless both the integration gate and the overfit gate have passed,
+each read from its own receipt rather than from memory.
 
 Nine tasks: three folds by three seeds. Each task trains on its fold's nine
 training scenes, selects its checkpoint on its three validation scenes by
@@ -102,7 +107,7 @@ Nothing about a test scene may influence anything here. If a training run is
 restarted, changed, or retuned in response to a test metric, that run is
 invalid under Stream S step 9 and must be discarded rather than reported.
 
-## 5. Input-use controls
+## 4. Input-use controls
 
     ./scripts/run_phase5.sh controls
 
@@ -113,7 +118,7 @@ These are diagnostics. A shuffle that barely moves the score is reported exactly
 as observed, and is evidence about whether the network uses that input. It is
 never a reason to retrain, and it is never a threshold anything must pass.
 
-## 6. Evaluate
+## 5. Evaluate
 
     ./scripts/run_phase5.sh evaluate
 
@@ -132,17 +137,18 @@ Three populations, fixed before any scoring and never merged:
 The predictor cannot narrow the primary support. A nonfinite prediction on a
 supported sample is scored as a model failure and counted, not dropped.
 
-## 7. Tables and figures
+## 6. Tables and figures
 
-    ./scripts/run_phase5.sh report
+    ./scripts/run_phase5.sh tables
+    ./scripts/run_phase5.sh figures
 
 Stream AC. The headline table, the formulation-reference table labelled as a
 diagnostic rather than an estimand, the operational splat-pool table, and the
 five figures. Every figure regenerates from the tables alone.
 
-## 8. Acceptance
+## 7. Acceptance
 
-    ./scripts/run_phase5.sh accept
+    ./scripts/run_phase5.sh acceptance
 
 Stream AD step 45, re-derived from the shipped artifacts rather than asserted.
 Every condition is checked, and any failure is a stop that forbids interpreting
@@ -163,15 +169,26 @@ rather than merely discouraging:
 
 ## Implementation status, honestly stated
 
-At the time this runbook was written, the following are implemented and covered
-by the suite: the context-lift comparator and its three validation gates, the
-folds, the predictor with both boundaries enforced by AST audit, the training
-loop with the overfit gate and the shuffle controls, the paired scene bootstrap
-proven equal to Phase 4's, the estimand layer, and the scoring core with its
-three supports.
+Implemented and covered by the suite: the context-lift comparator and its three
+validation gates, the folds, the predictor with both boundaries enforced by AST
+audit, the training loop with the overfit gate and the shuffle controls, the
+paired scene bootstrap proven equal to Phase 4's, the estimand layer, the
+scoring core with its three supports, and the sixteen-step integration gate
+with its stop machinery.
 
-The orchestration entry point `lot.phase5` that these modes call, which reads
-the caches and the Phase 4 parquets and drives the pieces above, is the
-remaining work. It cannot be validated off the cluster, because none of its
-inputs exist off the cluster; expect to debug it against real cache shapes on
-the first `check` run.
+`check` is implemented and runs. On a machine without the Borah artifacts it
+stops at step 2 with classification `missing_artifact`, naming each absent path
+and why the phase needs it, which is the correct behaviour and is how the stop
+machinery was verified off the cluster.
+
+Steps 3 through 16 have never executed against real artifacts. They are written
+against the shapes Phase 4's own code produces, and the whole point of the gate
+is that this is an assumption until it runs. Expect step 3 or step 5 to be
+where a real mismatch first appears.
+
+Not yet implemented: `overfit`, `train`, `controls`, and `evaluate` beyond their
+data assembly, and `tables`, `figures`, and `acceptance` entirely. Those last
+three refuse with an explanation rather than a stack trace, deliberately: their
+inputs are the evaluation records the gate exists to make trustworthy, so
+building them before the gate passes would be building on an unverified
+foundation.

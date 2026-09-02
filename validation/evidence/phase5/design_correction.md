@@ -89,3 +89,42 @@ population depends on it.
 Recorded before Phase 5 test outcomes were inspected. Nothing in this file was
 written, revised, or reordered after any Phase 5 result existed, because no
 Phase 5 result existed at any point before this commit.
+
+---
+
+## Reviewer confirmation, recorded verbatim
+
+Recorded 2026-09-01, still before any Phase 5 model is trained and before any
+Phase 5 test metric exists. Preserved verbatim at the reviewer's instruction,
+because these are the two statements the phase's interpretability rests on and
+paraphrasing them later would lose exactly what was confirmed.
+
+On the comparator correction:
+
+> The causal comparator correction is now real, not theoretical. The per-point
+> headline uses Context-Lift Transport-Only, while the accepted Phase-4
+> target-lift path is reference-only. That fixes the information asymmetry
+> cleanly.
+
+On the operational path:
+
+> The splat-pool arm passed the symmetry audit. That means the operational
+> secondary comparison does not need a new comparator.
+
+On landing-location scoring, the first of the two underdetermined decisions
+this document records:
+
+> Landing-location scoring: yes. Once samples are context-indexed and pushed
+> forward with context depth, the scientifically coherent target is the feature
+> at the actual landing location. Otherwise you would quietly reintroduce a
+> target-indexed correspondence assumption.
+
+On the formulation-diagnostic population, the second:
+
+> `V_form` intersecting on target patch cell: also yes. TL and CL do not share
+> the same source identity, so the target cell is the common observational unit
+> for that formulation diagnostic.
+
+Both decisions were made and committed before this confirmation was given, and
+neither was altered by it. The confirmation is recorded as review evidence, not
+as the origin of the choice.

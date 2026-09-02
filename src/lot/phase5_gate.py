@@ -30,7 +30,9 @@ from .phase5_check import (
     check_test_seal,
     describe_tensor,
     environment_identity,
-    hash_scene_artifacts,
+    aligned_depth_digest,
+    verify_mean_vector_identity,
+    verify_scene_identities,
     model_visible_fields,
     resource_probe,
     run_steps,
@@ -58,7 +60,7 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         phase5_scene_pairs,
         predictor_config_from,
     )
-    from .phase5_folds import fold_digest, frozen_folds
+    from .phase5_folds import REPLICA_SCENES, fold_digest, frozen_folds
     from .phase5_score import primary_support, score_primary
     from .predictors import build_predictor
     from .train import batch_loss
@@ -97,8 +99,10 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
     def step2() -> dict[str, Any]:
         result = step2_resolve_artifacts(cfg)
         state["artifacts"] = result.evidence["artifacts"]
-        state["scene_hashes"] = hash_scene_artifacts(cfg, PROBE_SCENES)
-        return {**result.evidence, "probe_scene_hashes": state["scene_hashes"]}
+        # Every scene the folds name, compared against the accepted identity,
+        # not a probe subset merely recorded.
+        state["scene_identities"] = verify_scene_identities(cfg, REPLICA_SCENES, "2")
+        return {**result.evidence, "scene_identities": state["scene_identities"]}
 
     def step3() -> dict[str, Any]:
         convention = load_convention_record(cfg)
@@ -133,8 +137,13 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         return schema
 
     def step4() -> dict[str, Any]:
+        # Scene inputs for every scene, not only the three probe families. The
+        # aligned context depth is a derived artifact with no accepted stored
+        # value, so it is recomputed through Phase 4's own code here and its
+        # digest recorded per scene; that is the "recomputed maps" line of the
+        # pin, and it is what the receipt binds for that input.
         summaries: dict[str, Any] = {}
-        for scene in PROBE_SCENES:
+        for scene in REPLICA_SCENES:
             first = scene == PROBE_SCENES[0]
             inputs = (
                 state["probe_inputs"] if first
@@ -148,7 +157,11 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
                     1 for c in inputs.calibrations.values() if not c.affine_failed
                 ),
                 "convention": inputs.convention,
+                "aligned_depth_digest": aligned_depth_digest(inputs),
             }
+            state["scene_identities"][scene]["aligned_depth_digest"] = (
+                summaries[scene]["aligned_depth_digest"]
+            )
             if not first:
                 inputs.close()
         conventions = {s["convention"] for s in summaries.values()}
@@ -163,6 +176,9 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
     def step5() -> dict[str, Any]:
         center = phase5_mean_vector(cfg)
         state["center"] = center
+        state["mean_vector"] = verify_mean_vector_identity(
+            center, state["scene_identities"], "5"
+        )
         inputs = state["probe_inputs"]
         pairs = phase5_scene_pairs(cfg, analysis, inputs.scene)
         per_regime: dict[str, Any] = {}
@@ -293,12 +309,55 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
                  "n_nonfinite": with_broken.n_predict_nonfinite},
             )
         state["primary_support"] = support
+
+        # The cross-path producer, run on the real pair. This is the arithmetic
+        # PROTOCOL 3.9's disclosure rests on, and it has to be seen working on
+        # real geometry rather than only on synthetic columns.
+        from .phase5_score import score_cross_path
+        from .transport import apply_transport_plan, transport_plan
+
+        est_plan = transport_plan(
+            example.depth_context_aligned, context.K.to(dtype), target.K.to(dtype), T,
+            (target.height, target.width),
+        )
+        transported = apply_transport_plan(est_plan, fc).reshape(fc.shape[0], -1)
+        # Stand-in operational support: every cell the plan gave any weight to.
+        # The accepted Phase 4 scored-cell mask replaces this in evaluate; the
+        # gate needs a real, non-empty cell set to prove the producer runs.
+        coverage = est_plan.coverage.reshape(-1) if hasattr(est_plan, "coverage") else None
+        scored_cells = (
+            np.nonzero(coverage.cpu().numpy() > 0)[0]
+            if coverage is not None else np.arange(n_cells)
+        )
+        cross = score_cross_path(
+            lift, support, scored_cells, fc, ft, center, None, transported,
+            fc.reshape(fc.shape[0], -1), ft.reshape(ft.shape[0], -1),
+            (target.height, target.width), grid,
+        )
+        if cross.n_intersect == 0:
+            raise GateStop(
+                "7", "the cross-path common-valid set is empty on a real pair",
+                FROZEN_DESIGN_MISMATCH, {"scored_cells": int(scored_cells.size)},
+            )
+        if int(cross.samples_per_cell.sum()) != int(cross.per_point_mask.sum()):
+            raise GateStop(
+                "7", "cross-path pooling lost or duplicated per-point samples",
+                IMPLEMENTATION_BUG,
+                {"pooled": int(cross.samples_per_cell.sum()),
+                 "masked": int(cross.per_point_mask.sum())},
+            )
         return {
             "counts": counts,
             "cl_centered": without.cl_centered,
             "nowarp_centered": without.nowarp_centered,
             "all_nonfinite_predictor_score": with_broken.predict_centered,
             "failures_counted": with_broken.n_predict_nonfinite,
+            "cross_path": {
+                "n_intersect": cross.n_intersect,
+                "max_samples_per_cell": int(cross.samples_per_cell.max()),
+                "x_cl_centered": cross.x_cl_centered,
+                "x_sp_transport_centered": cross.x_sp_transport_centered,
+            },
         }
 
     def step8() -> dict[str, Any]:
@@ -495,7 +554,8 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
     def step15() -> dict[str, Any]:
         pin = {
             "resolved_artifacts": state.get("artifacts", {}),
-            "probe_scene_hashes": state.get("scene_hashes", {}),
+            "scene_identities": state.get("scene_identities", {}),
+            "mean_vector": state.get("mean_vector", {}),
             "schema_summary": state.get("schema", {}),
             "implementation_commit": git_commit(),
             "split_hash": fold_digest(frozen_folds()),

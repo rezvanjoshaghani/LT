@@ -63,17 +63,27 @@ def make_records(
                 # The cross-path common-valid columns. Both paths re-scored on
                 # the cells they share, which is the population PROTOCOL 3.9's
                 # disclosure is computed on.
-                "x_cl_raw": cl + level, "x_cl_centered": cl + level,
-                "x_predict_raw": predict + level,
-                "x_predict_centered": predict + level,
-                "x_sp_transport_raw": 0.7 + level,
-                "x_sp_transport_centered": 0.7 + level,
-                "x_sp_predict_raw": 0.69 + level,
-                "x_sp_predict_centered": 0.69 + level,
+                **_intersection(cl + level, predict + level, nowarp + level,
+                                0.7 + level, 0.69 + level, 0.5 + level),
                 "n_primary": 900, "n_formulation": 700, "n_splat": 800,
                 "n_intersect": 640, "n_predict_nonfinite": 0,
             })
     return records
+
+
+def _intersection(cl, predict, nowarp, sp_transport, sp_predict, sp_nowarp) -> dict:
+    """All six cross-path arms with all four columns, cosines set and L2 finite."""
+    values = {
+        "cl": cl, "predict": predict, "nowarp": nowarp,
+        "sp_transport": sp_transport, "sp_predict": sp_predict, "sp_nowarp": sp_nowarp,
+    }
+    out = {}
+    for arm, v in values.items():
+        out[f"x_{arm}_raw"] = v
+        out[f"x_{arm}_centered"] = v
+        out[f"x_{arm}_l2_raw"] = 1.0 - v
+        out[f"x_{arm}_l2_centered"] = 1.0 - v
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +324,8 @@ def test_a_missing_second_path_can_never_reach_the_strong_wording():
     assert out["near_zero"]
     assert out["splat_pool"] is None
     assert out["wording"] == (
-        "no measurable difference at the reported scale, single path"
+        "no measurable difference at the reported scale; this quantity "
+        "has no second evaluation path by construction"
     )
     assert out["wording"] != "small, sign-consistent effect"
 
@@ -459,7 +470,7 @@ def test_the_disclosure_terms_share_one_scene_draw():
                            noise=1e-5)
     forms = quantity_formulas("centered")
     direct = paired_interval(
-        records, INTERSECTION_FIELDS, forms["path_difference"],
+        records, INTERSECTION_FIELDS, forms["path_difference_learn"],
         resamples=ANALYSIS.bootstrap_resamples, seed=ANALYSIS.bootstrap_seed,
         confidence=ANALYSIS.bootstrap_confidence,
     )
@@ -475,7 +486,11 @@ def test_the_disclosure_terms_share_one_scene_draw():
 def test_cross_path_quantities_declare_their_population():
     from lot.phase5_estimands import CROSS_PATH
 
-    for name in ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference"):
+    for name in (
+        "x_delta_learn_pp", "x_delta_learn_sp", "x_cl_margin", "x_sp_transport_margin",
+        "x_predict_margin", "x_sp_predict_margin", "path_difference_learn",
+        "path_difference_cl_margin", "path_difference_predict_margin",
+    ):
         assert QUANTITY_POPULATION[name] == CROSS_PATH
 
 
@@ -486,3 +501,76 @@ def test_an_empty_intersection_reports_an_empty_disclosure():
     cell = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS)
     assert math.isnan(cell.disclosure["per_point"]["estimate"])
     assert not cell.disclosure["near_zero"]
+
+
+# ---------------------------------------------------------------------------
+# Round-three finding 4: every interpreted effect is disclosed against its path
+# ---------------------------------------------------------------------------
+
+def test_a_small_margin_is_disclosed_against_the_splat_margin():
+    """A per-point margin inside the band must consult the operational margin."""
+    from lot.phase5_estimands import DISCLOSURE_PAIR, INTERPRETED_EFFECTS
+
+    assert "cl_margin" in DISCLOSURE_PAIR and "predict_margin" in DISCLOSURE_PAIR
+    records = make_records(n_scenes=8, pairs_per_scene=5, noise=1e-6)
+    for r in records:
+        # Per-point margin tiny and positive; splat margin large and negative.
+        r["x_cl_centered"], r["x_nowarp_centered"] = 0.5020, 0.5000
+        r["x_sp_transport_centered"], r["x_sp_nowarp_centered"] = 0.40, 0.45
+    cell = evaluate_quantity(records, "cl_margin", "centered", ANALYSIS)
+    d = cell.disclosure
+    assert d["splat_pool"] is not None, "the counterpart was not consulted"
+    assert d["per_point"]["estimate"] == pytest.approx(0.002, abs=1e-6)
+    assert d["splat_pool"]["estimate"] == pytest.approx(-0.05, abs=1e-6)
+    assert d["wording"].startswith("no claim of advantage")
+    assert "single path" not in d["wording"]
+
+
+def test_the_operational_gap_is_paired_with_the_same_disclosure_as_the_headline():
+    records = make_records(n_scenes=8, pairs_per_scene=5, noise=1e-6)
+    pp = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS).disclosure
+    sp = evaluate_quantity(records, "delta_learn_sp", "centered", ANALYSIS).disclosure
+    assert sp["splat_pool"] is not None
+    assert sp["per_point"]["estimate"] == pytest.approx(pp["per_point"]["estimate"])
+    assert sp["splat_pool"]["estimate"] == pytest.approx(pp["splat_pool"]["estimate"])
+    assert sp["wording"] == pp["wording"]
+
+
+def test_every_interpreted_effect_has_a_pair_or_is_declared_single_path():
+    from lot.phase5_estimands import (
+        DISCLOSURE_PAIR, INTERPRETED_EFFECTS, SINGLE_PATH_BY_CONSTRUCTION,
+    )
+
+    for name in INTERPRETED_EFFECTS:
+        assert name in DISCLOSURE_PAIR or name in SINGLE_PATH_BY_CONSTRUCTION, name
+    assert SINGLE_PATH_BY_CONSTRUCTION == {"delta_formulation"}
+
+
+def test_an_interpreted_effect_without_a_pair_raises_rather_than_going_single_path(monkeypatch):
+    from lot import phase5_estimands as m
+
+    monkeypatch.setattr(m, "INTERPRETED_EFFECTS", m.INTERPRETED_EFFECTS | {"cl_transport"})
+    records = make_records(n_scenes=6, pairs_per_scene=4)
+    with pytest.raises(ValueError, match="no disclosure pair"):
+        evaluate_quantity(records, "cl_transport", "centered", ANALYSIS)
+
+
+def test_the_formulation_diagnostic_names_its_single_path_as_design():
+    records = make_records(n_scenes=8, pairs_per_scene=5, noise=1e-6)
+    for r in records:
+        r["tl_form_centered"], r["cl_form_centered"] = 0.6010, 0.6000
+    cell = evaluate_quantity(records, "delta_formulation", "centered", ANALYSIS)
+    assert cell.disclosure["splat_pool"] is None
+    assert "by construction" in cell.disclosure["wording"]
+    assert cell.disclosure["wording"] != "small, sign-consistent effect"
+
+
+def test_margin_path_differences_are_their_own_paired_quantities():
+    records = make_records(n_scenes=8, pairs_per_scene=5, scene_spread=0.2, noise=1e-6)
+    for name in ("cl_margin", "predict_margin"):
+        d = evaluate_quantity(records, name, "centered", ANALYSIS).disclosure
+        diff = d["path_difference"]
+        assert math.isfinite(diff["lo"]) and math.isfinite(diff["hi"])
+        assert diff["estimate"] == pytest.approx(
+            d["per_point"]["estimate"] - d["splat_pool"]["estimate"], abs=1e-9
+        )

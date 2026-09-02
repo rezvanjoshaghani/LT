@@ -85,11 +85,10 @@ SPLAT_FIELDS = (
 # tuple deliberately: a single bootstrap draw then serves both, which is what
 # makes the path difference paired rather than a subtraction of two independent
 # intervals.
-INTERSECTION_FIELDS = (
-    "x_cl_raw", "x_cl_centered",
-    "x_predict_raw", "x_predict_centered",
-    "x_sp_transport_raw", "x_sp_transport_centered",
-    "x_sp_predict_raw", "x_sp_predict_centered",
+INTERSECTION_FIELDS = tuple(
+    f"x_{arm}_{column}"
+    for arm in ("cl", "predict", "nowarp", "sp_transport", "sp_predict", "sp_nowarp")
+    for column in ("raw", "centered", "l2_raw", "l2_centered")
 )
 COUNT_FIELDS = (
     "n_primary", "n_formulation", "n_splat", "n_intersect", "n_predict_nonfinite",
@@ -136,16 +135,32 @@ def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], flo
         "sp_transport_margin": lambda v: v[f"sp_transport_{m}"] - v[f"sp_nowarp_{m}"],
         "sp_predict_margin": lambda v: v[f"sp_predict_{m}"] - v[f"sp_nowarp_{m}"],
         # PROTOCOL 3.9's disclosure terms, every one recomputed on the
-        # cross-path common-valid cell set before differencing.
+        # cross-path common-valid cell set before differencing. Each interpreted
+        # effect has a per-point term, a splat term, and a path difference, and
+        # all three read one field tuple so one scene draw serves them.
         "x_delta_learn_pp": lambda v: v[f"x_cl_{m}"] - v[f"x_predict_{m}"],
         "x_delta_learn_sp": (
             lambda v: v[f"x_sp_transport_{m}"] - v[f"x_sp_predict_{m}"]
         ),
-        # The quantity 3.9 requires an interval for: the difference between what
-        # the two evaluation paths say about the same effect on the same cells.
-        "path_difference": lambda v: (
+        "x_cl_margin": lambda v: v[f"x_cl_{m}"] - v[f"x_nowarp_{m}"],
+        "x_sp_transport_margin": (
+            lambda v: v[f"x_sp_transport_{m}"] - v[f"x_sp_nowarp_{m}"]
+        ),
+        "x_predict_margin": lambda v: v[f"x_predict_{m}"] - v[f"x_nowarp_{m}"],
+        "x_sp_predict_margin": (
+            lambda v: v[f"x_sp_predict_{m}"] - v[f"x_sp_nowarp_{m}"]
+        ),
+        "path_difference_learn": lambda v: (
             (v[f"x_cl_{m}"] - v[f"x_predict_{m}"])
             - (v[f"x_sp_transport_{m}"] - v[f"x_sp_predict_{m}"])
+        ),
+        "path_difference_cl_margin": lambda v: (
+            (v[f"x_cl_{m}"] - v[f"x_nowarp_{m}"])
+            - (v[f"x_sp_transport_{m}"] - v[f"x_sp_nowarp_{m}"])
+        ),
+        "path_difference_predict_margin": lambda v: (
+            (v[f"x_predict_{m}"] - v[f"x_nowarp_{m}"])
+            - (v[f"x_sp_predict_{m}"] - v[f"x_sp_nowarp_{m}"])
         ),
     }
 
@@ -170,7 +185,13 @@ QUANTITY_POPULATION = {
     "sp_predict_margin": SPLAT_POOL,
     "x_delta_learn_pp": CROSS_PATH,
     "x_delta_learn_sp": CROSS_PATH,
-    "path_difference": CROSS_PATH,
+    "x_cl_margin": CROSS_PATH,
+    "x_sp_transport_margin": CROSS_PATH,
+    "x_predict_margin": CROSS_PATH,
+    "x_sp_predict_margin": CROSS_PATH,
+    "path_difference_learn": CROSS_PATH,
+    "path_difference_cl_margin": CROSS_PATH,
+    "path_difference_predict_margin": CROSS_PATH,
 }
 
 # Quantities that live in score space, and to which the frozen 0.003 near-zero
@@ -318,7 +339,8 @@ def near_zero_disclosure(
             "paths_agree_in_sign": None,
             "both_intervals_exclude_zero": None,
             "wording": (
-                "no measurable difference at the reported scale, single path"
+                "no measurable difference at the reported scale; this quantity "
+                "has no second evaluation path by construction"
                 if pp_in else "effect outside the operator band"
             ),
         }
@@ -431,8 +453,39 @@ def _count_field_for(population: str) -> str:
 # forbids, so the mapping points at the intersection columns and not at the
 # own-population ones.
 DISCLOSURE_PAIR = {
-    "delta_learn_pp": ("x_delta_learn_pp", "x_delta_learn_sp"),
+    # quantity: (per-point term, splat term, path difference), all on CROSS_PATH.
+    "delta_learn_pp": ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference_learn"),
+    # The operational gap is the same effect read from the other side, so it is
+    # disclosed against the same pair with the roles kept in path order.
+    "delta_learn_sp": ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference_learn"),
+    "cl_margin": ("x_cl_margin", "x_sp_transport_margin", "path_difference_cl_margin"),
+    "sp_transport_margin": (
+        "x_cl_margin", "x_sp_transport_margin", "path_difference_cl_margin"
+    ),
+    "predict_margin": (
+        "x_predict_margin", "x_sp_predict_margin", "path_difference_predict_margin"
+    ),
+    "sp_predict_margin": (
+        "x_predict_margin", "x_sp_predict_margin", "path_difference_predict_margin"
+    ),
 }
+
+# The quantities PROTOCOL 3.9's near-zero wording applies to: the interpreted
+# effects, meaning differences a reader would take as a claim about one method
+# relative to another. Every one either has a disclosure pair above or is
+# declared here as having no second path by construction. A quantity in this
+# set with neither is a programming error and evaluate_quantity raises, so the
+# single-path wording can never be reached by omission.
+INTERPRETED_EFFECTS = frozenset({
+    "delta_learn_pp", "delta_learn_sp",
+    "cl_margin", "sp_transport_margin",
+    "predict_margin", "sp_predict_margin",
+    "delta_formulation",
+})
+# The formulation diagnostic compares two per-point estimators and has no splat
+# counterpart at all, so its single-path disclosure is a fact of the design
+# rather than a fallback.
+SINGLE_PATH_BY_CONSTRUCTION = frozenset({"delta_formulation"})
 
 
 def _interval_for(
@@ -482,14 +535,24 @@ def evaluate_quantity(
     # population, whose fields sit in one tuple, so one scene draw serves all
     # three and the difference is recomputed inside each replicate.
     pair = DISCLOSURE_PAIR.get(quantity)
+    if (
+        quantity in INTERPRETED_EFFECTS
+        and pair is None
+        and quantity not in SINGLE_PATH_BY_CONSTRUCTION
+    ):
+        raise ValueError(
+            f"{quantity} is an interpreted effect with no disclosure pair and is "
+            "not declared single-path by construction; PROTOCOL 3.9 does not "
+            "permit falling back to a one-path wording when a counterpart exists"
+        )
     counterpart = None
     difference = None
     per_point_term = PathEstimate(interval["estimate"], interval["lo"], interval["hi"])
     if pair is not None:
-        pp_name, sp_name = pair
+        pp_name, sp_name, diff_name = pair
         pp_x, _ = _interval_for(records, pp_name, metric, analysis, unit)
         sp_x, _ = _interval_for(records, sp_name, metric, analysis, unit)
-        diff, _ = _interval_for(records, "path_difference", metric, analysis, unit)
+        diff, _ = _interval_for(records, diff_name, metric, analysis, unit)
         per_point_term = PathEstimate(pp_x["estimate"], pp_x["lo"], pp_x["hi"])
         counterpart = PathEstimate(sp_x["estimate"], sp_x["lo"], sp_x["hi"])
         difference = PathEstimate(diff["estimate"], diff["lo"], diff["hi"])

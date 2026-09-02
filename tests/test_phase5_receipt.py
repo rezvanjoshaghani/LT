@@ -31,8 +31,16 @@ def _receipt(tmp_path: Path, passed: bool = True, **overrides) -> Path:
     return path
 
 
-def test_a_matching_receipt_is_accepted(tmp_path):
-    assert verify(_receipt(tmp_path), CONFIG, "gate") == []
+def _identity_problems(problems: list[str]) -> list[str]:
+    """The identity-layer problems only; artifact binding is tested separately."""
+    return [
+        p for p in problems
+        if "artifact" not in p and "identity block" not in p
+    ]
+
+
+def test_a_matching_receipt_passes_the_identity_layer(tmp_path):
+    assert _identity_problems(verify(_receipt(tmp_path), CONFIG, "gate")) == []
 
 
 def test_a_failed_receipt_is_refused_with_its_failing_step(tmp_path):
@@ -67,7 +75,7 @@ def test_identity_is_read_from_the_top_level_too(tmp_path):
     report = {"passed": True, **current_identity(CONFIG)}
     path = tmp_path / "flat.json"
     path.write_text(json.dumps(report), encoding="utf-8")
-    assert verify(path, CONFIG, "gate") == []
+    assert _identity_problems(verify(path, CONFIG, "gate")) == []
 
 
 def test_an_unreadable_receipt_is_refused(tmp_path):
@@ -99,53 +107,156 @@ def test_current_identity_names_all_bound_fields():
 
 
 # ---------------------------------------------------------------------------
-# The receipt is bound to the inputs the gate actually resolved
+# The receipt is bound to the content of the inputs the gate resolved
 # ---------------------------------------------------------------------------
 
-def _receipt_with_artifacts(tmp_path: Path, artifacts: dict) -> Path:
+def _full_receipt(tmp_path: Path, artifacts: dict, scenes: dict, **identity) -> Path:
     report = {
         "passed": True,
         "steps": [
-            {"step": "1", "evidence": current_identity(CONFIG)},
-            {"step": "2", "evidence": {"artifacts": artifacts}},
+            {"step": "1", "evidence": {**current_identity(CONFIG), **identity}},
+            {"step": "2", "evidence": {"artifacts": artifacts, "scene_identities": scenes}},
         ],
     }
-    path = tmp_path / "with_artifacts.json"
+    path = tmp_path / "full.json"
     path.write_text(json.dumps(report), encoding="utf-8")
     return path
 
 
-def test_a_receipt_naming_a_different_input_tree_is_refused(tmp_path):
-    """Two runs can share a commit and a config and still read different bytes."""
-    path = _receipt_with_artifacts(
-        tmp_path, {"phase4_dir": {"path": "/somewhere/else/phase4_rung1"}}
-    )
+def test_a_receipt_without_an_artifact_block_cannot_license_training(tmp_path):
+    """A verdict alone is not an integration receipt."""
+    problems = verify(_receipt(tmp_path), CONFIG, "gate")
+    assert any("no resolved-artifact block" in p for p in problems)
+
+
+def test_a_receipt_without_scene_identities_is_refused(tmp_path):
+    path = _full_receipt(tmp_path, artifacts={"x": {}}, scenes={})
     problems = verify(path, CONFIG, "gate")
-    # Only fires when the current run can resolve that artifact; on this machine
-    # phase4_dir does not exist, so the check is correctly silent rather than
-    # inventing a comparison against nothing.
+    assert any("no per-scene identity block" in p for p in problems)
+
+
+def test_every_required_artifact_must_be_recorded(tmp_path):
+    from lot.phase5_receipt import BOUND_ARTIFACT_FIELDS
+
+    assert "mean_vector_dir" in BOUND_ARTIFACT_FIELDS
+    assert "phase4_convention" in BOUND_ARTIFACT_FIELDS
+    path = _full_receipt(tmp_path, artifacts={"renders_root": {"path": "x"}}, scenes={"a": {}})
+    problems = verify(path, CONFIG, "gate")
+    # Every bound artifact this run can resolve and the receipt omits is named.
     from lot.phase5 import load_phase5_config
-    resolvable = Path(load_phase5_config(CONFIG).phase4_dir).exists()
-    assert bool(problems) == resolvable
+    cfg = load_phase5_config(CONFIG)
+    if Path(cfg.mean_vector_dir).exists():
+        assert any("does not record mean_vector_dir" in p for p in problems)
 
 
-def test_the_artifact_check_compares_the_paths_the_gate_recorded(tmp_path):
-    """Exercised against an artifact that does resolve here."""
+def test_an_artifact_this_run_cannot_resolve_is_a_failure_not_a_skip(tmp_path):
     from lot.phase5 import load_phase5_config
 
     cfg = load_phase5_config(CONFIG)
-    mean_dir = Path(cfg.mean_vector_dir)
-    if not mean_dir.exists():
-        pytest.skip("the Phase 3 outputs are not present on this machine")
-
-    matching = _receipt_with_artifacts(
-        tmp_path, {"mean_vector_dir": {"path": str(mean_dir.resolve())}}
+    if Path(cfg.phase4_dir).exists():
+        pytest.skip("phase4_dir resolves here; the skip path cannot be exercised")
+    path = _full_receipt(
+        tmp_path,
+        artifacts={"phase4_dir": {"path": "/elsewhere/phase4_rung1"}},
+        scenes={"a": {}},
     )
-    assert verify(matching, CONFIG, "gate") == []
-
-
-def test_a_receipt_without_an_artifact_block_still_checks_identity(tmp_path):
-    """An older receipt format must not silently skip the identity binding."""
-    path = _receipt(tmp_path, commit="stale")
     problems = verify(path, CONFIG, "gate")
-    assert any("commit moved" in p for p in problems)
+    assert any("phase4_dir is not present" in p for p in problems)
+
+
+def test_a_file_artifact_that_changed_under_its_path_is_refused(tmp_path):
+    """Same path, different bytes: the binding is by content."""
+    import dataclasses
+
+    from lot.phase5 import load_phase5_config
+    from lot.phase5_check import sha256_file
+
+    convention = tmp_path / "phase4" / "evidence" / "convention_record.json"
+    convention.parent.mkdir(parents=True)
+    convention.write_text('{"convention": "planar_z"}', encoding="utf-8")
+    (tmp_path / "phase4" / "eval").mkdir()
+    cfg_path = tmp_path / "phase5.yaml"
+    base = load_phase5_config(CONFIG)
+    moved = dataclasses.replace(base, phase4_dir=str(tmp_path / "phase4"))
+    import yaml
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["phase4_dir"] = str(tmp_path / "phase4")
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    good = {
+        "phase4_convention": {
+            "path": str(convention.resolve()), "sha256": sha256_file(convention),
+        }
+    }
+    path = _full_receipt(tmp_path, artifacts=good, scenes={"a": {}},
+                         config_digest=moved.digest())
+    before = [p for p in verify(path, cfg_path, "gate") if "phase4_convention" in p]
+    assert before == [], before
+
+    convention.write_text('{"convention": "ray_distance"}', encoding="utf-8")
+    after = [p for p in verify(path, cfg_path, "gate") if "phase4_convention" in p]
+    assert after and "changed under its path" in after[0]
+
+
+def test_scene_identity_fields_are_compared_when_recomputable(tmp_path, monkeypatch):
+    """The real comparison runs; only the loaders it calls are stubbed."""
+    import lot.encoders as enc
+    import lot.phase4 as p4
+    import lot.phase5_check as chk
+    from lot import phase5_receipt as m
+    from lot.render_replica import REPLICA_SCENES
+
+    monkeypatch.setattr(enc, "load_cache_meta",
+                        lambda root, encoder, scene: {"features_digest": "f"})
+    monkeypatch.setattr(p4, "load_depth_archive",
+                        lambda root, encoder, scene: {"meta": {"depth_digest": "d"}})
+    monkeypatch.setattr(p4, "manifest_digest", lambda root: "m")
+    monkeypatch.setattr(chk, "sha256_file", lambda path: "p")
+
+    # A real parquet path is stat()ed for its byte count, so give every scene one.
+    from lot.phase5 import load_phase5_config
+    import dataclasses, yaml
+    eval_dir = tmp_path / "phase4" / "eval"
+    eval_dir.mkdir(parents=True)
+    for scene in REPLICA_SCENES:
+        (eval_dir / f"{scene}.parquet").write_bytes(b"x")
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["phase4_dir"] = str(tmp_path / "phase4")
+    cfg_path = tmp_path / "phase5.yaml"
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    cfg = load_phase5_config(cfg_path)
+
+    live = {"features_digest": "f", "depth_digest": "d", "manifest_digest": "m",
+            "phase4_parquet_sha256": "p", "phase4_parquet_bytes": 1}
+    scenes = {scene: dict(live) for scene in REPLICA_SCENES}
+    scenes["room_0"]["depth_digest"] = "stale"
+    report = {"passed": True, "steps": [
+        {"step": "2", "evidence": {"artifacts": {"x": {}}, "scene_identities": scenes}},
+    ]}
+    problems = m._scene_identity_problems(report, cfg, "gate")
+    assert any("room_0 depth_digest moved" in p for p in problems), problems
+    # Every other scene agreed, so room_0 is the only mismatch reported.
+    assert sum("moved since the gate ran" in p for p in problems) == 1
+
+
+def test_a_scene_missing_from_the_receipt_is_named(tmp_path, monkeypatch):
+    from lot import phase5_receipt as m
+    from lot.render_replica import REPLICA_SCENES
+
+    scenes = {scene: {} for scene in REPLICA_SCENES if scene != "office_3"}
+    report = {"steps": [{"evidence": {"scene_identities": scenes}}]}
+    monkeypatch.setattr(m, "BOUND_SCENE_FIELDS", ())
+    from lot.phase5 import load_phase5_config
+    problems = m._scene_identity_problems(report, load_phase5_config(CONFIG), "gate")
+    assert any("office_3" in p and "did not verify" in p for p in problems)
+
+
+def test_receipt_scene_identities_merge_step2_and_step4_blocks():
+    from lot.phase5_receipt import receipt_scene_identities
+
+    report = {"steps": [
+        {"evidence": {"scene_identities": {"a": {"features_digest": "f"}}}},
+        {"evidence": {"scene_identities": {"a": {"aligned_depth_digest": "z"}}}},
+    ]}
+    merged = receipt_scene_identities(report)
+    assert merged["a"] == {"features_digest": "f", "aligned_depth_digest": "z"}

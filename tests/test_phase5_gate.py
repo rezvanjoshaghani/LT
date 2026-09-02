@@ -320,3 +320,122 @@ def test_environment_identity_names_what_ran():
     identity = environment_identity()
     assert identity["python"] and identity["torch"]
     assert "cuda_available" in identity
+
+
+# ---------------------------------------------------------------------------
+# Round-three finding 2: every scene compared against the accepted identity
+# ---------------------------------------------------------------------------
+
+def _identity_env(monkeypatch, tmp_path, accepted, live_features, live_depth, live_manifest):
+    """Stand up fake caches and a fake Phase 4 parquet record for one scene."""
+    from lot import phase5_check as m
+    import lot.encoders as enc
+    import lot.phase4 as p4
+    import lot.evaluate as ev
+
+    eval_dir = tmp_path / "phase4" / "eval"
+    eval_dir.mkdir(parents=True)
+    (eval_dir / "room_0.parquet").write_bytes(b"parquet-bytes")
+    monkeypatch.setattr(ev, "read_run_metadata", lambda path: accepted)
+    monkeypatch.setattr(enc, "load_cache_meta",
+                        lambda root, encoder, scene: {"features_digest": live_features})
+    monkeypatch.setattr(p4, "load_depth_archive",
+                        lambda root, encoder, scene: {"meta": {"depth_digest": live_depth}})
+    monkeypatch.setattr(p4, "manifest_digest", lambda root: live_manifest)
+
+    @dataclasses.dataclass
+    class Cfg:
+        phase4_dir: str = str(tmp_path / "phase4")
+        cache_root: str = str(tmp_path / "cache")
+        feature_encoder: str = "dinov2_vitb14"
+        depth_encoder: str = "vggt_1b"
+        renders_root: str = str(tmp_path / "renders")
+
+    return m, Cfg()
+
+
+def test_matching_scene_identities_pass_and_are_recorded(monkeypatch, tmp_path):
+    from lot.phase5_check import verify_scene_identities
+
+    accepted = {"features_digest": "F", "depth_digest": "D", "manifest_digest": "M",
+                "mean_vector_digest": "V", "git_commit": "abc"}
+    _, cfg = _identity_env(monkeypatch, tmp_path, accepted, "F", "D", "M")
+    out = verify_scene_identities(cfg, ["room_0"])
+    assert out["room_0"]["features_digest"] == "F"
+    assert out["room_0"]["accepted_mean_vector_digest"] == "V"
+    assert out["room_0"]["phase4_parquet_bytes"] == len(b"parquet-bytes")
+
+
+@pytest.mark.parametrize("field,live", [
+    ("features_digest", ("X", "D", "M")),
+    ("depth_digest", ("F", "X", "M")),
+    ("manifest_digest", ("F", "D", "X")),
+])
+def test_a_live_input_disagreeing_with_phase4_is_a_stop(monkeypatch, tmp_path, field, live):
+    from lot.phase5_check import verify_scene_identities
+
+    accepted = {"features_digest": "F", "depth_digest": "D", "manifest_digest": "M"}
+    _, cfg = _identity_env(monkeypatch, tmp_path, accepted, *live)
+    with pytest.raises(GateStop) as caught:
+        verify_scene_identities(cfg, ["room_0"])
+    assert caught.value.classification == FROZEN_DESIGN_MISMATCH
+    mismatch = caught.value.evidence["mismatches"][0]
+    assert mismatch["field"] == field
+    assert mismatch["accepted"] != mismatch["live"]
+
+
+def test_a_missing_phase4_parquet_is_reported_per_scene(monkeypatch, tmp_path):
+    from lot.phase5_check import verify_scene_identities
+
+    _, cfg = _identity_env(monkeypatch, tmp_path, {}, "F", "D", "M")
+    with pytest.raises(GateStop) as caught:
+        verify_scene_identities(cfg, ["room_0", "room_1"])
+    problems = caught.value.evidence["mismatches"]
+    assert any(p["scene"] == "room_1" and "missing" in p["problem"] for p in problems)
+
+
+def test_the_mean_vector_must_be_the_one_phase4_centered_with():
+    from lot.evaluate import vector_digest
+    from lot.phase5_check import verify_mean_vector_identity
+
+    center = torch.arange(8, dtype=torch.float32)
+    live = vector_digest(center.numpy())
+    ok = verify_mean_vector_identity(
+        center, {"a": {"accepted_mean_vector_digest": live}}
+    )
+    assert ok["mean_vector_digest"] == live
+    with pytest.raises(GateStop) as caught:
+        verify_mean_vector_identity(
+            center, {"a": {"accepted_mean_vector_digest": "not-it"}}
+        )
+    assert caught.value.classification == FROZEN_DESIGN_MISMATCH
+
+
+def test_aligned_depth_digest_is_deterministic_and_content_sensitive():
+    from lot.phase5_check import aligned_depth_digest
+
+    @dataclasses.dataclass
+    class Calib:
+        scale: float = 1.0
+        affine_failed: bool = False
+
+    class Inputs:
+        def __init__(self, value):
+            import numpy as np
+            self.est_maps = {"f1": np.full((2, 2), value, dtype=np.float32)}
+            self.calibrations = {"f1": Calib()}
+
+    a = aligned_depth_digest(Inputs(1.0))
+    assert a == aligned_depth_digest(Inputs(1.0))
+    assert a != aligned_depth_digest(Inputs(2.0))
+
+
+def test_the_gate_no_longer_stops_at_a_probe_subset():
+    """The identity check is over every scene the folds name."""
+    import inspect
+
+    from lot import phase5_gate
+
+    source = inspect.getsource(phase5_gate.run_integration_gate)
+    assert "verify_scene_identities(cfg, REPLICA_SCENES" in source
+    assert "hash_scene_artifacts" not in source

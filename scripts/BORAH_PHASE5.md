@@ -179,7 +179,12 @@ with its stop machinery.
 `check` is implemented and runs. On a machine without the Borah artifacts it
 stops at step 2 with classification `missing_artifact`, naming each absent path
 and why the phase needs it, which is the correct behaviour and is how the stop
-machinery was verified off the cluster.
+machinery was verified off the cluster. On the cluster, step 2 compares every
+scene's live feature, depth, and manifest digests against the accepted Phase 4
+run records and stops on any disagreement; step 4 recomputes the aligned
+context depth for every scene and records its digest; step 7 runs the
+cross-path producer on a real pair. Receipts are bound to all of it by
+content, so a later run cannot inherit a verdict about different bytes.
 
 Steps 3 through 16 have never executed against real artifacts. They are written
 against the shapes Phase 4's own code produces, and the whole point of the gate

@@ -202,20 +202,119 @@ def step2_resolve_artifacts(cfg: Any) -> StepResult:
     return StepResult("2", "resolve real Borah artifacts", True, {"artifacts": found})
 
 
-def hash_scene_artifacts(cfg: Any, scenes: Sequence[str]) -> dict[str, Any]:
-    """Per-scene digests of everything the pin defers to cluster time."""
-    out: dict[str, Any] = {}
+def verify_scene_identities(
+    cfg: Any, scenes: Sequence[str], step: str = "2"
+) -> dict[str, Any]:
+    """Compare every scene's live inputs against the accepted Phase 4 identity.
+
+    This is what the pin says the gate does, for all eighteen scenes and not a
+    probe subset, and it compares rather than merely records: a live value that
+    disagrees with what the accepted Phase 4 run recorded is a stop.
+
+    Per scene, the accepted identity is read from the Phase 4 parquet's own run
+    record, which carries the feature-cache digest, the depth-cache digest, the
+    manifest digest, and the mean-vector digest that produced the accepted
+    rows. The live feature and depth caches are opened and their recorded
+    digests compared to it; the manifest is re-hashed with Phase 4's own
+    function and compared; the parquet itself is hashed so the receipt binds
+    the bytes the supports were read from.
+
+    The aligned context depth has no accepted stored value to compare against,
+    because Phase 4 never persisted the maps, only the calibrations. It is
+    recomputed through Phase 4's own code and its digest recorded, which is the
+    most a gate can do for a derived artifact and is what the pin promises.
+    """
+    from .encoders import load_cache_meta
+    from .evaluate import read_run_metadata
+    from .phase4 import load_depth_archive, manifest_digest
+
+    per_scene: dict[str, Any] = {}
+    mismatches: list[dict[str, Any]] = []
     for scene in scenes:
         entry: dict[str, Any] = {}
-        manifest = Path(cfg.renders_root) / scene / "manifest.json"
-        if manifest.exists():
-            entry["manifest_sha256"] = sha256_file(manifest)
         parquet = Path(cfg.phase4_dir) / "eval" / f"{scene}.parquet"
-        if parquet.exists():
-            entry["phase4_parquet_sha256"] = sha256_file(parquet)
-            entry["phase4_parquet_bytes"] = parquet.stat().st_size
-        out[scene] = entry
-    return out
+        if not parquet.exists():
+            mismatches.append({"scene": scene, "field": "phase4_parquet",
+                               "problem": f"missing: {parquet}"})
+            continue
+        accepted = read_run_metadata(parquet) or {}
+        entry["phase4_parquet_sha256"] = sha256_file(parquet)
+        entry["phase4_parquet_bytes"] = parquet.stat().st_size
+        entry["phase4_commit"] = accepted.get("git_commit")
+
+        feature_meta = load_cache_meta(cfg.cache_root, cfg.feature_encoder, scene)
+        live_features = feature_meta.get("features_digest")
+        entry["features_digest"] = live_features
+        if live_features != accepted.get("features_digest"):
+            mismatches.append({
+                "scene": scene, "field": "features_digest",
+                "accepted": accepted.get("features_digest"), "live": live_features,
+            })
+
+        depth_meta = load_depth_archive(cfg.cache_root, cfg.depth_encoder, scene)["meta"]
+        live_depth = depth_meta.get("depth_digest")
+        entry["depth_digest"] = live_depth
+        if live_depth != accepted.get("depth_digest"):
+            mismatches.append({
+                "scene": scene, "field": "depth_digest",
+                "accepted": accepted.get("depth_digest"), "live": live_depth,
+            })
+
+        live_manifest = manifest_digest(Path(cfg.renders_root) / scene)
+        entry["manifest_digest"] = live_manifest
+        if live_manifest != accepted.get("manifest_digest"):
+            mismatches.append({
+                "scene": scene, "field": "manifest_digest",
+                "accepted": accepted.get("manifest_digest"), "live": live_manifest,
+            })
+        entry["accepted_mean_vector_digest"] = accepted.get("mean_vector_digest")
+        per_scene[scene] = entry
+
+    if mismatches:
+        raise GateStop(
+            step,
+            f"{len(mismatches)} live input(s) disagree with the accepted Phase 4 "
+            "identity; the gate would be verifying different bytes from the ones "
+            "the accepted supports were read from",
+            FROZEN_DESIGN_MISMATCH,
+            {"mismatches": mismatches, "scenes_checked": len(per_scene)},
+        )
+    return per_scene
+
+
+def aligned_depth_digest(inputs: Any) -> str:
+    """Digest of one scene's recomputed aligned context depth, frame order fixed."""
+    digest = hashlib.sha256()
+    for frame_id in sorted(inputs.est_maps):
+        digest.update(str(frame_id).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(np.ascontiguousarray(inputs.est_maps[frame_id]).tobytes())
+        calibration = inputs.calibrations[frame_id]
+        digest.update(repr(dataclasses.astuple(calibration)).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def verify_mean_vector_identity(
+    center: Any, per_scene: dict[str, Any], step: str = "5"
+) -> dict[str, Any]:
+    """The centering statistic must be the one the accepted rows were scored with."""
+    from .evaluate import vector_digest
+
+    live = vector_digest(center.detach().cpu().numpy())
+    accepted = {
+        scene: entry.get("accepted_mean_vector_digest")
+        for scene, entry in per_scene.items()
+    }
+    disagreeing = {s: a for s, a in accepted.items() if a is not None and a != live}
+    if disagreeing:
+        raise GateStop(
+            step, "the loaded mean vector is not the one the accepted Phase 4 "
+            "rows were centered with",
+            FROZEN_DESIGN_MISMATCH,
+            {"live": live, "accepted_by_scene": disagreeing},
+        )
+    return {"mean_vector_digest": live, "scenes_agreeing": len(accepted)}
 
 
 # ---------------------------------------------------------------------------

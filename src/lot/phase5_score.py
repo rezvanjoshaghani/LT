@@ -435,6 +435,13 @@ def region_masks(
 # The cross-path common-valid set, for PROTOCOL 3.9's two-path disclosure
 # ---------------------------------------------------------------------------
 
+CROSS_PATH_ARMS = ("cl", "predict", "nowarp", "sp_transport", "sp_predict", "sp_nowarp")
+
+
+def _empty_arm(prefix: str) -> dict[str, float]:
+    return _prefixed(_EMPTY_METRICS, prefix)
+
+
 @dataclasses.dataclass
 class CrossPathScores:
     """Both paths recomputed on the cells they share, for the 3.9 disclosure.
@@ -446,29 +453,59 @@ class CrossPathScores:
     scenes serves both paths and the difference is recomputed inside each
     replicate."
 
-    Comparing V_P5_pp against V_sp directly would mix an operator difference
-    with a selection difference, and the selection difference can carry its own
-    sign. So both paths are re-scored here on the target cells they share, and
-    every column below travels in one record so a single bootstrap draw serves
-    the pair.
+    The atomic unit is the target patch cell, on both arms, with one weight per
+    cell. That is the whole point of this record and it was the defect in its
+    first version: the per-point arm scored every context sample landing in a
+    common cell, so a cell that received two samples counted twice on one path
+    and once on the other, and collision multiplicity alone could manufacture a
+    path difference between operators that agreed at every cell. Now the
+    per-point predictions and targets are pooled to one normalized value per
+    cell before scoring, which is the same output-level rule the splat contract
+    already applies, and both arms then average over the same cells.
 
-    The shared index is the target patch cell, which is the only unit the two
-    estimators have in common: a per-point sample is a context patch with a
-    continuous landing, a splat unit is a target cell.
+    Every arm carries all four PROTOCOL 3.7 columns. The common cells and the
+    per-point samples that fed them travel with the record, so the support an
+    aggregate rests on can be reconstructed and audited rather than inferred.
     """
 
     n_intersect: int
+    # Explicit and learned, per-point arm, pooled to cells.
     x_cl_raw: float
     x_cl_centered: float
+    x_cl_l2_raw: float
+    x_cl_l2_centered: float
     x_predict_raw: float
     x_predict_centered: float
+    x_predict_l2_raw: float
+    x_predict_l2_centered: float
+    x_nowarp_raw: float
+    x_nowarp_centered: float
+    x_nowarp_l2_raw: float
+    x_nowarp_l2_centered: float
+    # Explicit and learned, splat arm, on the same cells.
     x_sp_transport_raw: float
     x_sp_transport_centered: float
+    x_sp_transport_l2_raw: float
+    x_sp_transport_l2_centered: float
     x_sp_predict_raw: float
     x_sp_predict_centered: float
+    x_sp_predict_l2_raw: float
+    x_sp_predict_l2_centered: float
+    x_sp_nowarp_raw: float
+    x_sp_nowarp_centered: float
+    x_sp_nowarp_l2_raw: float
+    x_sp_nowarp_l2_centered: float
+    # The support itself. Excluded from the aggregated fields, carried so an
+    # aggregate can prove what it rests on.
+    common_cells: np.ndarray
+    per_point_mask: np.ndarray
+    samples_per_cell: np.ndarray
 
     def as_fields(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        row = dataclasses.asdict(self)
+        for key in ("common_cells", "per_point_mask", "samples_per_cell"):
+            row.pop(key)
+        return row
 
 
 def cross_path_cells(
@@ -493,6 +530,32 @@ def cross_path_cells(
     return common, primary & inside
 
 
+def pool_per_point_to_cells(
+    values: Tensor, cells: np.ndarray, common: np.ndarray
+) -> tuple[Tensor, np.ndarray]:
+    """One value per common cell: the mean of the per-point values landing in it.
+
+    values: [M, C] per-point vectors, cells: [M] the cell each landed in, common:
+    the ordered common cells. Returns ([n_common, C], samples_per_cell).
+
+    Pooling happens at the vector level and the cosine is taken afterwards,
+    which is PROTOCOL 3.7's output-level rule for pooled outputs. Averaging the
+    per-sample cosines instead would be a different, un-frozen estimator.
+    """
+    lookup = {int(cell): i for i, cell in enumerate(common)}
+    pooled = torch.zeros(len(common), values.shape[-1], dtype=values.dtype,
+                         device=values.device)
+    counts = np.zeros(len(common), dtype=np.int64)
+    for row, cell in enumerate(cells):
+        slot = lookup.get(int(cell))
+        if slot is None:
+            continue
+        pooled[slot] += values[row]
+        counts[slot] += 1
+    weights = torch.from_numpy(np.maximum(counts, 1)).to(pooled.dtype).to(pooled.device)
+    return pooled / weights[:, None], counts
+
+
 def score_cross_path(
     lift: ContextLiftMap,
     primary: Tensor,
@@ -508,12 +571,17 @@ def score_cross_path(
     target_grid_hw: tuple[int, int],
     patch_size: int = PATCH_SIZE,
 ) -> CrossPathScores:
-    """Recompute both paths on their common cells, in one record.
+    """Recompute both paths on their common cells, one weight per cell.
 
-    The per-point terms are scored at the landing locations of the supported
-    samples that fall inside the common cells; the splat terms are scored on
-    those same cells. Nothing here re-decides either path's own support, which
-    stays exactly as the headline and operational tables use it.
+    Per-point arm: for every common cell, the supported samples landing in it
+    have their predictions and their targets pooled to one vector each, and the
+    cell is scored once. Splat arm: the cell is scored once on the values the
+    accepted Phase 4 splat produced. Both arms therefore average over the same
+    cells with the same weights, and n_intersect is the count of those cells on
+    both sides.
+
+    Nothing here re-decides either path's own support, which stays exactly as
+    the headline and operational tables use it.
     """
     common, pp_mask = cross_path_cells(
         lift, primary, splat_scored_cells, target_hw, patch_size
@@ -521,29 +589,60 @@ def score_cross_path(
     if common.size == 0 or not bool(pp_mask.any()):
         return CrossPathScores(
             n_intersect=0,
-            **{f"x_{k}": float("nan") for k in (
-                "cl_raw", "cl_centered", "predict_raw", "predict_centered",
-                "sp_transport_raw", "sp_transport_centered",
-                "sp_predict_raw", "sp_predict_centered",
-            )},
+            **{f"x_{k}": v for arm in CROSS_PATH_ARMS for k, v in _empty_arm(arm).items()},
+            common_cells=common,
+            per_point_mask=pp_mask.cpu().numpy().copy(),
+            samples_per_cell=np.zeros(0, dtype=np.int64),
         )
 
-    per_point = score_primary(
-        lift, pp_mask, features_context, features_target, center,
-        predicted_target_grid, target_grid_hw, patch_size,
-    )
-    splat = score_splat_pool(
-        common, transported_est, features_context_flat, features_target_flat,
-        center, predicted_target_grid,
-    )
+    chosen = torch.nonzero(pp_mask, as_tuple=False).reshape(-1)
+    uv_target = lift.uv_target[chosen]
+    uv_context = lift.uv_context[chosen]
+    landed_cells = patch_cell_index(uv_target, target_hw, patch_size)
+
+    # Per-point vectors at the landing locations, then pooled to cells.
+    target_pp = sample_features_bilinear(features_target, uv_target, patch_size)
+    cl_pp = sample_features_bilinear(features_context, uv_context, patch_size)
+    nowarp_pp = sample_features_bilinear(features_context, uv_target, patch_size)
+    target_cells, samples_per_cell = pool_per_point_to_cells(target_pp, landed_cells, common)
+    cl_cells, _ = pool_per_point_to_cells(cl_pp, landed_cells, common)
+    nowarp_cells, _ = pool_per_point_to_cells(nowarp_pp, landed_cells, common)
+
+    if predicted_target_grid is None:
+        predict_pp_metrics = dict(_EMPTY_METRICS)
+        predict_sp_metrics = dict(_EMPTY_METRICS)
+    else:
+        grid_h, grid_w = target_grid_hw
+        channels = predicted_target_grid.shape[-1]
+        maps = predicted_target_grid.T.reshape(channels, grid_h, grid_w)
+        predicted_pp = sample_map_bilinear(
+            maps, pixel_to_patch_coords(uv_target, patch_size)
+        ) + center
+        predicted_cells, _ = pool_per_point_to_cells(predicted_pp, landed_cells, common)
+        predict_pp_metrics = score_all_metrics(predicted_cells, target_cells, center)
+        index = torch.from_numpy(common)
+        predict_sp_metrics = score_all_metrics(
+            predicted_target_grid[index] + center, features_target_flat[:, index].T, center
+        )
+
+    # Splat arm on exactly the same cells.
+    index = torch.from_numpy(common)
+    target_sp = features_target_flat[:, index].T
     return CrossPathScores(
         n_intersect=int(common.size),
-        x_cl_raw=per_point.cl_raw,
-        x_cl_centered=per_point.cl_centered,
-        x_predict_raw=per_point.predict_raw,
-        x_predict_centered=per_point.predict_centered,
-        x_sp_transport_raw=splat.sp_transport_raw,
-        x_sp_transport_centered=splat.sp_transport_centered,
-        x_sp_predict_raw=splat.sp_predict_raw,
-        x_sp_predict_centered=splat.sp_predict_centered,
+        **_prefixed(score_all_metrics(cl_cells, target_cells, center), "x_cl"),
+        **_prefixed(predict_pp_metrics, "x_predict"),
+        **_prefixed(score_all_metrics(nowarp_cells, target_cells, center), "x_nowarp"),
+        **_prefixed(
+            score_all_metrics(transported_est[:, index].T, target_sp, center),
+            "x_sp_transport",
+        ),
+        **_prefixed(predict_sp_metrics, "x_sp_predict"),
+        **_prefixed(
+            score_all_metrics(features_context_flat[:, index].T, target_sp, center),
+            "x_sp_nowarp",
+        ),
+        common_cells=common,
+        per_point_mask=pp_mask.cpu().numpy().copy(),
+        samples_per_cell=samples_per_cell,
     )

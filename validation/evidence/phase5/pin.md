@@ -107,6 +107,13 @@ These cannot be computed on the workstation this pin was written on, because
 the inputs live on Borah. `check` computes each one, compares it against the
 value the Phase 4 run recorded, and refuses to proceed on any mismatch.
 
+Recorded 2026-09-02: this paragraph was written as a specification and, until
+the round-three code review, the implementation compared nothing and examined
+three scenes. `lot.phase5_check.verify_scene_identities` now does what the
+paragraph says, for every scene, against each Phase 4 parquet's own run
+record, and the receipt binds the same identities by content. The section
+below is accurate as of that fix.
+
 - DINOv2 feature-cache per-scene `features_digest` values, 18 scenes.
 - VGGT depth-cache per-scene `depth_digest` values, 18 scenes.
 - Context-image-scaled context-depth artifact digest. Phase 5 does not persist

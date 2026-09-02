@@ -49,18 +49,22 @@ from .encoders import (
 # own score by declining to answer. In a healthy run this never fires and the
 # count column is zero everywhere.
 MODEL_FAILURE_COSINE = -1.0
+# The largest distance two unit vectors can have, which is the L2 companion's
+# worst attainable value and therefore the failure value under that metric.
+MODEL_FAILURE_L2 = 2.0
 
 
-def _cosine(a: Tensor, b: Tensor) -> Tensor:
-    return torch.nn.functional.cosine_similarity(a, b, dim=-1, eps=1e-12)
+def _unit(features: Tensor, eps: float = 1e-12) -> Tensor:
+    """Unit-normalize, matching lot.evaluate.unit_normalize's convention."""
+    return features / features.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
-def _scored_mean(cosine: Tensor, failures: Tensor) -> float:
-    """Mean cosine over a support, with model failures held at the worst value."""
-    if cosine.numel() == 0:
+def _scored_mean(values: Tensor, failures: Tensor, failure_value: float) -> float:
+    """Mean over a support, with model failures held at the metric's worst value."""
+    if values.numel() == 0:
         return float("nan")
-    values = torch.where(failures, torch.full_like(cosine, MODEL_FAILURE_COSINE), cosine)
-    return float(values.mean())
+    held = torch.where(failures, torch.full_like(values, failure_value), values)
+    return float(held.mean())
 
 
 def score_predictions(
@@ -68,34 +72,90 @@ def score_predictions(
 ) -> tuple[float, float, int]:
     """Raw and centered mean cosine of one method against the target features.
 
+    Kept for callers that want only the cosines. score_all_metrics is the full
+    PROTOCOL 3.7 record and is what the reported schema is built from.
+    """
+    metrics = score_all_metrics(prediction, target, center)
+    return metrics["cosine_raw"], metrics["cosine_centered"], metrics["n_failures"]
+
+
+def score_all_metrics(
+    prediction: Tensor, target: Tensor, center: Tensor
+) -> dict[str, Any]:
+    """The four PROTOCOL 3.7 metric columns for one method, plus the failure count.
+
     prediction, target: [N, C]. center: [C], the frozen Phase 3 global mean.
 
-    Centering is applied at the output level, immediately before the cosine, per
+    Raw and centered cosine each carry an L2 companion on unit-normalized
+    features, which CLAUDE.md and PROTOCOL 3.7 require of every reported metric.
+    Reporting cosine alone would leave the Phase 5 schema incomplete against the
+    frozen protocol and incomparable with the Phase 3 and Phase 4 tables.
+
+    Centering is applied at the output level, immediately before scoring, per
     PROTOCOL 3.7. Nonfinite predictions are counted and scored as failures under
-    both metrics rather than being excluded from either.
+    every metric rather than excluded from any of them: for cosine the failure
+    value is the worst attainable, and for L2 it is the largest distance two
+    unit vectors can have, so a model cannot improve any reported number by
+    declining to answer.
     """
     if prediction.shape != target.shape:
         raise ValueError(f"prediction {tuple(prediction.shape)} != target {tuple(target.shape)}")
     if prediction.shape[0] == 0:
-        return float("nan"), float("nan"), 0
+        nan = float("nan")
+        return {
+            "cosine_raw": nan, "cosine_centered": nan,
+            "l2_raw": nan, "l2_centered": nan, "n_failures": 0,
+        }
     failures = ~torch.isfinite(prediction).all(dim=-1)
     safe = torch.where(failures[:, None], torch.zeros_like(prediction), prediction)
-    raw = _scored_mean(_cosine(safe, target), failures)
-    centered = _scored_mean(_cosine(safe - center, target - center), failures)
-    return raw, centered, int(failures.sum())
+
+    def pair(center_vector: Tensor | None) -> tuple[float, float]:
+        a, b = (safe, target) if center_vector is None else (
+            safe - center_vector, target - center_vector
+        )
+        a_n, b_n = _unit(a), _unit(b)
+        cosine = (a_n * b_n).sum(dim=-1)
+        l2 = (a_n - b_n).norm(dim=-1)
+        return (
+            _scored_mean(cosine, failures, MODEL_FAILURE_COSINE),
+            _scored_mean(l2, failures, MODEL_FAILURE_L2),
+        )
+
+    cosine_raw, l2_raw = pair(None)
+    cosine_centered, l2_centered = pair(center)
+    return {
+        "cosine_raw": cosine_raw,
+        "cosine_centered": cosine_centered,
+        "l2_raw": l2_raw,
+        "l2_centered": l2_centered,
+        "n_failures": int(failures.sum()),
+    }
 
 
 @dataclasses.dataclass
 class PrimaryScores:
-    """One pair's primary per-point record, on the CL-Transport support."""
+    """One pair's primary per-point record, on the CL-Transport support.
+
+    Every method carries all four PROTOCOL 3.7 columns: raw and centered cosine
+    with their L2 companions. The reported Phase 5 quantities are built on the
+    cosines, exactly as Phase 4's are, and the L2 columns travel in the record
+    so the shipped schema is complete against the frozen protocol and
+    comparable with the Phase 3 and Phase 4 tables.
+    """
 
     n_primary: int
     cl_raw: float
     cl_centered: float
+    cl_l2_raw: float
+    cl_l2_centered: float
     predict_raw: float
     predict_centered: float
+    predict_l2_raw: float
+    predict_l2_centered: float
     nowarp_raw: float
     nowarp_centered: float
+    nowarp_l2_raw: float
+    nowarp_l2_centered: float
     n_predict_nonfinite: int
     support_mask: np.ndarray
 
@@ -103,6 +163,22 @@ class PrimaryScores:
         row = dataclasses.asdict(self)
         row.pop("support_mask")
         return row
+
+
+def _prefixed(metrics: dict[str, Any], prefix: str) -> dict[str, float]:
+    """Rename one method's metric columns onto its record prefix."""
+    return {
+        f"{prefix}_raw": metrics["cosine_raw"],
+        f"{prefix}_centered": metrics["cosine_centered"],
+        f"{prefix}_l2_raw": metrics["l2_raw"],
+        f"{prefix}_l2_centered": metrics["l2_centered"],
+    }
+
+
+_EMPTY_METRICS = {
+    "cosine_raw": float("nan"), "cosine_centered": float("nan"),
+    "l2_raw": float("nan"), "l2_centered": float("nan"), "n_failures": 0,
+}
 
 
 def primary_support(lift: ContextLiftMap, gt_evaluable: Tensor) -> Tensor:
@@ -136,9 +212,14 @@ def score_primary(
     """
     chosen = torch.nonzero(support, as_tuple=False).reshape(-1)
     if chosen.numel() == 0:
-        empty = float("nan")
-        return PrimaryScores(0, empty, empty, empty, empty, empty, empty, 0,
-                             support.cpu().numpy().copy())
+        return PrimaryScores(
+            n_primary=0,
+            **_prefixed(_EMPTY_METRICS, "cl"),
+            **_prefixed(_EMPTY_METRICS, "predict"),
+            **_prefixed(_EMPTY_METRICS, "nowarp"),
+            n_predict_nonfinite=0,
+            support_mask=support.cpu().numpy().copy(),
+        )
 
     uv_target = lift.uv_target[chosen]
     uv_context = lift.uv_context[chosen]
@@ -155,12 +236,11 @@ def score_primary(
     # the prediction that assumes the transformation is the identity.
     nowarp = sample_features_bilinear(features_context, uv_target, patch_size)
 
-    cl_raw, cl_centered, _ = score_predictions(cl, target, center)
-    nowarp_raw, nowarp_centered, _ = score_predictions(nowarp, target, center)
+    cl_metrics = score_all_metrics(cl, target, center)
+    nowarp_metrics = score_all_metrics(nowarp, target, center)
 
     if predicted_target_grid is None:
-        predict_raw = predict_centered = float("nan")
-        n_failures = 0
+        predict_metrics = dict(_EMPTY_METRICS)
     else:
         grid_h, grid_w = target_grid_hw
         channels = predicted_target_grid.shape[-1]
@@ -169,19 +249,14 @@ def score_primary(
         predicted = sample_map_bilinear(maps, patch_coords)
         # The network predicts centered features, so the raw comparison adds the
         # frozen mean back rather than comparing objects of different kinds.
-        predict_raw, predict_centered, n_failures = score_predictions(
-            predicted + center, target, center
-        )
+        predict_metrics = score_all_metrics(predicted + center, target, center)
 
     return PrimaryScores(
         n_primary=int(chosen.numel()),
-        cl_raw=cl_raw,
-        cl_centered=cl_centered,
-        predict_raw=predict_raw,
-        predict_centered=predict_centered,
-        nowarp_raw=nowarp_raw,
-        nowarp_centered=nowarp_centered,
-        n_predict_nonfinite=n_failures,
+        **_prefixed(cl_metrics, "cl"),
+        **_prefixed(predict_metrics, "predict"),
+        **_prefixed(nowarp_metrics, "nowarp"),
+        n_predict_nonfinite=predict_metrics["n_failures"],
         support_mask=support.cpu().numpy().copy(),
     )
 
@@ -217,8 +292,12 @@ class FormulationScores:
     n_formulation: int
     tl_form_raw: float
     tl_form_centered: float
+    tl_form_l2_raw: float
+    tl_form_l2_centered: float
     cl_form_raw: float
     cl_form_centered: float
+    cl_form_l2_raw: float
+    cl_form_l2_centered: float
 
     def as_fields(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -242,20 +321,19 @@ def score_formulation(
     """
     chosen = torch.nonzero(support, as_tuple=False).reshape(-1)
     if chosen.numel() == 0:
-        nan = float("nan")
-        return FormulationScores(0, nan, nan, nan, nan)
+        return FormulationScores(
+            n_formulation=0,
+            **_prefixed(_EMPTY_METRICS, "tl_form"),
+            **_prefixed(_EMPTY_METRICS, "cl_form"),
+        )
     uv_target = lift.uv_target[chosen]
     target = sample_features_bilinear(features_target, uv_target, patch_size)
     cl = sample_features_bilinear(features_context, lift.uv_context[chosen], patch_size)
 
-    cl_raw, cl_centered, _ = score_predictions(cl, target, center)
-    tl_raw, tl_centered, _ = score_predictions(target_lift_prediction, target, center)
     return FormulationScores(
         n_formulation=int(chosen.numel()),
-        tl_form_raw=tl_raw,
-        tl_form_centered=tl_centered,
-        cl_form_raw=cl_raw,
-        cl_form_centered=cl_centered,
+        **_prefixed(score_all_metrics(target_lift_prediction, target, center), "tl_form"),
+        **_prefixed(score_all_metrics(cl, target, center), "cl_form"),
     )
 
 
@@ -266,10 +344,16 @@ class SplatScores:
     n_splat: int
     sp_transport_raw: float
     sp_transport_centered: float
+    sp_transport_l2_raw: float
+    sp_transport_l2_centered: float
     sp_predict_raw: float
     sp_predict_centered: float
+    sp_predict_l2_raw: float
+    sp_predict_l2_centered: float
     sp_nowarp_raw: float
     sp_nowarp_centered: float
+    sp_nowarp_l2_raw: float
+    sp_nowarp_l2_centered: float
 
     def as_fields(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -295,28 +379,28 @@ def score_splat_pool(
     """
     cells = np.asarray(scored_cells, dtype=np.int64)
     if cells.size == 0:
-        nan = float("nan")
-        return SplatScores(0, nan, nan, nan, nan, nan, nan)
+        return SplatScores(
+            n_splat=0,
+            **_prefixed(_EMPTY_METRICS, "sp_transport"),
+            **_prefixed(_EMPTY_METRICS, "sp_predict"),
+            **_prefixed(_EMPTY_METRICS, "sp_nowarp"),
+        )
     index = torch.from_numpy(cells)
     target = features_target_flat[:, index].T
     transport = transported_est[:, index].T
     nowarp = features_context_flat[:, index].T
 
-    t_raw, t_centered, _ = score_predictions(transport, target, center)
-    n_raw, n_centered, _ = score_predictions(nowarp, target, center)
     if predicted_target_grid is None:
-        p_raw = p_centered = float("nan")
+        predict_metrics = dict(_EMPTY_METRICS)
     else:
-        predicted = predicted_target_grid[index] + center
-        p_raw, p_centered, _ = score_predictions(predicted, target, center)
+        predict_metrics = score_all_metrics(
+            predicted_target_grid[index] + center, target, center
+        )
     return SplatScores(
         n_splat=int(cells.size),
-        sp_transport_raw=t_raw,
-        sp_transport_centered=t_centered,
-        sp_predict_raw=p_raw,
-        sp_predict_centered=p_centered,
-        sp_nowarp_raw=n_raw,
-        sp_nowarp_centered=n_centered,
+        **_prefixed(score_all_metrics(transport, target, center), "sp_transport"),
+        **_prefixed(predict_metrics, "sp_predict"),
+        **_prefixed(score_all_metrics(nowarp, target, center), "sp_nowarp"),
     )
 
 

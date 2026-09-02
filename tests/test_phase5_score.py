@@ -287,3 +287,82 @@ def test_region_masks_partition_the_support():
     assert int((masks["low_texture"] & masks["high_texture"]).sum()) == 0
     for mask in masks.values():
         assert bool((mask <= support).all())
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.7 requires an L2 companion beside every cosine
+# ---------------------------------------------------------------------------
+
+def test_every_method_reports_all_four_protocol_columns():
+    from lot.phase5_score import score_all_metrics
+
+    target = torch.randn(20, CHANNELS, dtype=torch.float64)
+    metrics = score_all_metrics(target.clone(), target, _center())
+    assert set(metrics) == {
+        "cosine_raw", "cosine_centered", "l2_raw", "l2_centered", "n_failures"
+    }
+    assert metrics["cosine_raw"] == pytest.approx(1.0)
+    assert metrics["l2_raw"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["l2_centered"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_l2_matches_the_frozen_phase3_implementation():
+    """The companion must be the same quantity Phase 3 and Phase 4 report."""
+    from lot.evaluate import value_agreement
+    from lot.phase5_score import score_all_metrics
+
+    g = torch.Generator().manual_seed(21)
+    prediction = torch.randn(30, CHANNELS, generator=g, dtype=torch.float64)
+    target = torch.randn(30, CHANNELS, generator=g, dtype=torch.float64)
+    center = _center()
+
+    mine = score_all_metrics(prediction, target, center)
+    cosine_raw, l2_raw = value_agreement(prediction, target)
+    cosine_centered, l2_centered = value_agreement(prediction, target, center=center)
+    assert mine["cosine_raw"] == pytest.approx(cosine_raw, abs=1e-6)
+    assert mine["l2_raw"] == pytest.approx(l2_raw, abs=1e-6)
+    assert mine["cosine_centered"] == pytest.approx(cosine_centered, abs=1e-6)
+    assert mine["l2_centered"] == pytest.approx(l2_centered, abs=1e-6)
+
+
+def test_l2_scores_a_failure_at_the_worst_attainable_distance():
+    from lot.phase5_score import MODEL_FAILURE_L2, score_all_metrics
+
+    target = torch.randn(4, CHANNELS, dtype=torch.float64)
+    prediction = target.clone()
+    prediction[1] = float("nan")
+    metrics = score_all_metrics(prediction, target, torch.zeros(CHANNELS, dtype=torch.float64))
+    assert metrics["n_failures"] == 1
+    assert metrics["l2_raw"] == pytest.approx((3 * 0.0 + MODEL_FAILURE_L2) / 4, abs=1e-6)
+
+
+def test_the_primary_record_carries_l2_for_every_method():
+    scene, lift, support = _two_plane_setup()
+    n_target = GRID * GRID
+    predicted = torch.randn(n_target, CHANNELS, dtype=torch.float64)
+    fields = score_primary(
+        lift, support, _features(1), _features(2), _center(), predicted, (GRID, GRID)
+    ).as_fields()
+    for method in ("cl", "predict", "nowarp"):
+        for column in ("raw", "centered", "l2_raw", "l2_centered"):
+            key = f"{method}_{column}"
+            assert key in fields, key
+            assert math.isfinite(fields[key]), key
+
+
+def test_the_splat_and_formulation_records_carry_l2_too():
+    from lot.phase5_score import SplatScores, score_splat_pool
+
+    n_cells = 16
+    g = torch.Generator().manual_seed(8)
+    a = torch.randn(CHANNELS, n_cells, generator=g, dtype=torch.float64)
+    b = torch.randn(CHANNELS, n_cells, generator=g, dtype=torch.float64)
+    c = torch.randn(CHANNELS, n_cells, generator=g, dtype=torch.float64)
+    predicted = torch.randn(n_cells, CHANNELS, generator=g, dtype=torch.float64)
+    fields = score_splat_pool(
+        np.array([0, 3, 9], dtype=np.int64), a, b, c,
+        torch.zeros(CHANNELS, dtype=torch.float64), predicted,
+    ).as_fields()
+    for method in ("sp_transport", "sp_predict", "sp_nowarp"):
+        for column in ("raw", "centered", "l2_raw", "l2_centered"):
+            assert f"{method}_{column}" in fields

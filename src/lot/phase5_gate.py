@@ -47,14 +47,15 @@ REGIMES = ("rotation", "translation", "orbit")
 def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
     from .analysis_config import AnalysisConfig  # noqa: F401  (typing clarity)
     from .context_lift import context_lift_map, context_lift_support, rotation_homography_landing
-    from .datasets import load_scene_pairs, subsample_by_stratum
     from .encoders import PATCH_SIZE, patch_cell_index, pixel_to_patch_coords
-    from .evaluate import git_commit, load_or_build_mean_vector
+    from .evaluate import git_commit
     from .geometry import project, relative_pose, transform_points, unproject
     from .phase5 import (
         build_example,
         build_scene_inputs,
         load_convention_record,
+        phase5_mean_vector,
+        phase5_scene_pairs,
         predictor_config_from,
     )
     from .phase5_folds import fold_digest, frozen_folds
@@ -160,14 +161,10 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         return {"scenes": summaries, "single_convention": sorted(conventions)[0]}
 
     def step5() -> dict[str, Any]:
-        center = load_or_build_mean_vector(
-            Path(cfg.mean_vector_dir), cfg.cache_root, cfg.feature_encoder
-        )
+        center = phase5_mean_vector(cfg)
         state["center"] = center
         inputs = state["probe_inputs"]
-        pairs = subsample_by_stratum(
-            load_scene_pairs(Path(cfg.renders_root) / inputs.scene, analysis), analysis
-        )
+        pairs = phase5_scene_pairs(cfg, analysis, inputs.scene)
         per_regime: dict[str, Any] = {}
         for regime in REGIMES:
             candidates = [p for p in pairs if p.regime == regime]
@@ -401,37 +398,29 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         batch_pairs = int(cfg.training.get("batch_pairs", 8))
         examples = list(state["examples"].values())
         batch = [examples[i % len(examples)] for i in range(batch_pairs)]
-        # Supervision lengths differ per pair, so the batch is trimmed to the
-        # shortest for this shape probe. The real data layer batches by padding
-        # with an unsupported mask; what is being checked here is that the
-        # stacked shapes, dtypes, and devices line up at all.
-        shortest = min(int(e.support.numel()) for e in batch)
-        moved = [
-            dataclasses.replace(
-                e,
-                features_context=e.features_context.to(device),
-                depth_context_aligned=e.depth_context_aligned.to(device),
-                camera=e.camera.to(device),
-                context_valid=e.context_valid.to(device),
-                query_patch_coords=e.query_patch_coords[:shortest].to(device),
-                target_centered=e.target_centered[:shortest].to(device),
-                support=e.support[:shortest].to(device),
-            )
-            for e in batch
-        ]
+        # The batch goes through the real training path untouched: no
+        # truncation, no manual device transfer. An earlier version of this step
+        # trimmed every pair to the shortest supervision length and moved the
+        # tensors itself, which made the probe pass while the actual training
+        # path could not have batched pairs of differing support at all, nor
+        # placed its own tensors on the device. A gate that works around the
+        # code it is meant to exercise proves nothing about that code.
         grid = model_cfg.target_grid
+        lengths = [int(e.support.numel()) for e in batch]
         shapes = {
-            "batch_pairs": len(moved),
-            "n_queries_per_pair": shortest,
-            "features_context": describe_tensor(moved[0].features_context),
-            "depth_context_aligned": describe_tensor(moved[0].depth_context_aligned),
-            "camera": describe_tensor(moved[0].camera),
-            "context_valid": describe_tensor(moved[0].context_valid),
-            "query_patch_coords": describe_tensor(moved[0].query_patch_coords),
-            "target_centered": describe_tensor(moved[0].target_centered),
-            "support": describe_tensor(moved[0].support),
+            "batch_pairs": len(batch),
+            "supervision_lengths": lengths,
+            "ragged": len(set(lengths)) > 1,
+            "features_context": describe_tensor(batch[0].features_context),
+            "depth_context_aligned": describe_tensor(batch[0].depth_context_aligned),
+            "camera": describe_tensor(batch[0].camera),
+            "context_valid": describe_tensor(batch[0].context_valid),
+            "query_patch_coords": describe_tensor(batch[0].query_patch_coords),
+            "target_centered": describe_tensor(batch[0].target_centered),
+            "support": describe_tensor(batch[0].support),
         }
-        assert_no_forbidden_fields(moved[0], "dry-run batch")
+        assert_no_forbidden_fields(batch[0], "dry-run batch")
+        moved = batch
 
         holder: dict[str, Any] = {}
 

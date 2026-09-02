@@ -54,19 +54,26 @@ FORMULATION = "formulation"
 # Per-pair score fields. Each is the pair's mean score over its own supported
 # samples, so a cell's estimand is the unweighted mean over camera pairs that
 # PROTOCOL 3.4 fixes as the unit.
+# Each method carries all four PROTOCOL 3.7 columns. The reported quantities are
+# built on the cosines, as Phase 4's are; the L2 companions are aggregated
+# alongside so the shipped tables are schema-complete against the frozen
+# protocol rather than cosine-only.
 PRIMARY_FIELDS = (
-    "cl_raw", "cl_centered",
-    "predict_raw", "predict_centered",
-    "nowarp_raw", "nowarp_centered",
+    "cl_raw", "cl_centered", "cl_l2_raw", "cl_l2_centered",
+    "predict_raw", "predict_centered", "predict_l2_raw", "predict_l2_centered",
+    "nowarp_raw", "nowarp_centered", "nowarp_l2_raw", "nowarp_l2_centered",
 )
 FORMULATION_FIELDS = (
-    "tl_form_raw", "tl_form_centered",
-    "cl_form_raw", "cl_form_centered",
+    "tl_form_raw", "tl_form_centered", "tl_form_l2_raw", "tl_form_l2_centered",
+    "cl_form_raw", "cl_form_centered", "cl_form_l2_raw", "cl_form_l2_centered",
 )
 SPLAT_FIELDS = (
     "sp_transport_raw", "sp_transport_centered",
+    "sp_transport_l2_raw", "sp_transport_l2_centered",
     "sp_predict_raw", "sp_predict_centered",
+    "sp_predict_l2_raw", "sp_predict_l2_centered",
     "sp_nowarp_raw", "sp_nowarp_centered",
+    "sp_nowarp_l2_raw", "sp_nowarp_l2_centered",
 )
 # Counts and diagnostics. Never bootstrapped as scores, and the near-zero rule
 # does not apply to them because they are not in score space.
@@ -190,42 +197,117 @@ def support_counts(records: Sequence[dict], count_field: str) -> SupportCounts:
     )
 
 
-def near_zero_disclosure(
-    quantity: str, estimate: float, lo: float, hi: float, analysis: AnalysisConfig
-) -> dict[str, Any]:
-    """The frozen 0.003 rule, carried forward unchanged from PROTOCOL 3.9.
+@dataclasses.dataclass(frozen=True)
+class PathEstimate:
+    """One evaluation path's estimate and paired interval for a quantity."""
 
-    An effect no larger than the operator band is not certified by that band.
-    The exact estimate and its paired interval are printed, the cell is flagged,
-    and the wording discipline applies: no equivalence is claimed, because no
-    equivalence region was ever frozen.
+    estimate: float
+    lo: float
+    hi: float
+
+    @property
+    def finite(self) -> bool:
+        return math.isfinite(self.estimate)
+
+    def within(self, band: float) -> bool:
+        return self.finite and abs(self.estimate) <= band
+
+    @property
+    def excludes_zero(self) -> bool:
+        return math.isfinite(self.lo) and math.isfinite(self.hi) and (
+            self.lo > 0.0 or self.hi < 0.0
+        )
+
+    @property
+    def sign(self) -> int:
+        if not self.finite or self.estimate == 0.0:
+            return 0
+        return 1 if self.estimate > 0.0 else -1
+
+
+def near_zero_disclosure(
+    quantity: str,
+    per_point: PathEstimate,
+    splat_pool: PathEstimate | None,
+    analysis: AnalysisConfig,
+) -> dict[str, Any]:
+    """The frozen 0.003 rule, carried forward verbatim from PROTOCOL 3.9.
+
+    The rule is explicitly two-path. Its exact words: both estimates within the
+    band with one sign and both intervals clear of zero licenses a claim of a
+    small, sign-consistent effect; exactly one within the band licenses the
+    effect but not a claim about its size, which is reported as path-sensitive;
+    a difference in sign, or an interval that includes zero, licenses no claim
+    of advantage and the effect is reported as being at the scale of
+    evaluation-path choice.
+
+    An earlier version of this function saw one path and could therefore issue
+    the strongest of those three wordings while the other path disagreed or
+    reversed sign. That is precisely the over-licensing 3.9 exists to prevent,
+    so the second path is now a required argument. Passing None is permitted
+    only for a quantity that has no second path, and it can never reach the
+    sign-consistent wording.
 
     Applied only to score-space quantities. Counts and fractions are not in the
     metric's units and the band means nothing for them.
     """
     if quantity not in SCORE_SPACE_QUANTITIES:
         return {"near_zero": False, "applicable": False}
+
     band = analysis.path_agreement_tolerance
-    if not math.isfinite(estimate):
-        return {"near_zero": False, "applicable": True}
-    flagged = abs(estimate) <= band
-    interval_excludes_zero = (
-        math.isfinite(lo) and math.isfinite(hi) and (lo > 0.0 or hi < 0.0)
-    )
+    if not per_point.finite:
+        return {"near_zero": False, "applicable": True, "band": band}
+
+    pp_in = per_point.within(band)
+    if splat_pool is None or not splat_pool.finite:
+        # No comparable second path. The band still flags the cell, but the only
+        # claim available is the weakest one: 3.9's licence for a sign-consistent
+        # effect is conditional on both paths, and one path cannot supply it.
+        return {
+            "near_zero": bool(pp_in),
+            "applicable": True,
+            "band": band,
+            "per_point": dataclasses.asdict(per_point),
+            "splat_pool": None,
+            "paths_agree_in_sign": None,
+            "both_intervals_exclude_zero": None,
+            "wording": (
+                "no measurable difference at the reported scale, single path"
+                if pp_in else "effect outside the operator band"
+            ),
+        }
+
+    sp_in = splat_pool.within(band)
+    same_sign = per_point.sign == splat_pool.sign and per_point.sign != 0
+    both_clear = per_point.excludes_zero and splat_pool.excludes_zero
+
+    if pp_in and sp_in and same_sign and both_clear:
+        wording = "small, sign-consistent effect"
+    elif pp_in != sp_in:
+        wording = (
+            "effect licensed but its size is path-sensitive; the two evaluation "
+            "paths do not agree about whether it sits inside the operator band"
+        )
+    elif not same_sign or not both_clear:
+        wording = (
+            "no claim of advantage; the effect is at the scale of "
+            "evaluation-path choice"
+        )
+    else:
+        wording = "effect outside the operator band"
+
     return {
-        "near_zero": bool(flagged),
+        "near_zero": bool(pp_in or sp_in),
         "applicable": True,
         "band": band,
-        "interval_excludes_zero": bool(interval_excludes_zero),
-        # The only claim a flagged cell licenses on its own. Equivalence is not
-        # among them and is never asserted from a near-zero estimate.
-        "wording": (
-            "no measurable difference at the reported scale"
-            if flagged and not interval_excludes_zero
-            else "small, sign-consistent effect"
-            if flagged
-            else "effect outside the operator band"
-        ),
+        "per_point": dataclasses.asdict(per_point),
+        "splat_pool": dataclasses.asdict(splat_pool),
+        "path_difference": per_point.estimate - splat_pool.estimate,
+        "paths_agree_in_sign": bool(same_sign),
+        "both_intervals_exclude_zero": bool(both_clear),
+        # Equivalence is never among the licensed wordings, under any branch,
+        # because no equivalence region was ever frozen.
+        "wording": wording,
     }
 
 
@@ -270,6 +352,46 @@ def _count_field_for(population: str) -> str:
     }[population]
 
 
+# Which splat-pool quantity is the same effect measured on the operational
+# path. PROTOCOL 3.9's near-zero rule compares an effect across both evaluation
+# paths, so a quantity that has a counterpart must be disclosed against it.
+# The formulation quantities have none: they exist only on the per-point path,
+# and a cell without a second path can never reach the sign-consistent wording.
+PATH_COUNTERPART = {
+    "delta_learn_pp": "delta_learn_sp",
+    "cl_margin": "sp_transport_margin",
+    "predict_margin": "sp_predict_margin",
+    "cl_transport": "sp_transport",
+    "predict_with_depth": "sp_predict",
+}
+
+
+def _interval_for(
+    records: Sequence[dict],
+    quantity: str,
+    metric: str,
+    analysis: AnalysisConfig,
+    unit: str,
+) -> tuple[dict[str, Any], SupportCounts]:
+    """One quantity's paired interval on its own population, without disclosure."""
+    population = QUANTITY_POPULATION[quantity]
+    fields = _fields_for(population)
+    count_field = _count_field_for(population)
+    formula = quantity_formulas(metric)[quantity]
+    contributing = [
+        r for r in records
+        if isinstance(r.get(count_field), (int, float)) and (r.get(count_field) or 0) > 0
+    ]
+    interval = paired_interval(
+        contributing, fields, formula,
+        resamples=analysis.bootstrap_resamples,
+        seed=analysis.bootstrap_seed,
+        confidence=analysis.bootstrap_confidence,
+        unit=unit,
+    )
+    return interval, support_counts(contributing, count_field)
+
+
 def evaluate_quantity(
     records: Sequence[dict],
     quantity: str,
@@ -284,25 +406,21 @@ def evaluate_quantity(
     replicate from that replicate's own means.
     """
     population = QUANTITY_POPULATION[quantity]
-    fields = _fields_for(population)
-    count_field = _count_field_for(population)
-    formula = quantity_formulas(metric)[quantity]
+    interval, counts = _interval_for(records, quantity, metric, analysis, unit)
 
-    # Only pairs that actually contributed to this population may enter its cell.
-    contributing = [
-        r for r in records
-        if isinstance(r.get(count_field), (int, float)) and (r.get(count_field) or 0) > 0
-    ]
-    counts = support_counts(contributing, count_field)
-    interval = paired_interval(
-        contributing, fields, formula,
-        resamples=analysis.bootstrap_resamples,
-        seed=analysis.bootstrap_seed,
-        confidence=analysis.bootstrap_confidence,
-        unit=unit,
-    )
+    # PROTOCOL 3.9's disclosure is two-path, so the counterpart on the
+    # operational path is computed here and handed to it rather than left out.
+    counterpart_name = PATH_COUNTERPART.get(quantity)
+    counterpart = None
+    if counterpart_name is not None:
+        other, _ = _interval_for(records, counterpart_name, metric, analysis, unit)
+        counterpart = PathEstimate(other["estimate"], other["lo"], other["hi"])
+
     disclosure = near_zero_disclosure(
-        quantity, interval["estimate"], interval["lo"], interval["hi"], analysis
+        quantity,
+        PathEstimate(interval["estimate"], interval["lo"], interval["hi"]),
+        counterpart,
+        analysis,
     )
     return CellResult(
         quantity=quantity,

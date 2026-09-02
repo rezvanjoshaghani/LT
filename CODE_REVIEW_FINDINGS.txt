@@ -1,0 +1,125 @@
+CODE REVIEW FINDINGS
+====================
+
+Review target: repair/validation-streams-abc
+Comparison base: ff52d13
+
+1. [P1] Mean-vector loader is called with the wrong signature
+
+File: src/lot/phase5_gate.py
+Line: 163
+
+load_or_build_mean_vector requires (cache_root, encoder, scenes, out_dir),
+but this call supplies three arguments in a different order. With real
+artifacts, integration-gate step 5 will stop with TypeError before exercising
+the remaining checks.
+
+
+2. [P1] Dataset helpers use obsolete positional APIs
+
+Files:
+  src/lot/phase5.py, lines 361-363
+  src/lot/phase5_gate.py, lines 168-169
+
+load_scene_pairs expects (renders_root, scene, config=...), while
+subsample_by_stratum expects an integer max_per_stratum. These calls pass an
+AnalysisConfig in the scene and count positions, respectively, so both the
+gate and normal example iterator fail on real data.
+
+
+3. [P1] Pair-dependent supervision cannot be batched
+
+File: src/lot/train.py
+Lines: 185-187
+
+build_example produces one query per supported landing, so M varies by camera
+pair. Stacking these tensors raises when two pairs have different support
+counts. The integration gate conceals this by truncating every example to the
+shortest length; padding and an unsupported mask are described there but never
+implemented.
+
+
+4. [P1] CUDA training leaves every batch on CPU
+
+File: src/lot/train.py
+Line: 312
+
+The model moves to device, but examples created from NumPy and cache tensors
+remain on CPU, and _collate performs no device transfer. Calling train_fold
+with device="cuda" therefore fails at the first forward pass. The gate avoids
+this by manually moving its synthetic batch, so it does not test the actual
+training path.
+
+
+5. [P1] Checkpoint selection does not enforce the validation split
+
+File: src/lot/train.py
+Lines: 353-354
+
+Training checks only that its batch excludes test scenes; it does not require
+membership in fold.train. Validation is consumed without any role check, so
+test scenes can silently influence checkpoint selection, and validation scenes
+can enter optimization. The tiny-overfit entry point similarly accepts
+arbitrary scenes without a fold.
+
+
+6. [P1] Near-zero wording ignores the required second path
+
+File: src/lot/phase5_estimands.py
+Lines: 211-228
+
+PROTOCOL 3.9 licenses "small, sign-consistent effect" only after comparing
+both evaluation paths on their common-valid population, with both intervals
+excluding zero. This function sees one estimate and can issue that wording
+even when the splat path disagrees or reverses sign.
+
+
+7. [P2] Phase 5 omits required L2 companion metrics
+
+File: src/lot/phase5_score.py
+Lines: 66-85
+
+The frozen protocol requires raw and centered cosine with L2 companions for
+every scored record. Phase 5 computes and propagates cosine only; no Phase 5
+source or test contains an L2 implementation, so its eventual result schema
+will be protocol-incomplete.
+
+
+8. [P1] Gate receipts are not bound to the current run identity
+
+File: scripts/run_phase5.sh
+Lines: 106-109 and 124-127
+
+The launcher checks only the passed field. It does not compare the receipt's
+commit, configuration digest, fold digest, measurement digest, or environment
+with the current job. A clean later commit or changed configuration can
+therefore reuse a stale PASS receipt.
+
+
+9. [P1] Direct SLURM submission bypasses both gates
+
+File: scripts/phase5_train.sbatch
+Lines: 60-65
+
+The worker checks only for a clean tree before starting training; it never
+validates the integration or overfit receipts. Since the documented
+configuration also shows direct sbatch usage, the true execution boundary does
+not enforce the claimed prerequisites.
+
+
+10. [P2] An empty training iterator loops forever
+
+File: src/lot/train.py
+Lines: 330-337
+
+When train_examples yields nothing, the loop repeatedly recreates an empty
+iterator without advancing step or raising. A fold with no usable examples
+will occupy a cluster job indefinitely instead of producing a classified stop.
+
+
+KNOWN INCOMPLETENESS
+====================
+
+The branch is not runnable end-to-end. Modes overfit, train, controls, and
+evaluate all exit intentionally at src/lot/phase5.py lines 442-446, as the
+runbook acknowledges.

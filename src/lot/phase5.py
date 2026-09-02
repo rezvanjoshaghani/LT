@@ -34,7 +34,7 @@ from torch import Tensor
 
 from .analysis_config import DEFAULT_CONFIG_PATH, AnalysisConfig, load_analysis_config
 from .context_lift import context_lift_map, context_lift_support
-from .datasets import load_scene_pairs, subsample_by_stratum
+from .datasets import load_scene_pairs, scene_split, subsample_by_stratum
 from .encoders import PATCH_SIZE, load_cache_meta, patch_grid_shape
 from .evaluate import _SceneCache, git_commit, load_or_build_mean_vector
 from .geometry import relative_pose
@@ -52,7 +52,7 @@ from .phase4 import (
 from .phase5_folds import Fold, fold_of_test_scene, frozen_folds
 from .phase5_score import primary_support, score_primary
 from .predictors import PredictorConfig, camera_vector
-from .render_replica import MANIFEST_NAME, load_manifest
+from .render_replica import MANIFEST_NAME, REPLICA_SCENES, load_manifest
 from .train import TrainingExample
 
 PHASE5_VERSION = 1
@@ -144,6 +144,38 @@ def predictor_config_from(cfg: Phase5Config, image_hw: tuple[int, int]) -> Predi
         patch_size=PATCH_SIZE,
         context_grid=grid,
         target_grid=grid,
+    )
+
+
+def phase5_mean_vector(cfg: Phase5Config) -> Tensor:
+    """The frozen Phase 3 centering statistic, reused rather than rebuilt.
+
+    The scene list is Phase 3's own train split, not Phase 5's folds. That is
+    deliberate and load bearing: the stored vector carries a provenance record
+    naming the scenes it was built from, and the loader refuses a mismatch, so
+    passing the Phase 5 folds here would either fail loudly or, in a fresh
+    directory, silently build a different centering statistic and move both the
+    Mean-Feature floor and every centered score away from Phase 3 and Phase 4.
+    """
+    train = [s for s in REPLICA_SCENES if scene_split(s) == "train"]
+    return load_or_build_mean_vector(
+        Path(cfg.cache_root), cfg.feature_encoder, train, Path(cfg.mean_vector_dir)
+    )
+
+
+def phase5_scene_pairs(
+    cfg: Phase5Config, analysis: AnalysisConfig, scene: str
+) -> list[Any]:
+    """One scene's sampled pairs, drawn exactly as Phase 3 and Phase 4 draw them.
+
+    Defined once and used by both the evaluation path and the integration gate,
+    so the two cannot drift onto different populations.
+    """
+    return subsample_by_stratum(
+        load_scene_pairs(cfg.renders_root, scene, config=analysis),
+        analysis.max_pairs_per_stratum,
+        seed=cfg.seed,
+        config=analysis,
     )
 
 
@@ -358,9 +390,7 @@ def iter_examples(
     for scene in scenes:
         inputs = build_scene_inputs(cfg, analysis, scene, convention)
         try:
-            pairs = subsample_by_stratum(
-                load_scene_pairs(Path(cfg.renders_root) / scene, analysis), analysis
-            )
+            pairs = phase5_scene_pairs(cfg, analysis, scene)
             if regimes is not None:
                 pairs = [p for p in pairs if p.regime in set(regimes)]
             if limit_per_scene is not None:

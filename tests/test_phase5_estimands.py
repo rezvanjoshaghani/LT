@@ -16,6 +16,7 @@ from lot.phase5_estimands import (
     SPLAT_POOL,
     TL_REFERENCE,
     HeadlineSubstitutionError,
+    PathEstimate,
     assert_not_target_lift_headline,
     evaluate_quantity,
     near_zero_disclosure,
@@ -194,46 +195,117 @@ def test_empty_population_yields_a_reported_empty_cell():
 # Stream AB: the near-zero disclosure
 # ---------------------------------------------------------------------------
 
-def test_near_zero_flags_inside_the_frozen_band():
-    out = near_zero_disclosure("delta_learn_pp", 0.0012, 0.0009, 0.0015, ANALYSIS)
+def _pe(estimate, lo, hi):
+    return PathEstimate(estimate, lo, hi)
+
+
+def test_both_paths_inside_the_band_and_clear_of_zero_license_the_strong_wording():
+    """PROTOCOL 3.9's strongest near-zero licence, and its exact preconditions."""
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.0012, 0.0009, 0.0015), _pe(0.0018, 0.0011, 0.0024),
+        ANALYSIS,
+    )
     assert out["near_zero"]
     assert out["band"] == ANALYSIS.path_agreement_tolerance == 0.003
-    assert out["interval_excludes_zero"]
+    assert out["paths_agree_in_sign"] and out["both_intervals_exclude_zero"]
     assert out["wording"] == "small, sign-consistent effect"
 
 
-def test_near_zero_with_an_interval_containing_zero_claims_nothing():
-    out = near_zero_disclosure("delta_learn_pp", 0.0004, -0.0020, 0.0028, ANALYSIS)
+def test_a_disagreeing_splat_path_withdraws_the_strong_wording():
+    """The over-licensing the single-path version allowed, now impossible.
+
+    Same per-point cell as above. The operational path reverses sign, so 3.9
+    licenses no claim of advantage, where the earlier one-path function would
+    have called this a small, sign-consistent effect.
+    """
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.0012, 0.0009, 0.0015), _pe(-0.0016, -0.0022, -0.0009),
+        ANALYSIS,
+    )
+    assert not out["paths_agree_in_sign"]
+    assert out["wording"] == (
+        "no claim of advantage; the effect is at the scale of "
+        "evaluation-path choice"
+    )
+    assert "equivalen" not in out["wording"]
+
+
+def test_an_interval_containing_zero_withdraws_the_strong_wording():
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.0012, -0.0004, 0.0028), _pe(0.0018, 0.0011, 0.0024),
+        ANALYSIS,
+    )
+    assert not out["both_intervals_exclude_zero"]
+    assert out["wording"].startswith("no claim of advantage")
+
+
+def test_exactly_one_path_inside_the_band_is_reported_as_path_sensitive():
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.0012, 0.0009, 0.0015), _pe(0.031, 0.026, 0.036),
+        ANALYSIS,
+    )
     assert out["near_zero"]
-    assert not out["interval_excludes_zero"]
-    assert out["wording"] == "no measurable difference at the reported scale"
-    assert "equivalen" not in out["wording"], "equivalence is never claimed"
+    assert "path-sensitive" in out["wording"]
 
 
-def test_effects_outside_the_band_are_not_flagged():
-    out = near_zero_disclosure("delta_learn_pp", 0.031, 0.026, 0.036, ANALYSIS)
+def test_both_paths_outside_the_band_are_not_flagged():
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.031, 0.026, 0.036), _pe(0.028, 0.022, 0.034), ANALYSIS
+    )
     assert not out["near_zero"]
     assert out["wording"] == "effect outside the operator band"
 
 
 def test_the_band_is_exactly_at_the_boundary():
-    assert near_zero_disclosure("delta_learn_pp", 0.003, 0.002, 0.004, ANALYSIS)["near_zero"]
-    assert not near_zero_disclosure(
-        "delta_learn_pp", 0.0030001, 0.002, 0.004, ANALYSIS
-    )["near_zero"]
+    inside = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.003, 0.002, 0.004), _pe(0.003, 0.002, 0.004), ANALYSIS
+    )
+    assert inside["near_zero"]
+    outside = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.0030001, 0.002, 0.004), _pe(0.0030001, 0.002, 0.004),
+        ANALYSIS,
+    )
+    assert not outside["near_zero"]
+
+
+def test_a_missing_second_path_can_never_reach_the_strong_wording():
+    """A quantity with no counterpart is disclosed at the weakest licence."""
+    out = near_zero_disclosure("delta_learn_pp", _pe(0.0012, 0.0009, 0.0015), None,
+                               ANALYSIS)
+    assert out["near_zero"]
+    assert out["splat_pool"] is None
+    assert out["wording"] == (
+        "no measurable difference at the reported scale, single path"
+    )
+    assert out["wording"] != "small, sign-consistent effect"
 
 
 def test_the_band_does_not_apply_to_dimensionless_quantities():
-    out = near_zero_disclosure("n_primary", 0.001, 0.0, 0.002, ANALYSIS)
+    out = near_zero_disclosure("n_primary", _pe(0.001, 0.0, 0.002), None, ANALYSIS)
     assert not out["applicable"]
     assert not out["near_zero"]
 
 
 def test_a_nonfinite_estimate_is_not_flagged_as_near_zero():
-    out = near_zero_disclosure("delta_learn_pp", float("nan"), float("nan"),
-                               float("nan"), ANALYSIS)
+    nan = float("nan")
+    out = near_zero_disclosure("delta_learn_pp", _pe(nan, nan, nan), None, ANALYSIS)
     assert out["applicable"]
     assert not out["near_zero"]
+
+
+def test_no_branch_ever_claims_equivalence():
+    """No frozen equivalence region exists, so no wording may imply one."""
+    cases = [
+        (_pe(0.001, 0.0005, 0.0015), _pe(0.001, 0.0005, 0.0015)),
+        (_pe(0.001, -0.001, 0.003), _pe(0.001, 0.0005, 0.0015)),
+        (_pe(0.001, 0.0005, 0.0015), _pe(-0.001, -0.0015, -0.0005)),
+        (_pe(0.001, 0.0005, 0.0015), _pe(0.04, 0.03, 0.05)),
+        (_pe(0.04, 0.03, 0.05), _pe(0.04, 0.03, 0.05)),
+        (_pe(0.001, 0.0005, 0.0015), None),
+    ]
+    for per_point, splat in cases:
+        wording = near_zero_disclosure("delta_learn_pp", per_point, splat, ANALYSIS)
+        assert "equivalen" not in wording["wording"].lower()
 
 
 def test_cell_row_carries_the_disclosure_flat():

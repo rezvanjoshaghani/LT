@@ -97,41 +97,30 @@ print_identity() {
     run_lot python -m lot.phase5 --config "$CONFIG" --mode describe
 }
 
+# A receipt is only evidence about the state that produced it. Checking that it
+# says PASS, and nothing else, lets a later commit or an edited configuration
+# inherit an older run's verdict: the gate would have verified artifacts and
+# shapes for code that is no longer the code about to train. So every receipt is
+# bound to the run identity, and a mismatch is refused with the field named.
+require_receipt() {
+    local receipt="$1" label="$2" advice="$3"
+    if [ ! -f "$receipt" ]; then
+        echo "$label has not been run; $receipt is absent." >&2
+        echo "$advice" >&2
+        exit 1
+    fi
+    run_lot python -m lot.phase5_receipt \
+        --receipt "$receipt" --config "$CONFIG" --label "$label" || exit 1
+}
+
 require_gate_passed() {
-    if [ ! -f "$GATE_RECEIPT" ]; then
-        echo "the Borah integration gate has not been run." >&2
-        echo "run './scripts/run_phase5.sh check' first; $GATE_RECEIPT is absent." >&2
-        exit 1
-    fi
-    if ! run_lot python -c "
-import json, sys
-report = json.load(open('$GATE_RECEIPT'))
-sys.exit(0 if report.get('passed') else 1)
-"; then
-        echo "the Borah integration gate did not pass. Training is not permitted." >&2
-        echo "see $GATE_RECEIPT" >&2
-        exit 1
-    fi
-    echo "integration gate: PASS (from $GATE_RECEIPT)"
+    require_receipt "$GATE_RECEIPT" "the Borah integration gate" \
+        "run './scripts/run_phase5.sh check' first."
 }
 
 require_overfit_passed() {
-    if [ ! -f "$OVERFIT_RECEIPT" ]; then
-        echo "the tiny-subset overfit gate has not been run." >&2
-        echo "run './scripts/run_phase5.sh overfit' first." >&2
-        exit 1
-    fi
-    if ! run_lot python -c "
-import json, sys
-report = json.load(open('$OVERFIT_RECEIPT'))
-sys.exit(0 if report.get('passed') else 1)
-"; then
-        echo "the tiny-subset overfit gate did not pass." >&2
-        echo "Phase 5 stops here: a predictor that cannot fit the tiny sample" >&2
-        echo "cannot support a scientific reading of its underperformance." >&2
-        exit 1
-    fi
-    echo "tiny-subset overfit gate: PASS (from $OVERFIT_RECEIPT)"
+    require_receipt "$OVERFIT_RECEIPT" "the tiny-subset overfit gate" \
+        "run './scripts/run_phase5.sh overfit' first."
 }
 
 mkdir -p "$EVIDENCE_DIR"

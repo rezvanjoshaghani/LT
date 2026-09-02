@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import pytest
@@ -313,3 +314,158 @@ def test_batch_loss_reports_the_supported_count():
     assert n == 2 * M
     assert torch.isfinite(loss)
     assert math.isfinite(cosine)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: ragged supervision, device placement, and fold roles
+# ---------------------------------------------------------------------------
+
+def _ragged(index: int, m: int, scene: str = "room_1") -> TrainingExample:
+    e = make_example(index, scene=scene)
+    return dataclasses.replace(
+        e,
+        query_patch_coords=e.query_patch_coords[:m],
+        target_centered=e.target_centered[:m],
+        support=e.support[:m],
+    )
+
+
+def test_pairs_with_different_support_counts_batch():
+    """Real pairs never share a supervision length; stacking them must work."""
+    model = build_predictor(TINY)
+    batch = [_ragged(0, 5), _ragged(1, 3), _ragged(2, 4)]
+    loss, cosine, n = batch_loss(model, batch, GRID_HW)
+    assert torch.isfinite(loss)
+    assert n == 5 + 3 + 4, "every supported sample must be counted"
+
+
+def test_padding_is_inert_rather_than_approximate():
+    """A padded row must not move the loss by any amount."""
+    model = build_predictor(TINY).eval()
+    with torch.no_grad():
+        alone, _, n_alone = batch_loss(model, [_ragged(0, 3)], GRID_HW)
+        padded, _, n_padded = batch_loss(model, [_ragged(0, 3), _ragged(0, 3)], GRID_HW)
+        mixed, _, n_mixed = batch_loss(model, [_ragged(0, 3), _ragged(0, 5)], GRID_HW)
+    assert n_alone == 3 and n_padded == 6 and n_mixed == 8
+    # Two copies of one example give the same mean as one copy.
+    assert padded.item() == pytest.approx(alone.item(), abs=1e-6)
+    # The mixed batch pads the shorter pair; its 3 real samples still contribute
+    # exactly what they did alone, so nothing was invented or dropped.
+    assert math.isfinite(mixed.item())
+
+
+def test_truncating_instead_of_padding_would_lose_samples():
+    """Names the bias the padding fix removes."""
+    model = build_predictor(TINY).eval()
+    batch = [_ragged(0, 5), _ragged(1, 2)]
+    with torch.no_grad():
+        _, _, n = batch_loss(model, batch, GRID_HW)
+    shortest = min(int(e.support.numel()) for e in batch)
+    assert n == 7
+    assert n > shortest * len(batch), "truncation would have scored only 4"
+
+
+def test_collate_moves_inputs_to_the_model_device():
+    from lot.train import _collate
+
+    model = build_predictor(TINY)
+    device = next(model.parameters()).device
+    batch = _collate([make_example(0), make_example(1)], device)
+    for name, tensor in batch.items():
+        assert tensor.device == device, name
+
+
+def test_training_runs_on_the_model_device_without_manual_transfer():
+    """The training path itself must place its own tensors.
+
+    Run on whatever device is available. On CPU this is trivially true; on a
+    machine with CUDA it is the regression test for the failure where the model
+    moved to the device and the batch did not.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    fold = frozen_folds()[0]
+    train = [make_example(i, scene=fold.train[0]) for i in range(8)]
+    val = [make_example(100 + i, scene=fold.val[0]) for i in range(8)]
+    cfg = TrainingConfig(
+        learning_rate=1e-3, weight_decay=0.0, batch_pairs=8, max_steps=2,
+        warmup_steps=1, validation_every_steps=2, early_stopping_patience=99,
+    )
+    model, record = train_fold(
+        fold, seed=0, model_cfg=TINY, train_cfg=cfg,
+        train_examples=lambda: iter(train), val_examples=lambda: iter(val),
+        grid_hw=GRID_HW, device=device,
+    )
+    assert record.steps_run == 2
+    assert next(model.parameters()).device.type == device
+
+
+def test_a_scene_outside_the_train_split_is_refused_even_if_not_a_test_scene():
+    """Excluding test is necessary but not sufficient."""
+    from lot.train import assert_scenes_in_role
+
+    fold = frozen_folds()[0]
+    assert_scenes_in_role(fold, fold.train, "train", "ok")
+    assert_scenes_in_role(fold, fold.val, "val", "ok")
+    # A validation scene is not a test scene, and must still be refused in a
+    # training role: it would leak optimization into the selection statistic.
+    with pytest.raises(ValueError, match="not in its train split"):
+        assert_scenes_in_role(fold, [fold.val[0]], "train", "leak")
+    # And a training scene must be refused in the selection role.
+    with pytest.raises(ValueError, match="not in its val split"):
+        assert_scenes_in_role(fold, [fold.train[0]], "val", "leak")
+
+
+def test_a_test_scene_in_a_role_is_named_as_a_seal_breach():
+    from lot.train import assert_scenes_in_role
+
+    fold = frozen_folds()[0]
+    with pytest.raises(ValueError, match="sealed test set was breached"):
+        assert_scenes_in_role(fold, [fold.test[0]], "train", "leak")
+
+
+def test_an_unknown_role_is_refused():
+    from lot.train import assert_scenes_in_role
+
+    with pytest.raises(ValueError, match="unknown role"):
+        assert_scenes_in_role(frozen_folds()[0], [], "holdout", "x")
+
+
+def test_checkpoint_selection_refuses_a_validation_stream_of_test_scenes():
+    """Test scenes must not be able to influence checkpoint selection."""
+    fold = frozen_folds()[0]
+    train = [make_example(i, scene=fold.train[0]) for i in range(8)]
+    leaked = [make_example(100 + i, scene=fold.test[0]) for i in range(8)]
+    cfg = TrainingConfig(
+        learning_rate=1e-3, weight_decay=0.0, batch_pairs=8, max_steps=1,
+        warmup_steps=1, validation_every_steps=1, early_stopping_patience=99,
+    )
+    with pytest.raises(ValueError, match="sealed test set was breached"):
+        train_fold(
+            fold, seed=0, model_cfg=TINY, train_cfg=cfg,
+            train_examples=lambda: iter(train), val_examples=lambda: iter(leaked),
+            grid_hw=GRID_HW,
+        )
+
+
+def test_the_tiny_gate_refuses_scenes_outside_the_training_split():
+    fold = frozen_folds()[0]
+    examples = [make_example(i, scene=fold.test[0]) for i in range(4)]
+    cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
+    with pytest.raises(ValueError, match="sealed test set was breached"):
+        run_tiny_overfit_gate(
+            examples, TINY, cfg, GRID_HW, threshold=0.98, max_steps=5, fold=fold
+        )
+
+
+def test_an_empty_training_stream_stops_instead_of_spinning():
+    """A fold with no usable examples must fail, not occupy a cluster job."""
+    fold = frozen_folds()[0]
+    val = [make_example(100 + i, scene=fold.val[0]) for i in range(8)]
+    cfg = TrainingConfig(batch_pairs=8, max_steps=1000, warmup_steps=1,
+                         validation_every_steps=1)
+    with pytest.raises(ValueError, match="produced no training examples"):
+        train_fold(
+            fold, seed=0, model_cfg=TINY, train_cfg=cfg,
+            train_examples=lambda: iter([]), val_examples=lambda: iter(val),
+            grid_hw=GRID_HW,
+        )

@@ -137,13 +137,66 @@ class TrainingExample:
     support: Tensor                   # [M] bool
 
 
-def _collate(examples: Sequence[TrainingExample]) -> dict[str, Tensor]:
+def _collate(
+    examples: Sequence[TrainingExample], device: str | torch.device = "cpu"
+) -> dict[str, Tensor]:
+    """Stack the model inputs and move them to the device the model is on.
+
+    The transfer belongs here rather than at the call sites. Leaving it to the
+    caller meant train_fold could move the model to CUDA and then hand it CPU
+    tensors, which fails at the first forward pass; the integration gate did not
+    catch it because it moved its own batch by hand and so never exercised this
+    path.
+    """
     return {
-        "features_context": torch.stack([e.features_context for e in examples]),
-        "depth_context_aligned": torch.stack([e.depth_context_aligned for e in examples]),
-        "camera": torch.stack([e.camera for e in examples]),
-        "context_valid": torch.stack([e.context_valid for e in examples]),
+        "features_context": torch.stack(
+            [e.features_context for e in examples]
+        ).to(device),
+        "depth_context_aligned": torch.stack(
+            [e.depth_context_aligned for e in examples]
+        ).to(device),
+        "camera": torch.stack([e.camera for e in examples]).to(device),
+        "context_valid": torch.stack([e.context_valid for e in examples]).to(device),
     }
+
+
+def _pad_supervision(
+    examples: Sequence[TrainingExample], device: str | torch.device = "cpu"
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Stack per-pair supervision of differing lengths, padding with no support.
+
+    The number of supervised landings varies by camera pair, because it is the
+    count of samples the explicit comparator could validly transport and ground
+    truth could referee. Stacking those directly raises the moment two pairs
+    disagree, which is every real batch.
+
+    Padding is inert rather than approximate: a padded row carries support 0, and
+    centered_cosine_loss divides by the summed support, so a padded entry moves
+    neither the numerator nor the denominator. Truncating to the shortest pair
+    instead, which is what the integration gate did to get a shape probe, would
+    silently discard real supervised samples and bias every batch toward the
+    pairs with the least support.
+    """
+    lengths = [int(e.support.numel()) for e in examples]
+    width = max(lengths) if lengths else 0
+    coords, targets, support = [], [], []
+    for example in examples:
+        pad = width - int(example.support.numel())
+        q = example.query_patch_coords
+        t = example.target_centered
+        s = example.support
+        if pad:
+            q = torch.cat([q, q.new_zeros(pad, q.shape[-1])])
+            t = torch.cat([t, t.new_zeros(pad, t.shape[-1])])
+            s = torch.cat([s, s.new_zeros(pad, dtype=s.dtype)])
+        coords.append(q)
+        targets.append(t)
+        support.append(s)
+    return (
+        torch.stack(coords).to(device),
+        torch.stack(targets).to(device),
+        torch.stack(support).to(device),
+    )
 
 
 def read_predictions_at(
@@ -175,16 +228,16 @@ def batch_loss(
     grid_hw: tuple[int, int],
 ) -> tuple[Tensor, float, int]:
     """Loss and mean centered cosine over one batch's supported samples."""
-    batch = _collate(examples)
+    device = next(model.parameters()).device
+    batch = _collate(examples, device)
     predicted = model(
         batch["features_context"],
         batch["depth_context_aligned"],
         batch["camera"],
         context_valid=batch["context_valid"],
     )
-    queries = torch.stack([e.query_patch_coords for e in examples])
-    targets = torch.stack([e.target_centered for e in examples])
-    support = torch.stack([e.support for e in examples]).to(predicted.dtype)
+    queries, targets, support_mask = _pad_supervision(examples, device)
+    support = support_mask.to(predicted.dtype)
 
     read = read_predictions_at(predicted, queries, grid_hw)
     loss = centered_cosine_loss(read, targets, weights=support)
@@ -224,14 +277,14 @@ def evaluate_validation(
         nonlocal total, count, pairs
         if not buffer:
             return
-        batch = _collate(buffer)
+        device = next(model.parameters()).device
+        batch = _collate(buffer, device)
         predicted = model(
             batch["features_context"], batch["depth_context_aligned"],
             batch["camera"], context_valid=batch["context_valid"],
         )
-        queries = torch.stack([e.query_patch_coords for e in buffer])
-        targets = torch.stack([e.target_centered for e in buffer])
-        support = torch.stack([e.support for e in buffer]).to(predicted.dtype)
+        queries, targets, support_mask = _pad_supervision(buffer, device)
+        support = support_mask.to(predicted.dtype)
         read = read_predictions_at(predicted, queries, grid_hw)
         cosine = torch.nn.functional.cosine_similarity(read, targets, dim=-1, eps=1e-8)
         total += float((cosine * support).sum())
@@ -286,6 +339,39 @@ def assert_fold_is_sealed(fold: Fold, scenes: Sequence[str], where: str) -> None
         )
 
 
+def assert_scenes_in_role(
+    fold: Fold, scenes: Sequence[str], role: str, where: str
+) -> None:
+    """Every scene must belong to the split whose role it is being used for.
+
+    Excluding the test set is necessary but not sufficient. A scene absent from
+    the fold entirely, or a validation scene appearing in an optimizer step, or
+    a training scene appearing in checkpoint selection, all pass a test-only
+    check and all corrupt the experiment in different directions: the first
+    means the fold is not what the split hash says, the second leaks
+    optimization into the selection statistic, and the third selects a
+    checkpoint on data the model was fitted to.
+
+    So membership is asserted positively, against the named role, rather than
+    negatively against the test set alone.
+    """
+    allowed = {"train": set(fold.train), "val": set(fold.val)}.get(role)
+    if allowed is None:
+        raise ValueError(f"{where}: unknown role {role!r}; use 'train' or 'val'")
+    intruders = sorted(set(scenes) - allowed)
+    if intruders:
+        in_test = sorted(set(intruders) & set(fold.test))
+        detail = (
+            f" and {in_test} are this fold's test scenes, so the sealed test set "
+            "was breached and this run is invalid"
+            if in_test else ""
+        )
+        raise ValueError(
+            f"{where}: fold {fold.index} {role} role received scenes {intruders} "
+            f"that are not in its {role} split{detail}"
+        )
+
+
 def train_fold(
     fold: Fold,
     seed: int,
@@ -329,19 +415,31 @@ def train_fold(
 
     stream = iter(train_examples())
     buffer: list[TrainingExample] = []
+    yielded_this_pass = 0
     while step < limit:
         try:
             buffer.append(next(stream))
+            yielded_this_pass += 1
         except StopIteration:
+            # A pass that produced nothing means the fold has no usable example
+            # at all. Restarting the iterator would spin forever and hold a
+            # cluster job open with no output, so it is a classified stop.
+            if yielded_this_pass == 0:
+                raise ValueError(
+                    f"train_fold: fold {fold.index} seed {seed} produced no "
+                    "training examples in a full pass over its training scenes "
+                    f"{list(fold.train)}. Nothing can be optimized; this is a "
+                    "data or support failure, not a training outcome."
+                ) from None
             stream = iter(train_examples())
+            yielded_this_pass = 0
             continue
         if len(buffer) < train_cfg.batch_pairs:
             continue
 
-        assert_fold_is_sealed(fold, [e.scene for e in buffer], "train_fold")
-        for group in (buffer,):
-            loss, _, _ = batch_loss(model, group, grid_hw)
-            loss.backward()
+        assert_scenes_in_role(fold, [e.scene for e in buffer], "train", "train_fold")
+        loss, _, _ = batch_loss(model, buffer, grid_hw)
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip_norm)
         for param_group in optimizer.param_groups:
             param_group["lr"] = learning_rate_at(step, train_cfg)
@@ -351,7 +449,19 @@ def train_fold(
         step += 1
 
         if step % train_cfg.validation_every_steps == 0 or step == limit:
-            result = evaluate_validation(model, val_examples(), grid_hw, train_cfg.batch_pairs)
+            # Checkpoint selection may see validation scenes and nothing else.
+            # Asserted on the examples actually consumed, so a mislabelled
+            # stream cannot quietly select on train or test data.
+            def validation_stream():
+                for example in val_examples():
+                    assert_scenes_in_role(
+                        fold, [example.scene], "val", "checkpoint selection"
+                    )
+                    yield example
+
+            result = evaluate_validation(
+                model, validation_stream(), grid_hw, train_cfg.batch_pairs
+            )
             history.append((step, result.centered_cosine))
             if result.centered_cosine > best:
                 best = result.centered_cosine
@@ -421,14 +531,20 @@ def run_tiny_overfit_gate(
     seed: int = 0,
     device: str = "cpu",
     raise_on_failure: bool = True,
+    fold: Fold | None = None,
 ) -> TinyOverfitResult:
     """Fit the tiny subset and report whether the frozen threshold was reached.
 
-    The subset is training scenes only. Reaching the threshold says nothing
-    about generalization and is not meant to: it says the supervised mapping is
+    The subset is training scenes only, and when a fold is supplied that is
+    asserted rather than assumed. Reaching the threshold says nothing about
+    generalization and is not meant to: it says the supervised mapping is
     representable by this trunk under this optimizer, which is the precondition
     for reading anything scientific into a later underperformance.
     """
+    if fold is not None:
+        assert_scenes_in_role(
+            fold, [e.scene for e in examples], "train", "tiny overfit gate"
+        )
     torch.manual_seed(seed)
     model = build_predictor(model_cfg).to(device)
     model.train()

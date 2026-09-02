@@ -31,6 +31,13 @@ BOUND_FIELDS = (
     "measurement_digest",
 )
 
+# The resolved inputs the gate actually examined. A receipt that verified one
+# feature cache or one accepted Phase 4 run is not evidence about another, and
+# the configuration digest alone cannot see this: two runs can name the same
+# paths while the bytes behind them differ. Checked when the receipt carries
+# them, which every integration-gate receipt does.
+BOUND_ARTIFACT_FIELDS = ("renders_root", "cache_features", "phase4_dir", "phase4_eval")
+
 
 def receipt_identity(report: dict[str, Any]) -> dict[str, Any]:
     """Pull the identity out of a gate report, wherever the writer put it.
@@ -98,7 +105,46 @@ def verify(receipt_path: Path, config_path: Path, label: str) -> list[str]:
                 f"    current: {current[field]}\n"
                 "    The gate verified a different state. Rerun it."
             )
+
+    problems.extend(_artifact_problems(report, config_path, label))
     return problems
+
+
+def _artifact_problems(
+    report: dict[str, Any], config_path: Path, label: str
+) -> list[str]:
+    """Compare the inputs the gate resolved with the ones this run would read."""
+    from .phase5 import load_phase5_config
+    from .phase5_check import required_artifacts
+
+    recorded = receipt_artifacts(report)
+    if not recorded:
+        return []
+    cfg = load_phase5_config(config_path)
+    current = {a.name: str(a.path.resolve()) for a in required_artifacts(cfg)
+               if a.path.exists()}
+    problems = []
+    for name in BOUND_ARTIFACT_FIELDS:
+        if name not in recorded:
+            continue
+        was = recorded[name].get("path") if isinstance(recorded[name], dict) else None
+        now = current.get(name)
+        if was is not None and now is not None and was != now:
+            problems.append(
+                f"{label}: the {name} the gate verified is not the one this run "
+                f"would read.\n    receipt: {was}\n    current: {now}\n"
+                "    Rerun the gate against the inputs you intend to use."
+            )
+    return problems
+
+
+def receipt_artifacts(report: dict[str, Any]) -> dict[str, Any]:
+    """The resolved-artifact block a gate receipt records at step 2."""
+    for step in report.get("steps", []):
+        evidence = step.get("evidence") or {}
+        if "artifacts" in evidence:
+            return evidence["artifacts"]
+    return {}
 
 
 def main(argv: list[str] | None = None) -> None:

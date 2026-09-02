@@ -1,0 +1,141 @@
+PHASE 5 CODE REVIEW - ROUND 2
+============================
+
+Date: 2026-09-01
+Repository: D:\LT
+Branch: repair/validation-streams-abc
+Reviewed tip: 9150b56
+Comparison point: 7726aef
+
+SUMMARY
+-------
+
+The second review re-audited the ten original findings after commit 5f3c11b
+and reviewed the newly added receipt, scoring, estimand, training, and test
+code. The mean-vector and dataset API calls, ragged batching, device transfer,
+empty-stream stop, and L2 record schema are repaired. Five actionable issues
+remain.
+
+
+1. [P1] TWO-PATH DISCLOSURE IS STILL COMPUTED ON DIFFERENT POPULATIONS
+
+File: src/lot/phase5_estimands.py
+Lines: 409-417
+
+evaluate_quantity computes the per-point interval after filtering records on
+n_primary, then independently computes the splat counterpart after filtering
+on n_splat. Those are V_P5_pp and V_sp, not the cross-path common-valid cell
+set required by PROTOCOL 3.9. The records at this layer contain path-level
+pair averages and counts, not the sample_id sets or validity masks needed to
+recompute both paths on their intersection.
+
+The resulting path_difference at line 305 is only the subtraction of two
+point estimates. It has no interval, and the difference is not recomputed
+inside one paired scene bootstrap replicate. Selection differences can
+therefore change the sign or size attributed to evaluation-path choice and
+can feed an invalid wording decision.
+
+Required correction: persist or carry the contributing sample identities,
+intersect the paths by sample_id, recompute every term on that intersection,
+and bootstrap both estimates and their difference from the same scene draw.
+
+
+2. [P1] THE ONE-IN-BAND BRANCH OVERRIDES THE PROTOCOL'S SIGN/INTERVAL VETO
+
+File: src/lot/phase5_estimands.py
+Lines: 284-295
+
+The code checks pp_in != sp_in before it checks sign agreement and whether
+both intervals exclude zero. PROTOCOL 3.9 states that a sign difference or an
+interval containing zero licenses no claim of advantage. Those are vetoes,
+including when exactly one estimate is inside the 0.003 band.
+
+Reproduction:
+  per-point  estimate +0.001, interval [+0.0005, +0.0015]
+  splat-pool estimate -0.020, interval [-0.0300, -0.0100]
+
+Current result:
+  "effect licensed but its size is path-sensitive"
+
+Required result:
+  no claim of advantage, because the paths reverse sign.
+
+Required correction: apply the sign-disagreement and interval-includes-zero
+veto before the exactly-one-in-band wording branch.
+
+
+3. [P1] RECEIPTS ARE NOT BOUND TO THE COMPLETE EXPERIMENT IDENTITY
+
+Files:
+  src/lot/phase5_receipt.py, line 63
+  src/lot/phase5.py, lines 95-114
+  scripts/phase5_train.sbatch, line 65
+
+current_identity treats cfg.digest() as the configuration identity, but that
+digest covers only model, training, tiny_overfit, primary_alignment_level,
+and a version. It excludes fields that change the actual gated data or
+evaluation, including feature_encoder, depth_encoder, renders_root,
+cache_root, phase4_dir, the pair-subsampling seed, sensitivity levels, and
+controls. The verifier also ignores the artifact hashes recorded by the gate.
+
+Targeted checks confirmed that changing each of feature_encoder,
+depth_encoder, phase4_dir, renders_root, controls, or seed leaves cfg.digest()
+unchanged. A same-commit alternate configuration can therefore reuse a PASS
+receipt even though the gate never examined its inputs. The SLURM worker also
+hard-codes outputs/phase5_rung2/evidence despite accepting an arbitrary config
+path, increasing the chance that it reads another run's receipt.
+
+Required correction: bind the receipt to a complete content identity for all
+scientifically meaningful Phase 5 configuration fields and to the resolved
+artifact/pin identity. Derive or explicitly pass the receipt directory for
+the supplied config. Output relocation fields may remain excluded if they are
+the only excluded fields.
+
+
+4. [P1] THE TINY-OVERFIT GATE'S FROZEN SUBSET REQUIREMENTS ARE OPTIONAL
+
+File: src/lot/train.py
+Lines: 524-547
+
+The prior finding that the tiny gate accepts arbitrary scenes is not fully
+fixed. fold defaults to None, and the role assertion only runs when callers
+choose to supply it. Existing successful tests call the gate without a fold.
+The function also does not require exactly the frozen eight pairs or require
+the rotation, translation, and orbit regimes; it merely reports the count and
+observed regimes after training.
+
+The gate can therefore PASS on an easier, smaller, or test-derived subset and
+still be presented as evidence that the frozen eight-pair, three-regime gate
+passed.
+
+Required correction: make the fold and frozen subset specification mandatory
+at the gate boundary, assert every scene is in fold.train, require the exact
+pair count, and require the configured regime set before constructing the
+optimizer.
+
+
+5. [P2] VALIDATION-ONLY INPUT CONTROLS ARE OUTSIDE THE SPLIT SEAL
+
+File: src/lot/train.py
+Lines: 645-662
+
+run_input_use_controls documents its examples as validation pairs, and the
+launcher states that evaluate is the only mode allowed to touch test scenes.
+The function accepts no fold and performs no role assertion before evaluating
+the baseline and shuffled examples. Training and checkpoint selection now
+enforce positive split membership, but this adjacent entry point can still
+consume training or sealed test scenes.
+
+Required correction: require the fold and assert every control example is in
+fold.val before either baseline or shuffled evaluation.
+
+
+KNOWN INCOMPLETENESS
+--------------------
+
+The branch remains intentionally non-runnable end to end: modes overfit,
+train, controls, and evaluate still exit at src/lot/phase5.py lines 472-475.
+That known status is not counted as a new finding, but it means the new worker
+receipt enforcement and the full scientific pipeline could not be exercised
+as one completed run.
+

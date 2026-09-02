@@ -528,22 +528,47 @@ def run_tiny_overfit_gate(
     grid_hw: tuple[int, int],
     threshold: float,
     max_steps: int,
+    fold: Fold,
+    expected_pairs: int,
+    required_regimes: Sequence[str],
     seed: int = 0,
     device: str = "cpu",
     raise_on_failure: bool = True,
-    fold: Fold | None = None,
 ) -> TinyOverfitResult:
-    """Fit the tiny subset and report whether the frozen threshold was reached.
+    """Fit the frozen tiny subset and report whether the threshold was reached.
 
-    The subset is training scenes only, and when a fold is supplied that is
-    asserted rather than assumed. Reaching the threshold says nothing about
-    generalization and is not meant to: it says the supervised mapping is
-    representable by this trunk under this optimizer, which is the precondition
-    for reading anything scientific into a later underperformance.
+    The fold, the pair count, and the regime set are required arguments, not
+    options. This function's result is quoted as evidence that the frozen
+    eight-pair, three-regime gate passed, so it has to be the case that what ran
+    was that subset. With the fold optional an easier, smaller, or test-derived
+    sample could pass here and be presented under the frozen gate's name, and
+    reporting the realized count and regimes afterwards does not prevent that:
+    it describes whatever was supplied rather than constraining it.
+
+    Everything is therefore checked before the optimizer is constructed, so a
+    misconfigured gate fails without having trained at all.
+
+    Reaching the threshold says nothing about generalization and is not meant
+    to. It says the supervised mapping is representable by this trunk under this
+    optimizer, which is the precondition for reading anything scientific into a
+    later underperformance.
     """
-    if fold is not None:
-        assert_scenes_in_role(
-            fold, [e.scene for e in examples], "train", "tiny overfit gate"
+    assert_scenes_in_role(
+        fold, [e.scene for e in examples], "train", "tiny overfit gate"
+    )
+    if len(examples) != expected_pairs:
+        raise ValueError(
+            f"tiny overfit gate: the frozen subset is {expected_pairs} pairs and "
+            f"{len(examples)} were supplied. The gate's verdict is only evidence "
+            "about the subset the configuration froze."
+        )
+    observed = {e.regime for e in examples}
+    missing = sorted(set(required_regimes) - observed)
+    if missing:
+        raise ValueError(
+            f"tiny overfit gate: the frozen subset must span {sorted(required_regimes)} "
+            f"and is missing {missing}. A subset covering only the easy regimes "
+            "would pass without establishing what the gate exists to establish."
         )
     torch.manual_seed(seed)
     model = build_predictor(model_cfg).to(device)
@@ -648,13 +673,23 @@ def run_input_use_controls(
     grid_hw: tuple[int, int],
     batch_pairs: int,
     seed: int,
+    fold: Fold,
 ) -> list[ControlResult]:
     """Pose and depth shuffles on validation pairs. Diagnostics, never thresholds.
+
+    The fold is required and the validation role is asserted before anything is
+    evaluated. Training and checkpoint selection enforce positive split
+    membership, and this entry point sits beside them consuming the same kind of
+    object; leaving it unguarded would make it the one place a training or
+    sealed test scene could still be scored.
 
     A shuffle that barely moves the score is reported exactly as observed. It is
     evidence about whether the network uses that input, and it is not a reason
     to retrain, retune, or reinterpret the headline gap.
     """
+    assert_scenes_in_role(
+        fold, [e.scene for e in examples], "val", "input-use controls"
+    )
     baseline = evaluate_validation(model, examples, grid_hw, batch_pairs).centered_cosine
     results = []
     for name, shuffler in (("pose_shuffle", shuffle_pose), ("depth_shuffle", shuffle_depth)):

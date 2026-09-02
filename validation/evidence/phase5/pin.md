@@ -81,12 +81,25 @@ execution commit, so no analysis constant has moved since Phase 4 ran.
 - Scene-split (fold) digest: `25f0c03f72d58cc8e3ff2d8d4123241f6459d4ed50d3c303c5dc108bb0e19865`
   over the three folds in `src/lot/phase5_folds.py`, asserted against the
   executable rule by `tests/test_phase5_folds.py`.
-- Architecture and training-config digest:
-  `19d903812e4c366693717e48e81dba938cd5b87e94ead1d90bab8a38cba03ce1`
-  over the model, training, tiny-overfit, and primary-level sections of
-  configs/phase5.yaml, asserted by tests/test_phase5_config.py. It excludes
-  the output paths, because moving a directory does not change what was
-  measured. Predictor parameter count 16,680,960, also asserted.
+- Configuration digest:
+  `9e3508606bcaedb6068e95807aa27ea706d2d38b77f8c2df763d8f28968a0eca`
+  over every field of configs/phase5.yaml except `output_root` and
+  `experiment_name`, asserted by tests/test_phase5_config.py. Those two decide
+  only where results are written, so a relocated run is the same experiment;
+  everything else, including the encoders, every input path, the
+  pair-subsampling seed, the sensitivity levels, and the controls, is inside
+  the identity. The exclusion list is an allowlist of exclusions rather than of
+  inclusions, so a field added to the config later is covered without anyone
+  remembering to add it.
+
+  This digest replaces an earlier one that covered only the architecture, the
+  training settings, the overfit gate, and the primary level. The second code
+  review showed that a same-commit configuration pointing at a different
+  feature cache or a different accepted Phase 4 run produced an identical
+  digest, so it could have inherited a PASS receipt from a gate that never
+  examined its inputs. No Phase 5 result existed under either digest.
+
+  Predictor parameter count 16,680,960, also asserted.
 
 ## Cluster-resident, filled by `run_phase5.sh check`
 

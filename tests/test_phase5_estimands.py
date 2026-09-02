@@ -60,8 +60,18 @@ def make_records(
                 "sp_transport_raw": 0.7 + level, "sp_transport_centered": 0.7 + level,
                 "sp_predict_raw": 0.69 + level, "sp_predict_centered": 0.69 + level,
                 "sp_nowarp_raw": 0.5 + level, "sp_nowarp_centered": 0.5 + level,
+                # The cross-path common-valid columns. Both paths re-scored on
+                # the cells they share, which is the population PROTOCOL 3.9's
+                # disclosure is computed on.
+                "x_cl_raw": cl + level, "x_cl_centered": cl + level,
+                "x_predict_raw": predict + level,
+                "x_predict_centered": predict + level,
+                "x_sp_transport_raw": 0.7 + level,
+                "x_sp_transport_centered": 0.7 + level,
+                "x_sp_predict_raw": 0.69 + level,
+                "x_sp_predict_centered": 0.69 + level,
                 "n_primary": 900, "n_formulation": 700, "n_splat": 800,
-                "n_predict_nonfinite": 0,
+                "n_intersect": 640, "n_predict_nonfinite": 0,
             })
     return records
 
@@ -240,12 +250,41 @@ def test_an_interval_containing_zero_withdraws_the_strong_wording():
 
 
 def test_exactly_one_path_inside_the_band_is_reported_as_path_sensitive():
+    """Only when the veto does not fire: same sign, both intervals clear."""
     out = near_zero_disclosure(
         "delta_learn_pp", _pe(0.0012, 0.0009, 0.0015), _pe(0.031, 0.026, 0.036),
         ANALYSIS,
     )
     assert out["near_zero"]
     assert "path-sensitive" in out["wording"]
+
+
+def test_the_sign_veto_outranks_the_exactly_one_in_band_branch():
+    """PROTOCOL 3.9's third clause is unconditional, so it is a veto.
+
+    Exactly one estimate sits inside the band, which taken alone would read as
+    path-sensitive. The paths reverse sign, and 3.9 says that licenses no claim
+    of advantage. The veto has to be tested first or this cell is over-reported.
+    """
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.001, 0.0005, 0.0015), _pe(-0.020, -0.030, -0.010),
+        ANALYSIS,
+    )
+    assert not out["paths_agree_in_sign"]
+    assert out["wording"] == (
+        "no claim of advantage; the effect is at the scale of "
+        "evaluation-path choice"
+    )
+    assert "path-sensitive" not in out["wording"]
+
+
+def test_the_interval_veto_outranks_the_exactly_one_in_band_branch():
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.001, -0.0004, 0.0024), _pe(0.031, 0.026, 0.036),
+        ANALYSIS,
+    )
+    assert not out["both_intervals_exclude_zero"]
+    assert out["wording"].startswith("no claim of advantage")
 
 
 def test_both_paths_outside_the_band_are_not_flagged():
@@ -346,3 +385,104 @@ def test_three_rungs_stay_separate():
     assert rungs["learned_vs_explicit_limitation"] != pytest.approx(
         0.77 - 0.70
     ), "the Phase 4 target-lift score leaked into the Phase 5 rung"
+
+
+# ---------------------------------------------------------------------------
+# PROTOCOL 3.9: the disclosure is computed on the cross-path common-valid set
+# ---------------------------------------------------------------------------
+
+def test_the_disclosure_reads_the_intersection_columns_not_the_own_population_ones():
+    """Comparing V_P5_pp against V_sp would mix operator with selection.
+
+    The per-point and splat columns are given a large, opposite-signed gap here
+    while the intersection columns carry a small agreeing one. A disclosure
+    built on the own-population columns would report the former; the protocol
+    requires the latter.
+    """
+    records = make_records(n_scenes=8, pairs_per_scene=5, noise=1e-5)
+    for record in records:
+        # Own-population columns: a large gap the disclosure must NOT read.
+        record["cl_centered"] = 0.80
+        record["predict_centered"] = 0.40
+        record["sp_transport_centered"] = 0.40
+        record["sp_predict_centered"] = 0.80
+        # Intersection columns: a small, agreeing gap, which is what 3.9 wants.
+        record["x_cl_centered"] = 0.6010
+        record["x_predict_centered"] = 0.6000
+        record["x_sp_transport_centered"] = 0.5012
+        record["x_sp_predict_centered"] = 0.5000
+
+    cell = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS)
+    disclosure = cell.disclosure
+    assert disclosure["per_point"]["estimate"] == pytest.approx(0.0010, abs=1e-6)
+    assert disclosure["splat_pool"]["estimate"] == pytest.approx(0.0012, abs=1e-6)
+    assert disclosure["paths_agree_in_sign"]
+    assert disclosure["wording"] == "small, sign-consistent effect"
+    # The headline estimand itself still comes from the primary support.
+    assert cell.estimate == pytest.approx(0.40, abs=1e-6)
+
+
+def test_the_path_difference_carries_a_paired_interval():
+    """3.9 requires an interval for the difference, from one scene draw."""
+    records = make_records(n_scenes=8, pairs_per_scene=5, scene_spread=0.2,
+                           noise=1e-5)
+    cell = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS)
+    difference = cell.disclosure["path_difference"]
+    assert math.isfinite(difference["lo"]) and math.isfinite(difference["hi"])
+    assert difference["lo"] <= difference["estimate"] <= difference["hi"]
+    # The scene effect is shared by both paths and cancels in the difference, so
+    # the paired interval is tight where each path's own level is not.
+    assert difference["hi"] - difference["lo"] < 0.01
+
+
+def test_the_difference_equals_the_two_terms_it_is_built_from():
+    records = make_records(n_scenes=6, pairs_per_scene=4, noise=1e-6)
+    cell = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS)
+    d = cell.disclosure
+    assert d["path_difference"]["estimate"] == pytest.approx(
+        d["per_point"]["estimate"] - d["splat_pool"]["estimate"], abs=1e-9
+    )
+
+
+def test_the_disclosure_terms_share_one_scene_draw():
+    """Paired means the same resample serves both paths and the difference.
+
+    The bootstrap seed and unit list are identical across the three calls, so the
+    draw is the same stream; this pins that the difference's interval is not
+    wider than a subtraction of two independently drawn ones would allow it to
+    look, by checking it against the same-draw construction directly.
+    """
+    from lot.paired_bootstrap import paired_interval
+    from lot.phase5_estimands import INTERSECTION_FIELDS, quantity_formulas
+
+    records = make_records(n_scenes=8, pairs_per_scene=4, scene_spread=0.2,
+                           noise=1e-5)
+    forms = quantity_formulas("centered")
+    direct = paired_interval(
+        records, INTERSECTION_FIELDS, forms["path_difference"],
+        resamples=ANALYSIS.bootstrap_resamples, seed=ANALYSIS.bootstrap_seed,
+        confidence=ANALYSIS.bootstrap_confidence,
+    )
+    cell = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS)
+    assert cell.disclosure["path_difference"]["estimate"] == pytest.approx(
+        direct["estimate"], abs=1e-12
+    )
+    assert cell.disclosure["path_difference"]["lo"] == pytest.approx(
+        direct["lo"], abs=1e-12
+    )
+
+
+def test_cross_path_quantities_declare_their_population():
+    from lot.phase5_estimands import CROSS_PATH
+
+    for name in ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference"):
+        assert QUANTITY_POPULATION[name] == CROSS_PATH
+
+
+def test_an_empty_intersection_reports_an_empty_disclosure():
+    records = make_records(n_scenes=5, pairs_per_scene=4)
+    for record in records:
+        record["n_intersect"] = 0
+    cell = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS)
+    assert math.isnan(cell.disclosure["per_point"]["estimate"])
+    assert not cell.disclosure["near_zero"]

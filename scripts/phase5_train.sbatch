@@ -61,8 +61,20 @@ echo "clean worktree at commit $(git rev-parse HEAD)"
 # reached through run_phase5.sh. This file is documented as a direct sbatch
 # target, so the launcher is not the real execution boundary; a job submitted by
 # hand would otherwise train with neither gate having passed. Both receipts are
-# checked here, bound to this commit and configuration.
-EVIDENCE_DIR="outputs/phase5_rung2/evidence"
+# checked here, bound to this commit, configuration, and resolved inputs.
+#
+# The directory is derived from the config this job was given, not hard-coded.
+# A fixed path would read another run's receipts whenever the config named a
+# different experiment, which is exactly the confusion the binding exists to
+# prevent.
+EVIDENCE_DIR="$("$MM" run -n "$LOT_ENV" python -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, 'src')
+from lot.phase5 import load_phase5_config
+print(load_phase5_config(Path('$CONFIG')).evidence_dir)
+")"
+echo "receipts expected under $EVIDENCE_DIR"
 for receipt in "integration_gate:the Borah integration gate" \
                "tiny_overfit:the tiny-subset overfit gate"; do
     file="$EVIDENCE_DIR/${receipt%%:*}.json"

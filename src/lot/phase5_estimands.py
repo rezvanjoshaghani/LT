@@ -50,6 +50,10 @@ SPLAT_TRANSPORT = "Transport-Only"
 PER_POINT = "per_point"
 SPLAT_POOL = "splat_pool"
 FORMULATION = "formulation"
+# The cross-path common-valid population of PROTOCOL 3.9. Both paths are
+# re-scored on the target cells they share, so the near-zero disclosure compares
+# two operators rather than two selections.
+CROSS_PATH = "cross_path"
 
 # Per-pair score fields. Each is the pair's mean score over its own supported
 # samples, so a cell's estimand is the unweighted mean over camera pairs that
@@ -77,11 +81,24 @@ SPLAT_FIELDS = (
 )
 # Counts and diagnostics. Never bootstrapped as scores, and the near-zero rule
 # does not apply to them because they are not in score space.
+# PROTOCOL 3.9's cross-path common-valid columns. Both paths live in one field
+# tuple deliberately: a single bootstrap draw then serves both, which is what
+# makes the path difference paired rather than a subtraction of two independent
+# intervals.
+INTERSECTION_FIELDS = (
+    "x_cl_raw", "x_cl_centered",
+    "x_predict_raw", "x_predict_centered",
+    "x_sp_transport_raw", "x_sp_transport_centered",
+    "x_sp_predict_raw", "x_sp_predict_centered",
+)
 COUNT_FIELDS = (
-    "n_primary", "n_formulation", "n_splat", "n_predict_nonfinite",
+    "n_primary", "n_formulation", "n_splat", "n_intersect", "n_predict_nonfinite",
 )
 
-ALL_FIELDS = PRIMARY_FIELDS + FORMULATION_FIELDS + SPLAT_FIELDS + COUNT_FIELDS
+ALL_FIELDS = (
+    PRIMARY_FIELDS + FORMULATION_FIELDS + SPLAT_FIELDS
+    + INTERSECTION_FIELDS + COUNT_FIELDS
+)
 
 
 def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], float]]:
@@ -118,6 +135,18 @@ def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], flo
         "sp_predict": lambda v: v[f"sp_predict_{m}"],
         "sp_transport_margin": lambda v: v[f"sp_transport_{m}"] - v[f"sp_nowarp_{m}"],
         "sp_predict_margin": lambda v: v[f"sp_predict_{m}"] - v[f"sp_nowarp_{m}"],
+        # PROTOCOL 3.9's disclosure terms, every one recomputed on the
+        # cross-path common-valid cell set before differencing.
+        "x_delta_learn_pp": lambda v: v[f"x_cl_{m}"] - v[f"x_predict_{m}"],
+        "x_delta_learn_sp": (
+            lambda v: v[f"x_sp_transport_{m}"] - v[f"x_sp_predict_{m}"]
+        ),
+        # The quantity 3.9 requires an interval for: the difference between what
+        # the two evaluation paths say about the same effect on the same cells.
+        "path_difference": lambda v: (
+            (v[f"x_cl_{m}"] - v[f"x_predict_{m}"])
+            - (v[f"x_sp_transport_{m}"] - v[f"x_sp_predict_{m}"])
+        ),
     }
 
 
@@ -139,6 +168,9 @@ QUANTITY_POPULATION = {
     "sp_predict": SPLAT_POOL,
     "sp_transport_margin": SPLAT_POOL,
     "sp_predict_margin": SPLAT_POOL,
+    "x_delta_learn_pp": CROSS_PATH,
+    "x_delta_learn_sp": CROSS_PATH,
+    "path_difference": CROSS_PATH,
 }
 
 # Quantities that live in score space, and to which the frozen 0.003 near-zero
@@ -230,6 +262,7 @@ def near_zero_disclosure(
     per_point: PathEstimate,
     splat_pool: PathEstimate | None,
     analysis: AnalysisConfig,
+    difference: PathEstimate | None = None,
 ) -> dict[str, Any]:
     """The frozen 0.003 rule, carried forward verbatim from PROTOCOL 3.9.
 
@@ -256,7 +289,20 @@ def near_zero_disclosure(
 
     band = analysis.path_agreement_tolerance
     if not per_point.finite:
-        return {"near_zero": False, "applicable": True, "band": band}
+        # An undefined term still reports both sides, so a reader can see that
+        # the cell was empty rather than that the effect was large.
+        return {
+            "near_zero": False,
+            "applicable": True,
+            "band": band,
+            "per_point": dataclasses.asdict(per_point),
+            "splat_pool": (
+                dataclasses.asdict(splat_pool) if splat_pool is not None else None
+            ),
+            "paths_agree_in_sign": None,
+            "both_intervals_exclude_zero": None,
+            "wording": "not estimable on this cell",
+        }
 
     pp_in = per_point.within(band)
     if splat_pool is None or not splat_pool.finite:
@@ -281,20 +327,32 @@ def near_zero_disclosure(
     same_sign = per_point.sign == splat_pool.sign and per_point.sign != 0
     both_clear = per_point.excludes_zero and splat_pool.excludes_zero
 
-    if pp_in and sp_in and same_sign and both_clear:
-        wording = "small, sign-consistent effect"
-    elif pp_in != sp_in:
-        wording = (
-            "effect licensed but its size is path-sensitive; the two evaluation "
-            "paths do not agree about whether it sits inside the operator band"
-        )
+    # PROTOCOL 3.9's clauses are not three alternatives to be tried in the order
+    # the sentence lists them. Its third clause, "a difference in sign, or an
+    # interval that includes zero, licenses no claim of advantage", is stated
+    # unconditionally, so it is a veto over the other two rather than a fallback
+    # after them. Testing the exactly-one-in-band branch first, as an earlier
+    # version did, let a cell whose two paths reverse sign be reported as merely
+    # path-sensitive, which is a claim the protocol withholds.
+    #
+    # The band question is asked first only to decide whether the near-zero
+    # discipline is engaged at all: 3.9 scopes it to an effect "no larger than
+    # this tolerance", so a cell outside the band on both paths is not a
+    # near-zero cell and the veto has nothing to act on.
+    if not (pp_in or sp_in):
+        wording = "effect outside the operator band"
     elif not same_sign or not both_clear:
         wording = (
             "no claim of advantage; the effect is at the scale of "
             "evaluation-path choice"
         )
+    elif pp_in and sp_in:
+        wording = "small, sign-consistent effect"
     else:
-        wording = "effect outside the operator band"
+        wording = (
+            "effect licensed but its size is path-sensitive; the two evaluation "
+            "paths do not agree about whether it sits inside the operator band"
+        )
 
     return {
         "near_zero": bool(pp_in or sp_in),
@@ -302,7 +360,13 @@ def near_zero_disclosure(
         "band": band,
         "per_point": dataclasses.asdict(per_point),
         "splat_pool": dataclasses.asdict(splat_pool),
-        "path_difference": per_point.estimate - splat_pool.estimate,
+        # The difference carries its own paired interval, from the same scene
+        # draw, rather than being a bare subtraction of two point estimates.
+        "path_difference": (
+            dataclasses.asdict(difference) if difference is not None
+            else {"estimate": per_point.estimate - splat_pool.estimate,
+                  "lo": float("nan"), "hi": float("nan")}
+        ),
         "paths_agree_in_sign": bool(same_sign),
         "both_intervals_exclude_zero": bool(both_clear),
         # Equivalence is never among the licensed wordings, under any branch,
@@ -341,6 +405,8 @@ def _fields_for(population: str) -> tuple[str, ...]:
         return FORMULATION_FIELDS
     if population == SPLAT_POOL:
         return SPLAT_FIELDS
+    if population == CROSS_PATH:
+        return INTERSECTION_FIELDS
     raise ValueError(f"unknown population {population!r}")
 
 
@@ -349,6 +415,7 @@ def _count_field_for(population: str) -> str:
         PER_POINT: "n_primary",
         FORMULATION: "n_formulation",
         SPLAT_POOL: "n_splat",
+        CROSS_PATH: "n_intersect",
     }[population]
 
 
@@ -357,12 +424,14 @@ def _count_field_for(population: str) -> str:
 # paths, so a quantity that has a counterpart must be disclosed against it.
 # The formulation quantities have none: they exist only on the per-point path,
 # and a cell without a second path can never reach the sign-consistent wording.
-PATH_COUNTERPART = {
-    "delta_learn_pp": "delta_learn_sp",
-    "cl_margin": "sp_transport_margin",
-    "predict_margin": "sp_predict_margin",
-    "cl_transport": "sp_transport",
-    "predict_with_depth": "sp_predict",
+# The disclosure pair for each quantity, both terms living on the CROSS_PATH
+# population so they are recomputed on the cells the two paths share. Comparing
+# a quantity on V_P5_pp against its counterpart on V_sp would mix an operator
+# difference with a selection difference, which is exactly what PROTOCOL 3.9
+# forbids, so the mapping points at the intersection columns and not at the
+# own-population ones.
+DISCLOSURE_PAIR = {
+    "delta_learn_pp": ("x_delta_learn_pp", "x_delta_learn_sp"),
 }
 
 
@@ -408,19 +477,25 @@ def evaluate_quantity(
     population = QUANTITY_POPULATION[quantity]
     interval, counts = _interval_for(records, quantity, metric, analysis, unit)
 
-    # PROTOCOL 3.9's disclosure is two-path, so the counterpart on the
-    # operational path is computed here and handed to it rather than left out.
-    counterpart_name = PATH_COUNTERPART.get(quantity)
+    # PROTOCOL 3.9's disclosure is two-path and is computed on the cells the two
+    # paths share. Both terms and their difference come from the CROSS_PATH
+    # population, whose fields sit in one tuple, so one scene draw serves all
+    # three and the difference is recomputed inside each replicate.
+    pair = DISCLOSURE_PAIR.get(quantity)
     counterpart = None
-    if counterpart_name is not None:
-        other, _ = _interval_for(records, counterpart_name, metric, analysis, unit)
-        counterpart = PathEstimate(other["estimate"], other["lo"], other["hi"])
+    difference = None
+    per_point_term = PathEstimate(interval["estimate"], interval["lo"], interval["hi"])
+    if pair is not None:
+        pp_name, sp_name = pair
+        pp_x, _ = _interval_for(records, pp_name, metric, analysis, unit)
+        sp_x, _ = _interval_for(records, sp_name, metric, analysis, unit)
+        diff, _ = _interval_for(records, "path_difference", metric, analysis, unit)
+        per_point_term = PathEstimate(pp_x["estimate"], pp_x["lo"], pp_x["hi"])
+        counterpart = PathEstimate(sp_x["estimate"], sp_x["lo"], sp_x["hi"])
+        difference = PathEstimate(diff["estimate"], diff["lo"], diff["hi"])
 
     disclosure = near_zero_disclosure(
-        quantity,
-        PathEstimate(interval["estimate"], interval["lo"], interval["hi"]),
-        counterpart,
-        analysis,
+        quantity, per_point_term, counterpart, analysis, difference
     )
     return CellResult(
         quantity=quantity,

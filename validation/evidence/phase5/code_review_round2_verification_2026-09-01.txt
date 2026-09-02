@@ -1,0 +1,105 @@
+PHASE 5 CODE REVIEW - ROUND 2 VERIFICATION
+==========================================
+
+Date: 2026-09-01
+Repository: D:\LT
+Branch: repair/validation-streams-abc
+Reviewed tip: 9150b56
+Comparison point: 7726aef
+Starting working tree: clean
+
+SCOPE REVIEWED
+--------------
+
+  - Re-audit of all ten findings in the first Phase 5 review
+  - Changes in commits 5f3c11b and 9150b56
+  - Phase 5 configuration and cluster launch guards
+  - Gate-receipt production, parsing, and identity verification
+  - Ragged batching, CUDA transfer, training roles, tiny overfit, and controls
+  - Raw/centered cosine and L2 scoring records
+  - Estimand populations, paired bootstrap, and near-zero disclosure
+  - Added and changed Phase 5 tests
+
+AUTOMATED VERIFICATION
+----------------------
+
+Command:
+  python -m pytest tests/test_phase5_estimands.py tests/test_phase5_receipt.py
+      tests/test_phase5_score.py tests/test_phase5_train.py -q
+Result:
+  91 passed in 18.40 seconds
+
+Command:
+  python -m pytest -q
+Result:
+  471 passed, 3 skipped in 153.09 seconds
+
+Command:
+  python -m compileall -q src tests
+Result:
+  PASS
+
+Command:
+  git diff --check 7726aef..HEAD
+Result:
+  PASS
+
+Command:
+  bash -n scripts/run_phase5.sh
+  bash -n scripts/phase5_train.sbatch
+Result:
+  NOT RUN. The installed WSL launcher returned E_ACCESSDENIED before Bash
+  started. This is an environment limitation, not a script verdict.
+
+TARGETED ADVERSARIAL CHECKS
+---------------------------
+
+1. Near-zero branch precedence
+
+Input:
+  per-point  PathEstimate(0.001, 0.0005, 0.0015)
+  splat-pool PathEstimate(-0.02, -0.03, -0.01)
+
+Observed wording:
+  "effect licensed but its size is path-sensitive; the two evaluation paths
+   do not agree about whether it sits inside the operator band"
+
+Expected from PROTOCOL 3.9:
+  no claim of advantage, because the paths differ in sign.
+
+2. Configuration-receipt identity coverage
+
+For each field below, dataclasses.replace was used to alter a loaded
+Phase5Config and compare the resulting cfg.digest() with the original:
+
+  feature_encoder  unchanged digest: True
+  depth_encoder    unchanged digest: True
+  phase4_dir       unchanged digest: True
+  renders_root     unchanged digest: True
+  controls         unchanged digest: True
+  seed             unchanged digest: True
+
+3. Cross-path population audit
+
+Observed:
+  _interval_for filters per-point records on n_primary > 0.
+  _interval_for filters splat records on n_splat > 0 in a separate call.
+  near_zero_disclosure subtracts the two independent point estimates.
+
+Missing:
+  sample_id/mask intersection, common-valid recomputation, and a paired
+  bootstrap distribution for the path difference.
+
+4. Split-boundary audit
+
+Observed:
+  run_tiny_overfit_gate accepts fold=None and validates no scene role in that
+  case. It does not assert the frozen pair count or regime set.
+  run_input_use_controls accepts no fold and performs no validation-role check.
+
+REVIEW ARTIFACT EFFECT
+----------------------
+
+No source or test files were modified. This review added only the two plain
+text evidence files named in this directory.
+

@@ -96,3 +96,56 @@ def test_current_identity_names_all_bound_fields():
     identity = current_identity(CONFIG)
     assert set(identity) == set(BOUND_FIELDS)
     assert all(identity[field] for field in BOUND_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# The receipt is bound to the inputs the gate actually resolved
+# ---------------------------------------------------------------------------
+
+def _receipt_with_artifacts(tmp_path: Path, artifacts: dict) -> Path:
+    report = {
+        "passed": True,
+        "steps": [
+            {"step": "1", "evidence": current_identity(CONFIG)},
+            {"step": "2", "evidence": {"artifacts": artifacts}},
+        ],
+    }
+    path = tmp_path / "with_artifacts.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return path
+
+
+def test_a_receipt_naming_a_different_input_tree_is_refused(tmp_path):
+    """Two runs can share a commit and a config and still read different bytes."""
+    path = _receipt_with_artifacts(
+        tmp_path, {"phase4_dir": {"path": "/somewhere/else/phase4_rung1"}}
+    )
+    problems = verify(path, CONFIG, "gate")
+    # Only fires when the current run can resolve that artifact; on this machine
+    # phase4_dir does not exist, so the check is correctly silent rather than
+    # inventing a comparison against nothing.
+    from lot.phase5 import load_phase5_config
+    resolvable = Path(load_phase5_config(CONFIG).phase4_dir).exists()
+    assert bool(problems) == resolvable
+
+
+def test_the_artifact_check_compares_the_paths_the_gate_recorded(tmp_path):
+    """Exercised against an artifact that does resolve here."""
+    from lot.phase5 import load_phase5_config
+
+    cfg = load_phase5_config(CONFIG)
+    mean_dir = Path(cfg.mean_vector_dir)
+    if not mean_dir.exists():
+        pytest.skip("the Phase 3 outputs are not present on this machine")
+
+    matching = _receipt_with_artifacts(
+        tmp_path, {"mean_vector_dir": {"path": str(mean_dir.resolve())}}
+    )
+    assert verify(matching, CONFIG, "gate") == []
+
+
+def test_a_receipt_without_an_artifact_block_still_checks_identity(tmp_path):
+    """An older receipt format must not silently skip the identity binding."""
+    path = _receipt(tmp_path, commit="stale")
+    problems = verify(path, CONFIG, "gate")
+    assert any("commit moved" in p for p in problems)

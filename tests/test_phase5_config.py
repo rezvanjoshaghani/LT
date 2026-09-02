@@ -25,7 +25,7 @@ CONFIG_PATH = Path("configs/phase5.yaml")
 # configuration is what makes "not tuned on the test set" checkable rather than
 # merely asserted.
 FROZEN_CONFIG_DIGEST = (
-    "19d903812e4c366693717e48e81dba938cd5b87e94ead1d90bab8a38cba03ce1"
+    "9e3508606bcaedb6068e95807aa27ea706d2d38b77f8c2df763d8f28968a0eca"
 )
 
 
@@ -43,26 +43,53 @@ def test_the_config_digest_is_the_frozen_one():
 
 
 def test_the_digest_moves_with_any_value_it_covers():
+    """Everything that decides what is measured, not only the architecture.
+
+    The encoders, the input paths, the pair-subsampling seed, the sensitivity
+    levels, and the controls all change what a gate would have had to verify, so
+    a receipt bound to this digest must not survive any of them moving.
+    """
+    import dataclasses
+
     cfg = load_phase5_config(CONFIG_PATH)
     for field, value in (
         ("model", {**cfg.model, "d_model": 512}),
         ("training", {**cfg.training, "learning_rate": 1e-3}),
         ("tiny_overfit", {**cfg.tiny_overfit, "threshold_centered_cosine": 0.9}),
         ("primary_alignment_level", "affine"),
+        ("feature_encoder", "dinov2_vitl14"),
+        ("depth_encoder", "something_else"),
+        ("renders_root", "elsewhere/renders"),
+        ("cache_root", "elsewhere/cache"),
+        ("mean_vector_dir", "elsewhere/mean"),
+        ("phase4_dir", "elsewhere/phase4"),
+        ("analysis_config", "elsewhere/analysis.yaml"),
+        ("sensitivity_alignment_levels", ("none",)),
+        ("diagnostic_alignment_levels", ()),
+        ("controls", {"pose_shuffle": False}),
+        ("seed", 99),
     ):
-        import dataclasses
-
         moved = dataclasses.replace(cfg, **{field: value})
         assert moved.digest() != cfg.digest(), field
 
 
-def test_the_digest_ignores_where_outputs_are_written():
-    """Moving an output directory does not change what was measured."""
+def test_the_digest_ignores_only_where_outputs_are_written():
+    """Relocation is the sole permitted exclusion, and the list is closed."""
     import dataclasses
 
+    from lot.phase5 import Phase5Config
+
     cfg = load_phase5_config(CONFIG_PATH)
-    moved = dataclasses.replace(cfg, output_root="elsewhere")
-    assert moved.digest() == cfg.digest()
+    assert Phase5Config.RELOCATION_FIELDS == ("output_root", "experiment_name")
+    for field, value in (("output_root", "elsewhere"), ("experiment_name", "other")):
+        moved = dataclasses.replace(cfg, **{field: value})
+        assert moved.digest() == cfg.digest(), field
+
+    # The exclusion list is an allowlist of exclusions, so a field added to the
+    # config later is inside the identity without anyone remembering to add it.
+    fields = {f.name for f in dataclasses.fields(cfg)}
+    assert set(Phase5Config.RELOCATION_FIELDS) < fields
+    assert len(fields) - len(Phase5Config.RELOCATION_FIELDS) >= 13
 
 
 def test_unknown_config_keys_are_refused(tmp_path):

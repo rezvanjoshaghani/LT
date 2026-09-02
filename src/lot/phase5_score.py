@@ -429,3 +429,121 @@ def region_masks(
         "low_texture": support & lowtex,
         "high_texture": support & ~lowtex,
     }
+
+
+# ---------------------------------------------------------------------------
+# The cross-path common-valid set, for PROTOCOL 3.9's two-path disclosure
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class CrossPathScores:
+    """Both paths recomputed on the cells they share, for the 3.9 disclosure.
+
+    PROTOCOL 3.9 does not permit the path comparison to be a subtraction of two
+    numbers computed on different populations: "Every term of such a quantity is
+    recomputed on the cross-path common-valid cell set before differencing, and
+    its uncertainty comes from a paired scene bootstrap in which one draw of
+    scenes serves both paths and the difference is recomputed inside each
+    replicate."
+
+    Comparing V_P5_pp against V_sp directly would mix an operator difference
+    with a selection difference, and the selection difference can carry its own
+    sign. So both paths are re-scored here on the target cells they share, and
+    every column below travels in one record so a single bootstrap draw serves
+    the pair.
+
+    The shared index is the target patch cell, which is the only unit the two
+    estimators have in common: a per-point sample is a context patch with a
+    continuous landing, a splat unit is a target cell.
+    """
+
+    n_intersect: int
+    x_cl_raw: float
+    x_cl_centered: float
+    x_predict_raw: float
+    x_predict_centered: float
+    x_sp_transport_raw: float
+    x_sp_transport_centered: float
+    x_sp_predict_raw: float
+    x_sp_predict_centered: float
+
+    def as_fields(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+def cross_path_cells(
+    lift: ContextLiftMap,
+    primary: Tensor,
+    splat_scored_cells: np.ndarray,
+    target_hw: tuple[int, int],
+    patch_size: int = PATCH_SIZE,
+) -> tuple[np.ndarray, Tensor]:
+    """The target cells both paths score, and the per-point samples inside them.
+
+    Returns (common_cells, per_point_mask). A cell qualifies when the splat path
+    scored it and at least one supported per-point sample landed in it.
+    """
+    cells = patch_cell_index(lift.uv_target, target_hw, patch_size)
+    supported = primary.cpu().numpy()
+    landed_cells = np.unique(cells[supported]) if supported.any() else np.zeros(0, np.int64)
+    common = np.intersect1d(
+        landed_cells, np.asarray(splat_scored_cells, dtype=np.int64), assume_unique=False
+    )
+    inside = torch.from_numpy(np.isin(cells, common)).to(primary.device)
+    return common, primary & inside
+
+
+def score_cross_path(
+    lift: ContextLiftMap,
+    primary: Tensor,
+    splat_scored_cells: np.ndarray,
+    features_context: Tensor,
+    features_target: Tensor,
+    center: Tensor,
+    predicted_target_grid: Tensor | None,
+    transported_est: Tensor,
+    features_context_flat: Tensor,
+    features_target_flat: Tensor,
+    target_hw: tuple[int, int],
+    target_grid_hw: tuple[int, int],
+    patch_size: int = PATCH_SIZE,
+) -> CrossPathScores:
+    """Recompute both paths on their common cells, in one record.
+
+    The per-point terms are scored at the landing locations of the supported
+    samples that fall inside the common cells; the splat terms are scored on
+    those same cells. Nothing here re-decides either path's own support, which
+    stays exactly as the headline and operational tables use it.
+    """
+    common, pp_mask = cross_path_cells(
+        lift, primary, splat_scored_cells, target_hw, patch_size
+    )
+    if common.size == 0 or not bool(pp_mask.any()):
+        return CrossPathScores(
+            n_intersect=0,
+            **{f"x_{k}": float("nan") for k in (
+                "cl_raw", "cl_centered", "predict_raw", "predict_centered",
+                "sp_transport_raw", "sp_transport_centered",
+                "sp_predict_raw", "sp_predict_centered",
+            )},
+        )
+
+    per_point = score_primary(
+        lift, pp_mask, features_context, features_target, center,
+        predicted_target_grid, target_grid_hw, patch_size,
+    )
+    splat = score_splat_pool(
+        common, transported_est, features_context_flat, features_target_flat,
+        center, predicted_target_grid,
+    )
+    return CrossPathScores(
+        n_intersect=int(common.size),
+        x_cl_raw=per_point.cl_raw,
+        x_cl_centered=per_point.cl_centered,
+        x_predict_raw=per_point.predict_raw,
+        x_predict_centered=per_point.predict_centered,
+        x_sp_transport_raw=splat.sp_transport_raw,
+        x_sp_transport_centered=splat.sp_transport_centered,
+        x_sp_predict_raw=splat.sp_predict_raw,
+        x_sp_predict_centered=splat.sp_predict_centered,
+    )

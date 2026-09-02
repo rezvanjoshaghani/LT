@@ -152,11 +152,25 @@ def test_learning_rate_warms_up_then_decays_to_the_floor():
 # Stream U step 14: the tiny-subset overfit gate
 # ---------------------------------------------------------------------------
 
+FOLD = frozen_folds()[0]
+REGIMES = ("rotation", "translation", "orbit")
+
+
+def tiny_subset(n: int = 8) -> list[TrainingExample]:
+    """Pairs from the fold's training scenes, spanning the three regimes."""
+    return [
+        make_example(i, scene=FOLD.train[i % len(FOLD.train)],
+                     regime=REGIMES[i % len(REGIMES)])
+        for i in range(n)
+    ]
+
+
 def test_tiny_overfit_gate_passes_on_a_learnable_subset():
-    examples = [make_example(i) for i in range(8)]
+    examples = tiny_subset()
     cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
     result = run_tiny_overfit_gate(
-        examples, TINY, cfg, GRID_HW, threshold=0.98, max_steps=1500, seed=0
+        examples, TINY, cfg, GRID_HW, threshold=0.98, max_steps=1500,
+        fold=FOLD, expected_pairs=8, required_regimes=REGIMES, seed=0,
     )
     assert result.passed
     assert result.reached_centered_cosine >= 0.98
@@ -165,20 +179,22 @@ def test_tiny_overfit_gate_passes_on_a_learnable_subset():
 
 def test_tiny_overfit_gate_stops_when_the_threshold_is_unreachable():
     """Failure raises rather than returning quietly, because it is a stop."""
-    examples = [make_example(i) for i in range(8)]
+    examples = tiny_subset()
     # A threshold above the metric's range cannot be met by any model.
     cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
     with pytest.raises(TinyOverfitFailure, match="tiny-subset overfit gate failed"):
         run_tiny_overfit_gate(
-            examples, TINY, cfg, GRID_HW, threshold=1.5, max_steps=20, seed=0
+            examples, TINY, cfg, GRID_HW, threshold=1.5, max_steps=20,
+            fold=FOLD, expected_pairs=8, required_regimes=REGIMES, seed=0,
         )
 
 
 def test_tiny_overfit_gate_can_report_without_raising():
-    examples = [make_example(i) for i in range(4)]
+    examples = tiny_subset(4)
     cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
     result = run_tiny_overfit_gate(
-        examples, TINY, cfg, GRID_HW, threshold=1.5, max_steps=5, seed=0,
+        examples, TINY, cfg, GRID_HW, threshold=1.5, max_steps=5,
+        fold=FOLD, expected_pairs=4, required_regimes=REGIMES, seed=0,
         raise_on_failure=False,
     )
     assert not result.passed
@@ -186,14 +202,10 @@ def test_tiny_overfit_gate_can_report_without_raising():
 
 
 def test_tiny_overfit_gate_records_the_regimes_it_spanned():
-    examples = (
-        [make_example(i, regime="rotation") for i in range(3)]
-        + [make_example(i + 3, regime="translation") for i in range(3)]
-        + [make_example(i + 6, regime="orbit") for i in range(2)]
-    )
     cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
     result = run_tiny_overfit_gate(
-        examples, TINY, cfg, GRID_HW, threshold=0.0, max_steps=1, seed=0
+        tiny_subset(), TINY, cfg, GRID_HW, threshold=0.0, max_steps=1,
+        fold=FOLD, expected_pairs=8, required_regimes=REGIMES, seed=0,
     )
     assert result.regimes == ("orbit", "rotation", "translation")
 
@@ -295,8 +307,10 @@ def test_shuffle_of_one_example_is_a_no_op():
 
 def test_controls_report_both_shuffles_against_one_baseline():
     model = build_predictor(TINY).eval()
-    examples = [make_example(i) for i in range(6)]
-    results = run_input_use_controls(model, examples, GRID_HW, batch_pairs=3, seed=5)
+    examples = [make_example(i, scene=FOLD.val[i % len(FOLD.val)]) for i in range(6)]
+    results = run_input_use_controls(
+        model, examples, GRID_HW, batch_pairs=3, seed=5, fold=FOLD
+    )
     assert [r.name for r in results] == ["pose_shuffle", "depth_shuffle"]
     assert all(isinstance(r, ControlResult) for r in results)
     baselines = {r.baseline_centered_cosine for r in results}
@@ -448,13 +462,52 @@ def test_checkpoint_selection_refuses_a_validation_stream_of_test_scenes():
 
 
 def test_the_tiny_gate_refuses_scenes_outside_the_training_split():
-    fold = frozen_folds()[0]
-    examples = [make_example(i, scene=fold.test[0]) for i in range(4)]
+    examples = [make_example(i, scene=FOLD.test[0], regime=REGIMES[i % 3])
+                for i in range(8)]
     cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
     with pytest.raises(ValueError, match="sealed test set was breached"):
         run_tiny_overfit_gate(
-            examples, TINY, cfg, GRID_HW, threshold=0.98, max_steps=5, fold=fold
+            examples, TINY, cfg, GRID_HW, threshold=0.98, max_steps=5,
+            fold=FOLD, expected_pairs=8, required_regimes=REGIMES,
         )
+
+
+def test_the_tiny_gate_refuses_a_subset_of_the_wrong_size():
+    """Its verdict is quoted as evidence about the frozen subset, so it has to
+    be the case that the frozen subset is what ran."""
+    cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
+    with pytest.raises(ValueError, match="frozen subset is 8 pairs"):
+        run_tiny_overfit_gate(
+            tiny_subset(6), TINY, cfg, GRID_HW, threshold=0.98, max_steps=5,
+            fold=FOLD, expected_pairs=8, required_regimes=REGIMES,
+        )
+
+
+def test_the_tiny_gate_refuses_a_subset_missing_a_regime():
+    """A subset covering only the easy regimes would pass without establishing
+    what the gate exists to establish."""
+    examples = [make_example(i, scene=FOLD.train[0], regime="translation")
+                for i in range(8)]
+    cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
+    with pytest.raises(ValueError, match="missing"):
+        run_tiny_overfit_gate(
+            examples, TINY, cfg, GRID_HW, threshold=0.98, max_steps=5,
+            fold=FOLD, expected_pairs=8, required_regimes=REGIMES,
+        )
+
+
+def test_the_tiny_gate_checks_before_it_trains():
+    """A misconfigured gate fails without having built an optimizer at all."""
+    import time
+
+    cfg = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
+    started = time.perf_counter()
+    with pytest.raises(ValueError):
+        run_tiny_overfit_gate(
+            tiny_subset(3), TINY, cfg, GRID_HW, threshold=0.98, max_steps=100_000,
+            fold=FOLD, expected_pairs=8, required_regimes=REGIMES,
+        )
+    assert time.perf_counter() - started < 5.0, "the gate trained before checking"
 
 
 def test_an_empty_training_stream_stops_instead_of_spinning():
@@ -468,4 +521,20 @@ def test_an_empty_training_stream_stops_instead_of_spinning():
             fold, seed=0, model_cfg=TINY, train_cfg=cfg,
             train_examples=lambda: iter([]), val_examples=lambda: iter(val),
             grid_hw=GRID_HW,
+        )
+
+
+def test_controls_refuse_examples_outside_the_validation_split():
+    """The controls sit beside training and must obey the same seal."""
+    model = build_predictor(TINY).eval()
+    leaked = [make_example(i, scene=FOLD.test[0]) for i in range(4)]
+    with pytest.raises(ValueError, match="sealed test set was breached"):
+        run_input_use_controls(
+            model, leaked, GRID_HW, batch_pairs=2, seed=5, fold=FOLD
+        )
+
+    training = [make_example(i, scene=FOLD.train[0]) for i in range(4)]
+    with pytest.raises(ValueError, match="not in its val split"):
+        run_input_use_controls(
+            model, training, GRID_HW, batch_pairs=2, seed=5, fold=FOLD
         )

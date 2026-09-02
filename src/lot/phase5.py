@@ -92,26 +92,37 @@ class Phase5Config:
     def torch_dtype(self) -> torch.dtype:
         return torch.float32
 
-    def digest(self) -> str:
-        """Identity of everything that decides what a Phase 5 model is.
+    # The only fields that may sit outside the configuration identity. Both
+    # decide where results are written and nothing about what is measured, so a
+    # run relocated to another directory is the same experiment. Every other
+    # field is inside the digest by default: the list is an allowlist of
+    # exclusions rather than an allowlist of inclusions, so a field added to
+    # this config later is covered without anyone remembering to add it.
+    RELOCATION_FIELDS = ("output_root", "experiment_name")
 
-        Architecture and training only. The run's data pointers are recorded
-        separately in the run record, because moving an output directory does
-        not change what was measured.
+    def digest(self) -> str:
+        """Content identity of everything that decides what a Phase 5 run measures.
+
+        This is what a gate receipt is bound to, so its coverage is a
+        correctness property rather than a convenience. An earlier version
+        covered only the architecture, the training settings, the overfit gate,
+        and the primary level, which left the encoders, every input path, the
+        pair-subsampling seed, the sensitivity levels, and the controls outside
+        it. A same-commit configuration pointing at a different feature cache or
+        a different accepted Phase 4 run would then have inherited a PASS
+        receipt from a gate that never examined its inputs.
         """
         import hashlib
 
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "training": self.training,
-                "tiny_overfit": self.tiny_overfit,
-                "primary_alignment_level": self.primary_alignment_level,
-                "version": PHASE5_VERSION,
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        payload = {
+            field.name: getattr(self, field.name)
+            for field in dataclasses.fields(self)
+            if field.name not in self.RELOCATION_FIELDS
+        }
+        payload["version"] = PHASE5_VERSION
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=list).encode("utf-8")
+        ).hexdigest()
 
 
 def load_phase5_config(path: Path) -> Phase5Config:

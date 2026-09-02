@@ -1,3 +1,37 @@
+# Phase 5 code review, 2026-09-01, and its disposition
+
+Review of the Phase 5 branch against base `ff52d13`, reviewed tip `7726aef`.
+Ten findings, all verified against the source and all fixed at `5f3c11b`.
+Preserved verbatim below rather than summarized, on the same principle the
+Phase 4 breach evidence is preserved: the record of what was wrong is worth
+more than a claim that it was fixed.
+
+## Disposition
+
+Every finding was confirmed before any code changed. None was dismissed.
+Four of the ten (1, 2, and the two halves of 4) were calls written against
+signatures assumed rather than read, which is exactly the class of error the
+Borah integration gate exists to surface; the review found them first,
+before any cluster time was spent.
+
+Two findings deserve naming because the fix changed behaviour rather than
+only correctness. Finding 6: PROTOCOL 3.9's near-zero rule is explicitly
+two-path, and the single-path implementation could license the strongest
+wording while the operational path reversed sign; the second path is now a
+required argument. Finding 3: the integration gate had been truncating every
+example to the shortest supervision length, which made its shape probe pass
+while the real training path could not batch differing support at all. The
+gate now pushes a real ragged batch through the real path.
+
+Regression coverage for all ten is in tests/test_phase5_train.py,
+tests/test_phase5_score.py, tests/test_phase5_estimands.py, and
+tests/test_phase5_receipt.py. Suite at the fix: 471 passed, 3 skipped.
+
+---
+
+## Findings, verbatim
+
+```
 CODE REVIEW FINDINGS
 ====================
 
@@ -123,3 +157,45 @@ KNOWN INCOMPLETENESS
 The branch is not runnable end-to-end. Modes overfit, train, controls, and
 evaluate all exit intentionally at src/lot/phase5.py lines 442-446, as the
 runbook acknowledges.
+```
+
+## Verification, verbatim
+
+```
+CODE REVIEW VERIFICATION
+========================
+
+Repository: D:\LT
+Branch: repair/validation-streams-abc
+Review base: ff52d13
+Reviewed tip: 7726aef
+Working tree at review time: clean
+
+Scope reviewed:
+  - Seven local commits after ff52d13
+  - Approximately 7,102 added lines across 25 files
+  - Phase 5 configuration and cluster orchestration
+  - Context-lift geometry and support construction
+  - Predictor architecture and training loop
+  - Scoring, estimands, and paired bootstrap
+  - Integration-gate checks and receipt enforcement
+  - Added Phase 5 tests
+
+Verification performed:
+  - python -m pytest -q
+    Result: 439 passed, 3 skipped in 153.40 seconds
+
+  - python -m compileall -q src tests validation
+    Result: PASS
+
+  - git diff --check ff52d13..HEAD
+    Result: PASS
+
+  - Reproduced heterogeneous-batch failure in lot.train.batch_loss
+    Result: torch.stack rejected query tensors of shapes [5, 2] and [4, 2]
+
+  - Invoked lot.phase5 with --mode train
+    Result: exited because the mode is not implemented
+
+No source files were modified as part of the review.
+```

@@ -225,17 +225,55 @@ def load_convention_record(cfg: Phase5Config) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def prepare_frame_depth(
+    raw_depth: np.ndarray,
+    raw_conf: np.ndarray | None,
+    frame: Any,
+    gt_depth: np.ndarray,
+    verdict: str,
+    analysis: AnalysisConfig,
+) -> tuple[np.ndarray, FrameCalibration]:
+    """One frame's aligned estimated depth and its context-image calibration.
+
+    This is the per-frame sequence lot.phase4.evaluate_scene_phase4 runs inline:
+    resample to the rendered frame size, convert only if the run's single
+    convention says ray distance, apply the frozen 5a validity rule to the map
+    itself so invalid pixels become NaN for every downstream consumer, then
+    calibrate from the context image alone.
+
+    Phase 4 is accepted and pinned, so it cannot be refactored to call this;
+    the two therefore have to be held together by evidence rather than by
+    sharing code. tests/test_phase5_depth_equivalence.py replays Phase 4's
+    inline sequence from its own source and asserts this function reproduces it
+    bit for bit, which is the same discipline lot.paired_bootstrap uses to share
+    Phase 4's bootstrap. Without that test the docstring claim that both
+    headline methods consume Phase 4's depth "by construction" would rest on
+    two copies nobody compares.
+    """
+    resampled, _ = resample_depth_nearest(raw_depth, (frame.height, frame.width))
+    if verdict == "ray_distance":
+        resampled = (
+            resampled / secant_map(frame.K, frame.height, frame.width)
+        ).astype(np.float32)
+    conf = (
+        resample_depth_nearest(raw_conf, (frame.height, frame.width))[0]
+        if raw_conf is not None
+        else None
+    )
+    prevalid = transport_prevalid(resampled, conf, analysis)
+    aligned = np.where(prevalid, resampled, np.float32(np.nan)).astype(np.float32)
+    return aligned, frame_calibration(aligned, gt_depth, prevalid)
+
+
 def build_scene_inputs(
     cfg: Phase5Config, analysis: AnalysisConfig, scene: str, convention: dict[str, Any]
 ) -> SceneInputs:
     """Mirror Phase 4's per-frame depth preparation, step for step.
 
-    The sequence is deliberately identical to lot.phase4.evaluate_scene_phase4:
-    resample, convert only if the run's single convention says ray distance,
-    apply the frozen 5a validity rule to the map itself so invalid pixels become
-    NaN for every downstream consumer, then calibrate from the context image.
-    Any divergence here would mean the two headline methods no longer share
-    their geometry, which is the condition Stream AD makes a stop.
+    The per-frame work lives in prepare_frame_depth, which an equivalence test
+    pins against Phase 4's inline sequence. Any divergence would mean the two
+    headline methods no longer share their geometry, which is the condition
+    Stream AD makes a stop.
     """
     scene_root = Path(cfg.renders_root) / scene
     manifest = load_manifest(scene_root / MANIFEST_NAME)
@@ -250,26 +288,16 @@ def build_scene_inputs(
     est_maps: dict[str, np.ndarray] = {}
     calibrations: dict[str, FrameCalibration] = {}
     for frame in manifest.frames:
-        resampled, _ = resample_depth_nearest(
-            depth_cache["depth"][frame.frame_id], (frame.height, frame.width)
+        aligned, calibration = prepare_frame_depth(
+            depth_cache["depth"][frame.frame_id],
+            depth_cache["conf"][frame.frame_id],
+            frame,
+            cache.depth(frame.depth_path).numpy(),
+            verdict,
+            analysis,
         )
-        if verdict == "ray_distance":
-            resampled = (
-                resampled / secant_map(frame.K, frame.height, frame.width)
-            ).astype(np.float32)
-        conf_raw = depth_cache["conf"][frame.frame_id]
-        conf = (
-            resample_depth_nearest(conf_raw, (frame.height, frame.width))[0]
-            if conf_raw is not None
-            else None
-        )
-        prevalid = transport_prevalid(resampled, conf, analysis)
-        est_maps[frame.frame_id] = np.where(
-            prevalid, resampled, np.float32(np.nan)
-        ).astype(np.float32)
-        calibrations[frame.frame_id] = frame_calibration(
-            est_maps[frame.frame_id], cache.depth(frame.depth_path).numpy(), prevalid
-        )
+        est_maps[frame.frame_id] = aligned
+        calibrations[frame.frame_id] = calibration
 
     return SceneInputs(
         scene=scene,
@@ -472,12 +500,23 @@ def main(argv: list[str] | None = None) -> None:
         from .phase5_check import format_report
         from .phase5_gate import run_integration_gate
 
+        from .phase5_check import write_once
+        from .phase5_receipt import KIND_INTEGRATION, stamp_receipt
+
         report = run_integration_gate(cfg, analysis)
         destination = cfg.evidence_dir / "integration_gate.json"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(report.to_json(), encoding="utf-8")
+        # Stamped through the one function that knows what a receipt must carry,
+        # and written without destroying an earlier one.
+        stamped = stamp_receipt(
+            json.loads(report.to_json()), args.config, KIND_INTEGRATION
+        )
+        outcome = write_once(
+            destination, json.dumps(stamped, indent=2, sort_keys=True, default=str)
+        )
         print(format_report(report))
         print(f"\nevidence written to {destination}")
+        if outcome["archived_previous"]:
+            print(f"previous receipt kept at {outcome['archived_previous']}")
         raise SystemExit(0 if report.passed else 1)
 
     raise SystemExit(

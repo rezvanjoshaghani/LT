@@ -337,10 +337,15 @@ def _identity_env(monkeypatch, tmp_path, accepted, live_features, live_depth, li
     eval_dir.mkdir(parents=True)
     (eval_dir / "room_0.parquet").write_bytes(b"parquet-bytes")
     monkeypatch.setattr(ev, "read_run_metadata", lambda path: accepted)
-    monkeypatch.setattr(enc, "load_cache_meta",
-                        lambda root, encoder, scene: {"features_digest": live_features})
-    monkeypatch.setattr(p4, "load_depth_archive",
-                        lambda root, encoder, scene: {"meta": {"depth_digest": live_depth}})
+
+    # Both digests now come from the small meta.json rather than from
+    # decompressing the depth archive, so the stub answers per encoder.
+    def cache_meta(root, encoder, scene):
+        if encoder == "vggt_1b":
+            return {"depth_digest": live_depth}
+        return {"features_digest": live_features}
+
+    monkeypatch.setattr(enc, "load_cache_meta", cache_meta)
     monkeypatch.setattr(p4, "manifest_digest", lambda root: live_manifest)
 
     @dataclasses.dataclass
@@ -384,14 +389,47 @@ def test_a_live_input_disagreeing_with_phase4_is_a_stop(monkeypatch, tmp_path, f
     assert mismatch["accepted"] != mismatch["live"]
 
 
-def test_a_missing_phase4_parquet_is_reported_per_scene(monkeypatch, tmp_path):
-    from lot.phase5_check import verify_scene_identities
+def test_a_missing_phase4_parquet_is_a_missing_artifact_not_a_design_mismatch(
+    monkeypatch, tmp_path
+):
+    """The two failures have different remedies and must not be conflated.
 
-    _, cfg = _identity_env(monkeypatch, tmp_path, {}, "F", "D", "M")
+    An absent parquet is fixed by copying a file. A frozen-design mismatch may
+    require an amendment with a written rationale. Reporting the first as the
+    second sends the reader to the wrong repair.
+    """
+    from lot.phase5_check import MISSING_ARTIFACT, verify_scene_identities
+
+    accepted = {"features_digest": "F", "depth_digest": "D", "manifest_digest": "M"}
+    _, cfg = _identity_env(monkeypatch, tmp_path, accepted, "F", "D", "M")
     with pytest.raises(GateStop) as caught:
         verify_scene_identities(cfg, ["room_0", "room_1"])
-    problems = caught.value.evidence["mismatches"]
-    assert any(p["scene"] == "room_1" and "missing" in p["problem"] for p in problems)
+    assert caught.value.classification == MISSING_ARTIFACT
+    absent = caught.value.evidence["absent"]
+    assert any(a["scene"] == "room_1" and a["input"] == "phase4_parquet" for a in absent)
+    # room_0's parquet exists and agrees, so it is not reported as absent.
+    assert not any(a["scene"] == "room_0" for a in absent)
+
+
+def test_an_unreadable_cache_is_a_missing_artifact_not_an_implementation_bug(
+    monkeypatch, tmp_path
+):
+    """Without this the loader's exception reaches run_steps' catch-all."""
+    import lot.encoders as enc
+
+    from lot.phase5_check import MISSING_ARTIFACT, verify_scene_identities
+
+    accepted = {"features_digest": "F", "depth_digest": "D", "manifest_digest": "M"}
+    _, cfg = _identity_env(monkeypatch, tmp_path, accepted, "F", "D", "M")
+
+    def absent_cache(root, encoder, scene):
+        raise FileNotFoundError(f"no cache for {encoder}/{scene}")
+
+    monkeypatch.setattr(enc, "load_cache_meta", absent_cache)
+    with pytest.raises(GateStop) as caught:
+        verify_scene_identities(cfg, ["room_0"])
+    assert caught.value.classification == MISSING_ARTIFACT
+    assert caught.value.evidence["absent"][0]["input"] == "cache_or_manifest"
 
 
 def test_the_mean_vector_must_be_the_one_phase4_centered_with():
@@ -439,3 +477,58 @@ def test_the_gate_no_longer_stops_at_a_probe_subset():
     source = inspect.getsource(phase5_gate.run_integration_gate)
     assert "verify_scene_identities(cfg, REPLICA_SCENES" in source
     assert "hash_scene_artifacts" not in source
+
+
+# ---------------------------------------------------------------------------
+# Outputs are write-once: CLAUDE.md forbids overwriting them
+# ---------------------------------------------------------------------------
+
+def test_write_once_keeps_the_previous_file(tmp_path):
+    from lot.phase5_check import write_once
+
+    target = tmp_path / "evidence" / "integration_gate.json"
+    first = write_once(target, "first")
+    assert first["archived_previous"] is None
+    assert target.read_text(encoding="utf-8") == "first"
+
+    second = write_once(target, "second")
+    assert target.read_text(encoding="utf-8") == "second"
+    kept = Path(second["archived_previous"])
+    assert kept.exists() and kept.read_text(encoding="utf-8") == "first"
+
+
+def test_write_once_numbers_successive_supersessions(tmp_path):
+    from lot.phase5_check import write_once
+
+    target = tmp_path / "receipt.json"
+    write_once(target, "a")
+    write_once(target, "b")
+    write_once(target, "c")
+    kept = sorted(p.name for p in tmp_path.glob("receipt.superseded.*.json"))
+    assert kept == ["receipt.superseded.1.json", "receipt.superseded.2.json"]
+    assert target.read_text(encoding="utf-8") == "c"
+    # Nothing was lost.
+    bodies = {(tmp_path / name).read_text(encoding="utf-8") for name in kept}
+    assert bodies == {"a", "b"}
+
+
+def test_step_six_compares_the_example_against_an_independent_expectation():
+    """The defect this guards: the check compared uv_t with itself.
+
+    Both sides were built from the same tensor, so the GateStop was unreachable
+    and build_example could have indexed lift.landed instead of the support, or
+    applied the patch mapping twice, with the step still reporting PASS. The
+    comparison must read the coordinates the example actually carries and an
+    expectation derived independently from the lift and the support.
+    """
+    import inspect
+
+    from lot import phase5_gate
+
+    source = inspect.getsource(phase5_gate.run_integration_gate)
+    step6 = source[source.index("def step6("):source.index("def step7(")]
+    assert "example.query_patch_coords" in step6, "step 6 ignores the real example"
+    assert "primary_support(" in step6, "step 6 does not rebuild the support"
+    assert "context_lift_support(" in step6, "step 6 does not rebuild evaluability"
+    # The tautology was a self-comparison of the landing coordinates.
+    assert '"supervision_read_uv"' not in step6

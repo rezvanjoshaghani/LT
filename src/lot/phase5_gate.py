@@ -24,6 +24,7 @@ from .phase5_check import (
     GateReport,
     GateStop,
     assert_no_checkpoint_written,
+    write_once,
     assert_no_forbidden_fields,
     check_folds_against_inventory,
     check_schema,
@@ -221,12 +222,62 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         }
 
     def step6() -> dict[str, Any]:
+        """The headline rests on both methods being scored at one location.
+
+        The check compares the coordinates the *example* actually carries, which
+        is the object training and evaluation consume, against an expectation
+        the gate derives independently from the lift and the support. An earlier
+        version built both sides from the same uv_t tensor, so the comparison
+        was between a value and itself and could not fail: build_example could
+        have indexed lift.landed instead of the support, applied the patch
+        mapping twice, or used a different patch size, and the step still
+        reported PASS.
+        """
+        inputs = state["probe_inputs"]
         example = state["examples"]["translation"]
-        lift, _, target, _ = lift_for(example)
+        lift, context, target, T = lift_for(example)
+        dtype = cfg.torch_dtype
         target_hw = (target.height, target.width)
+
+        # Rebuild the support the same way build_example does, from ground truth
+        # and the explicit comparator, then derive what the supervision
+        # coordinates must be if the two methods read one location.
+        evaluable = context_lift_support(
+            lift,
+            inputs.cache.depth(context.depth_path).to(dtype),
+            inputs.cache.depth(target.depth_path).to(dtype),
+            context.K.to(dtype), target.K.to(dtype), T,
+            rel_tol=analysis.covisible_relative_depth_tol,
+        )
+        support = primary_support(lift, evaluable)
+        chosen = torch.nonzero(support, as_tuple=False).reshape(-1)
+        expected = pixel_to_patch_coords(lift.uv_target[chosen], PATCH_SIZE)
+        actual = example.query_patch_coords
+
+        if actual.shape != expected.shape:
+            raise GateStop(
+                "6", "the example's supervision coordinates do not have the shape "
+                "the context-lift support implies, so the predictor is not read "
+                "at the landing locations CL-Transport is scored at",
+                IMPLEMENTATION_BUG,
+                {"example_shape": list(actual.shape),
+                 "expected_shape": list(expected.shape),
+                 "n_supported": int(support.sum())},
+            )
+        residual = (
+            float((actual.to(expected.dtype) - expected).abs().max())
+            if actual.numel() else 0.0
+        )
+        if residual > 0.0:
+            raise GateStop(
+                "6", "CL-Transport and the predictor are not scored against the "
+                f"target feature at the same location; coordinates differ by "
+                f"{residual}",
+                IMPLEMENTATION_BUG, {"max_abs_coordinate_difference": residual},
+            )
+
         rows: list[dict[str, Any]] = []
-        chosen = torch.nonzero(lift.landed, as_tuple=False).reshape(-1)[:5]
-        for index in chosen.tolist():
+        for row_index, index in enumerate(chosen.tolist()[:5]):
             uv_t = lift.uv_target[index]
             rows.append({
                 "context_sample_index": index,
@@ -237,18 +288,18 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
                     patch_cell_index(uv_t[None], target_hw, PATCH_SIZE)[0]
                 ),
                 "predictor_read_patch_coord": [
-                    float(v) for v in pixel_to_patch_coords(uv_t[None], PATCH_SIZE)[0]
+                    float(v) for v in actual[row_index]
                 ],
-                "supervision_read_uv": [float(v) for v in uv_t],
+                "supervision_read_patch_coord": [
+                    float(v) for v in expected[row_index]
+                ],
             })
-        for row in rows:
-            if row["cl_landing_uv"] != row["supervision_read_uv"]:
-                raise GateStop(
-                    "6", "CL-Transport and the predictor are not scored against the "
-                    "target feature at the same location",
-                    IMPLEMENTATION_BUG, {"row": row},
-                )
-        return {"samples": rows, "n_landed": int(lift.landed.sum())}
+        return {
+            "samples": rows,
+            "n_landed": int(lift.landed.sum()),
+            "n_supported": int(support.sum()),
+            "max_abs_coordinate_difference": residual,
+        }
 
     def step7() -> dict[str, Any]:
         inputs = state["probe_inputs"]
@@ -564,12 +615,11 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
             "note": "no Phase 5 test outcome was inspected by this gate",
         }
         destination = Path(cfg.evidence_dir) / "pin_cluster.json"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(pin, indent=2, sort_keys=True, default=str), encoding="utf-8"
+        outcome = write_once(
+            destination, json.dumps(pin, indent=2, sort_keys=True, default=str)
         )
         state["pin_path"] = str(destination)
-        return {"written": str(destination), "keys": sorted(pin)}
+        return {**outcome, "keys": sorted(pin)}
 
     def step16() -> dict[str, Any]:
         evidence = assert_no_checkpoint_written(run_dir, checkpoints_before)

@@ -103,24 +103,28 @@ print_identity() {
 # shapes for code that is no longer the code about to train. So every receipt is
 # bound to the run identity, and a mismatch is refused with the field named.
 require_receipt() {
-    local receipt="$1" label="$2" advice="$3"
+    # kind selects which bindings apply. The integration receipt is bound to the
+    # resolved inputs it hashed; the overfit receipt carries no such block and is
+    # bound instead to the digest of the integration receipt that licensed it.
+    local receipt="$1" label="$2" advice="$3" kind="$4"
     if [ ! -f "$receipt" ]; then
         echo "$label has not been run; $receipt is absent." >&2
         echo "$advice" >&2
         exit 1
     fi
     run_lot python -m lot.phase5_receipt \
-        --receipt "$receipt" --config "$CONFIG" --label "$label" || exit 1
+        --receipt "$receipt" --config "$CONFIG" --label "$label" \
+        --kind "$kind" --gate-receipt "$GATE_RECEIPT" || exit 1
 }
 
 require_gate_passed() {
     require_receipt "$GATE_RECEIPT" "the Borah integration gate" \
-        "run './scripts/run_phase5.sh check' first."
+        "run './scripts/run_phase5.sh check' first." integration
 }
 
 require_overfit_passed() {
     require_receipt "$OVERFIT_RECEIPT" "the tiny-subset overfit gate" \
-        "run './scripts/run_phase5.sh overfit' first."
+        "run './scripts/run_phase5.sh overfit' first." overfit
 }
 
 mkdir -p "$EVIDENCE_DIR"

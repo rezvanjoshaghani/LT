@@ -197,7 +197,18 @@ QUANTITY_POPULATION = {
 # Quantities that live in score space, and to which the frozen 0.003 near-zero
 # disclosure applies. Counts and fractions are excluded by Stream AB step 35's
 # instruction not to apply the operator band to dimensionless quantities.
-SCORE_SPACE_QUANTITIES = frozenset(QUANTITY_POPULATION)
+# The near-zero rule is scoped by PROTOCOL 3.9 to "an interpreted effect", which
+# is a claim about one method relative to another. It is not every quantity that
+# happens to be measured in score units. The set is therefore INTERPRETED_EFFECTS
+# and is defined below, next to the disclosure registry it must stay consistent
+# with; an earlier version took frozenset(QUANTITY_POPULATION), which swept in
+# the cross-path disclosure terms and the path differences and then told
+# path_difference_learn, which is itself the difference between the two paths,
+# that it had no second evaluation path by construction.
+#
+# Absolute levels (cl_transport, sp_transport, tl_reference) are excluded for the
+# same reason: a level near zero is not a near-zero *effect*, and the three
+# licensed wordings are all statements about an advantage.
 
 
 class HeadlineSubstitutionError(RuntimeError):
@@ -278,12 +289,66 @@ class PathEstimate:
         return 1 if self.estimate > 0.0 else -1
 
 
+# Which splat-pool quantity is the same effect measured on the operational
+# path. PROTOCOL 3.9's near-zero rule compares an effect across both evaluation
+# paths, so a quantity that has a counterpart must be disclosed against it.
+# The formulation quantities have none: they exist only on the per-point path,
+# and a cell without a second path can never reach the sign-consistent wording.
+# The disclosure pair for each quantity, both terms living on the CROSS_PATH
+# population so they are recomputed on the cells the two paths share. Comparing
+# a quantity on V_P5_pp against its counterpart on V_sp would mix an operator
+# difference with a selection difference, which is exactly what PROTOCOL 3.9
+# forbids, so the mapping points at the intersection columns and not at the
+# own-population ones.
+DISCLOSURE_PAIR = {
+    # quantity: (per-point term, splat term, path difference), all on CROSS_PATH.
+    "delta_learn_pp": ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference_learn"),
+    # The operational gap is the same effect read from the other side, so it is
+    # disclosed against the same pair with the roles kept in path order.
+    "delta_learn_sp": ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference_learn"),
+    "cl_margin": ("x_cl_margin", "x_sp_transport_margin", "path_difference_cl_margin"),
+    "sp_transport_margin": (
+        "x_cl_margin", "x_sp_transport_margin", "path_difference_cl_margin"
+    ),
+    "predict_margin": (
+        "x_predict_margin", "x_sp_predict_margin", "path_difference_predict_margin"
+    ),
+    "sp_predict_margin": (
+        "x_predict_margin", "x_sp_predict_margin", "path_difference_predict_margin"
+    ),
+}
+
+# The quantities PROTOCOL 3.9's near-zero wording applies to: the interpreted
+# effects, meaning differences a reader would take as a claim about one method
+# relative to another. Every one either has a disclosure pair above or is
+# declared here as having no second path by construction. A quantity in this
+# set with neither is a programming error and evaluate_quantity raises, so the
+# single-path wording can never be reached by omission.
+INTERPRETED_EFFECTS = frozenset({
+    "delta_learn_pp", "delta_learn_sp",
+    "cl_margin", "sp_transport_margin",
+    "predict_margin", "sp_predict_margin",
+    "delta_formulation",
+})
+# The formulation diagnostic compares two per-point estimators and has no splat
+# counterpart at all, so its single-path disclosure is a fact of the design
+# rather than a fallback.
+SINGLE_PATH_BY_CONSTRUCTION = frozenset({"delta_formulation"})
+
+# PROTOCOL 3.9's near-zero discipline applies exactly to the interpreted
+# effects. Everything else in score space is reported with its interval and
+# no near-zero wording, because none of the three licensed sentences would be
+# true of it.
+SCORE_SPACE_QUANTITIES = INTERPRETED_EFFECTS
+
+
 def near_zero_disclosure(
     quantity: str,
     per_point: PathEstimate,
     splat_pool: PathEstimate | None,
     analysis: AnalysisConfig,
     difference: PathEstimate | None = None,
+    reported: PathEstimate | None = None,
 ) -> dict[str, Any]:
     """The frozen 0.003 rule, carried forward verbatim from PROTOCOL 3.9.
 
@@ -302,13 +367,29 @@ def near_zero_disclosure(
     only for a quantity that has no second path, and it can never reach the
     sign-consistent wording.
 
-    Applied only to score-space quantities. Counts and fractions are not in the
-    metric's units and the band means nothing for them.
+    Two different numbers are in play and they are not interchangeable. The
+    *trigger* is the interpreted effect the cell reports, because 3.9 scopes the
+    discipline to "an interpreted effect no larger than this tolerance", and the
+    effect a reader sees is the one in the table. The *terms* whose band
+    membership, sign, and intervals decide the wording are the two path
+    estimates, recomputed on the cross-path common-valid set. An earlier version
+    used the path terms for both, so a headline gap of 0.0015 sitting squarely
+    inside the band could print with no disclosure at all whenever its
+    intersection terms happened to fall outside it.
+
+    `reported` defaults to `per_point` for callers that have only one number,
+    which is the case when the quantity has no disclosure pair.
+
+    Applied only to the interpreted effects. Counts, fractions, absolute levels,
+    and the cross-path disclosure terms are not claims of advantage, and none of
+    the three licensed sentences would be true of them.
     """
     if quantity not in SCORE_SPACE_QUANTITIES:
         return {"near_zero": False, "applicable": False}
 
     band = analysis.path_agreement_tolerance
+    if reported is None:
+        reported = per_point
     if not per_point.finite:
         # An undefined term still reports both sides, so a reader can see that
         # the cell was empty rather than that the effect was large.
@@ -316,6 +397,7 @@ def near_zero_disclosure(
             "near_zero": False,
             "applicable": True,
             "band": band,
+            "reported": dataclasses.asdict(reported),
             "per_point": dataclasses.asdict(per_point),
             "splat_pool": (
                 dataclasses.asdict(splat_pool) if splat_pool is not None else None
@@ -326,14 +408,20 @@ def near_zero_disclosure(
         }
 
     pp_in = per_point.within(band)
+    # The cell is a near-zero cell when the effect it reports is inside the band,
+    # or when either path term is; disclosing on any of the three never
+    # under-discloses, which is the direction 3.9's caution points.
+    reported_in = reported.within(band)
     if splat_pool is None or not splat_pool.finite:
         # No comparable second path. The band still flags the cell, but the only
         # claim available is the weakest one: 3.9's licence for a sign-consistent
         # effect is conditional on both paths, and one path cannot supply it.
+        flagged = bool(pp_in or reported_in)
         return {
-            "near_zero": bool(pp_in),
+            "near_zero": flagged,
             "applicable": True,
             "band": band,
+            "reported": dataclasses.asdict(reported),
             "per_point": dataclasses.asdict(per_point),
             "splat_pool": None,
             "paths_agree_in_sign": None,
@@ -341,7 +429,7 @@ def near_zero_disclosure(
             "wording": (
                 "no measurable difference at the reported scale; this quantity "
                 "has no second evaluation path by construction"
-                if pp_in else "effect outside the operator band"
+                if flagged else "effect outside the operator band"
             ),
         }
 
@@ -361,7 +449,7 @@ def near_zero_disclosure(
     # discipline is engaged at all: 3.9 scopes it to an effect "no larger than
     # this tolerance", so a cell outside the band on both paths is not a
     # near-zero cell and the veto has nothing to act on.
-    if not (pp_in or sp_in):
+    if not (pp_in or sp_in or reported_in):
         wording = "effect outside the operator band"
     elif not same_sign or not both_clear:
         wording = (
@@ -377,9 +465,10 @@ def near_zero_disclosure(
         )
 
     return {
-        "near_zero": bool(pp_in or sp_in),
+        "near_zero": bool(pp_in or sp_in or reported_in),
         "applicable": True,
         "band": band,
+        "reported": dataclasses.asdict(reported),
         "per_point": dataclasses.asdict(per_point),
         "splat_pool": dataclasses.asdict(splat_pool),
         # The difference carries its own paired interval, from the same scene
@@ -439,53 +528,6 @@ def _count_field_for(population: str) -> str:
         SPLAT_POOL: "n_splat",
         CROSS_PATH: "n_intersect",
     }[population]
-
-
-# Which splat-pool quantity is the same effect measured on the operational
-# path. PROTOCOL 3.9's near-zero rule compares an effect across both evaluation
-# paths, so a quantity that has a counterpart must be disclosed against it.
-# The formulation quantities have none: they exist only on the per-point path,
-# and a cell without a second path can never reach the sign-consistent wording.
-# The disclosure pair for each quantity, both terms living on the CROSS_PATH
-# population so they are recomputed on the cells the two paths share. Comparing
-# a quantity on V_P5_pp against its counterpart on V_sp would mix an operator
-# difference with a selection difference, which is exactly what PROTOCOL 3.9
-# forbids, so the mapping points at the intersection columns and not at the
-# own-population ones.
-DISCLOSURE_PAIR = {
-    # quantity: (per-point term, splat term, path difference), all on CROSS_PATH.
-    "delta_learn_pp": ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference_learn"),
-    # The operational gap is the same effect read from the other side, so it is
-    # disclosed against the same pair with the roles kept in path order.
-    "delta_learn_sp": ("x_delta_learn_pp", "x_delta_learn_sp", "path_difference_learn"),
-    "cl_margin": ("x_cl_margin", "x_sp_transport_margin", "path_difference_cl_margin"),
-    "sp_transport_margin": (
-        "x_cl_margin", "x_sp_transport_margin", "path_difference_cl_margin"
-    ),
-    "predict_margin": (
-        "x_predict_margin", "x_sp_predict_margin", "path_difference_predict_margin"
-    ),
-    "sp_predict_margin": (
-        "x_predict_margin", "x_sp_predict_margin", "path_difference_predict_margin"
-    ),
-}
-
-# The quantities PROTOCOL 3.9's near-zero wording applies to: the interpreted
-# effects, meaning differences a reader would take as a claim about one method
-# relative to another. Every one either has a disclosure pair above or is
-# declared here as having no second path by construction. A quantity in this
-# set with neither is a programming error and evaluate_quantity raises, so the
-# single-path wording can never be reached by omission.
-INTERPRETED_EFFECTS = frozenset({
-    "delta_learn_pp", "delta_learn_sp",
-    "cl_margin", "sp_transport_margin",
-    "predict_margin", "sp_predict_margin",
-    "delta_formulation",
-})
-# The formulation diagnostic compares two per-point estimators and has no splat
-# counterpart at all, so its single-path disclosure is a fact of the design
-# rather than a fallback.
-SINGLE_PATH_BY_CONSTRUCTION = frozenset({"delta_formulation"})
 
 
 def _interval_for(
@@ -558,7 +600,8 @@ def evaluate_quantity(
         difference = PathEstimate(diff["estimate"], diff["lo"], diff["hi"])
 
     disclosure = near_zero_disclosure(
-        quantity, per_point_term, counterpart, analysis, difference
+        quantity, per_point_term, counterpart, analysis, difference,
+        reported=PathEstimate(interval["estimate"], interval["lo"], interval["hi"]),
     )
     return CellResult(
         quantity=quantity,

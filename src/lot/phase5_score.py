@@ -113,7 +113,16 @@ def score_all_metrics(
         a, b = (safe, target) if center_vector is None else (
             safe - center_vector, target - center_vector
         )
-        a_n, b_n = _unit(a), _unit(b)
+        # float32 before normalizing, exactly as lot.evaluate.value_agreement
+        # does. Every Phase 3 and Phase 4 score is float32 arithmetic, and the
+        # comparability this record claims with those tables depends on the two
+        # running the same arithmetic rather than merely the same formula.
+        # Without the cast this scored in whatever dtype the caller passed:
+        # float64 under the suite, float32 in the shipped path, and fp16 if the
+        # cache tensors were ever handed over directly, where the normalizing
+        # epsilon underflows and a prediction equal to the mean vector yields a
+        # NaN the pre-normalization finiteness check does not catch.
+        a_n, b_n = _unit(a.to(torch.float32)), _unit(b.to(torch.float32))
         cosine = (a_n * b_n).sum(dim=-1)
         l2 = (a_n - b_n).norm(dim=-1)
         return (

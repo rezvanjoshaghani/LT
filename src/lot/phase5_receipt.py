@@ -54,6 +54,24 @@ BOUND_SCENE_FIELDS = (
     "phase4_parquet_sha256", "phase4_parquet_bytes",
 )
 
+# A receipt's kind decides which bindings apply to it. The integration gate is
+# the only thing that resolves and hashes the inputs, so it is the only receipt
+# that can carry an artifact block or a per-scene identity block. The
+# tiny-overfit gate trains on a frozen subset and produces no such evidence.
+#
+# An earlier version applied the integration bindings to every receipt, which
+# made the overfit receipt impossible to verify: both gates could pass and
+# training would still refuse to start, citing a missing artifact block and
+# naming the wrong gate. The overfit receipt is instead bound to the identity
+# and to the digest of the integration receipt that licensed it, so it cannot be
+# carried across to a run the gate never examined.
+KIND_INTEGRATION = "integration"
+KIND_OVERFIT = "overfit"
+RECEIPT_KINDS = (KIND_INTEGRATION, KIND_OVERFIT)
+
+# The key an overfit receipt records the licensing gate receipt under.
+GATE_RECEIPT_DIGEST = "gate_receipt_sha256"
+
 
 def receipt_identity(report: dict[str, Any]) -> dict[str, Any]:
     """Pull the identity out of a gate report, wherever the writer put it.
@@ -89,8 +107,28 @@ def current_identity(config_path: Path) -> dict[str, Any]:
     }
 
 
-def verify(receipt_path: Path, config_path: Path, label: str) -> list[str]:
-    """Return a list of human-readable problems. Empty means the receipt stands."""
+def receipt_kind(report: dict[str, Any]) -> str:
+    """Which kind of receipt this is, defaulting to the integration gate.
+
+    The default is the stricter kind on purpose: a receipt that does not say
+    what it is gets the binding that refuses more, not less.
+    """
+    kind = report.get("kind")
+    return kind if kind in RECEIPT_KINDS else KIND_INTEGRATION
+
+
+def verify(
+    receipt_path: Path,
+    config_path: Path,
+    label: str,
+    kind: str | None = None,
+    gate_receipt: Path | None = None,
+) -> list[str]:
+    """Return a list of human-readable problems. Empty means the receipt stands.
+
+    kind names the receipt expected here; None reads it from the receipt itself.
+    gate_receipt is the integration receipt an overfit receipt must be bound to.
+    """
     problems: list[str] = []
     try:
         report = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
@@ -122,8 +160,84 @@ def verify(receipt_path: Path, config_path: Path, label: str) -> list[str]:
                 "    The gate verified a different state. Rerun it."
             )
 
-    problems.extend(_artifact_problems(report, config_path, label))
+    found_kind = receipt_kind(report)
+    if kind is not None and found_kind != kind:
+        problems.append(
+            f"{label}: receipt says it is a {found_kind!r} receipt, but a "
+            f"{kind!r} receipt is required here"
+        )
+        return problems
+
+    if found_kind == KIND_INTEGRATION:
+        problems.extend(_artifact_problems(report, config_path, label))
+    else:
+        problems.extend(_gate_binding_problems(report, label, gate_receipt))
     return problems
+
+
+def _gate_binding_problems(
+    report: dict[str, Any], label: str, gate_receipt: Path | None
+) -> list[str]:
+    """An overfit receipt is bound to the integration receipt that licensed it.
+
+    It carries no artifact or scene block of its own, because the overfit gate
+    resolves no inputs; what it must prove is that it ran after, and under, a
+    specific integration gate. Recording that gate receipt's digest does exactly
+    that: if the gate is rerun, its receipt changes and this binding fails, which
+    is the intended behaviour.
+    """
+    from .phase5_check import sha256_file
+
+    recorded = report.get(GATE_RECEIPT_DIGEST)
+    if not recorded:
+        return [
+            f"{label}: receipt does not record the integration receipt it ran "
+            f"under ({GATE_RECEIPT_DIGEST}); rerun the overfit gate"
+        ]
+    if gate_receipt is None:
+        return [
+            f"{label}: no integration receipt was supplied to bind against; this "
+            "is a caller error, not a receipt defect"
+        ]
+    if not Path(gate_receipt).exists():
+        return [
+            f"{label}: the integration receipt at {gate_receipt} is absent, so "
+            "this receipt's binding cannot be checked; rerun the gate"
+        ]
+    live = sha256_file(Path(gate_receipt))
+    if recorded != live:
+        return [
+            f"{label}: ran under a different integration gate than the one "
+            f"present.\n    receipt: {recorded}\n    current: {live}\n"
+            "    Rerun the overfit gate under the current gate."
+        ]
+    return []
+
+
+def stamp_receipt(
+    report: dict[str, Any],
+    config_path: Path,
+    kind: str,
+    gate_receipt: Path | None = None,
+) -> dict[str, Any]:
+    """Add the identity a receipt must carry, so writers cannot forget it.
+
+    One function stamps every receipt, so the shape verify() expects and the
+    shape the writers produce cannot drift apart.
+    """
+    from .phase5_check import sha256_file
+
+    if kind not in RECEIPT_KINDS:
+        raise ValueError(f"unknown receipt kind {kind!r}; use one of {RECEIPT_KINDS}")
+    stamped = {**report, "kind": kind, **current_identity(config_path)}
+    if kind == KIND_OVERFIT:
+        if gate_receipt is None or not Path(gate_receipt).exists():
+            raise ValueError(
+                "an overfit receipt must be bound to the integration receipt "
+                "that licensed it, and that receipt is absent"
+            )
+        stamped[GATE_RECEIPT_DIGEST] = sha256_file(Path(gate_receipt))
+    return stamped
 
 
 def _artifact_problems(
@@ -193,7 +307,7 @@ def _artifact_problems(
 def _scene_identity_problems(report: dict[str, Any], cfg: Any, label: str) -> list[str]:
     """Recompute every bound per-scene identity and compare it to the receipt."""
     from .encoders import load_cache_meta
-    from .phase4 import load_depth_archive, manifest_digest
+    from .phase4 import manifest_digest
     from .phase5_check import sha256_file
     from .render_replica import REPLICA_SCENES
 
@@ -218,9 +332,14 @@ def _scene_identity_problems(report: dict[str, Any], cfg: Any, label: str) -> li
             live["features_digest"] = load_cache_meta(
                 cfg.cache_root, cfg.feature_encoder, scene
             ).get("features_digest")
-            live["depth_digest"] = load_depth_archive(
+            # load_cache_meta reads the small meta.json. load_depth_archive
+            # would return the identical value, but only after digesting and
+            # fully decompressing the depth archive, which is roughly 11 GB of
+            # reads across 18 scenes for a field already on disk in JSON. The
+            # bytes behind that digest were verified by the gate.
+            live["depth_digest"] = load_cache_meta(
                 cfg.cache_root, cfg.depth_encoder, scene
-            )["meta"].get("depth_digest")
+            ).get("depth_digest")
             live["manifest_digest"] = manifest_digest(Path(cfg.renders_root) / scene)
             parquet = Path(cfg.phase4_dir) / "eval" / f"{scene}.parquet"
             live["phase4_parquet_sha256"] = sha256_file(parquet)
@@ -271,9 +390,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("configs/phase5.yaml"))
     parser.add_argument("--label", default="gate")
+    parser.add_argument("--kind", choices=RECEIPT_KINDS, default=None)
+    parser.add_argument(
+        "--gate-receipt", type=Path, default=None,
+        help="the integration receipt an overfit receipt must be bound to",
+    )
     args = parser.parse_args(argv)
 
-    problems = verify(args.receipt, args.config, args.label)
+    problems = verify(
+        args.receipt, args.config, args.label,
+        kind=args.kind, gate_receipt=args.gate_receipt,
+    )
     if problems:
         for problem in problems:
             print(problem, file=sys.stderr)

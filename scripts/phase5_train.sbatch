@@ -10,10 +10,11 @@
 #          --partition "${SLURM_PARTITION:?}" \
 #          --array 0-8 scripts/phase5_train.sbatch configs/phase5.yaml
 #
-# Run scripts/run_phase5.sh check, gates, and tiny first. The tiny-subset
-# overfit gate is a stop condition: a predictor that cannot fit eight pairs
-# cannot support a scientific reading of its later underperformance, so
-# training refuses to start until it has passed.
+# Run scripts/run_phase5.sh check, then overfit, first. The tiny-subset overfit
+# gate is a stop condition: a predictor that cannot fit eight pairs cannot
+# support a scientific reading of its later underperformance, so training
+# refuses to start until it has passed. This worker re-checks both receipts
+# itself rather than trusting the launcher.
 #
 # GPU shape, unlike Phase 4's evaluation array. The job reads cached features
 # and cached VGGT depth and never loads an encoder, but it does train.
@@ -75,17 +76,22 @@ from lot.phase5 import load_phase5_config
 print(load_phase5_config(Path('$CONFIG')).evidence_dir)
 ")"
 echo "receipts expected under $EVIDENCE_DIR"
-for receipt in "integration_gate:the Borah integration gate" \
-               "tiny_overfit:the tiny-subset overfit gate"; do
-    file="$EVIDENCE_DIR/${receipt%%:*}.json"
-    label="${receipt#*:}"
+GATE_RECEIPT="$EVIDENCE_DIR/integration_gate.json"
+for receipt in "integration_gate:integration:the Borah integration gate" \
+               "tiny_overfit:overfit:the tiny-subset overfit gate"; do
+    name="${receipt%%:*}"
+    rest="${receipt#*:}"
+    kind="${rest%%:*}"
+    label="${rest#*:}"
+    file="$EVIDENCE_DIR/$name.json"
     if [ ! -f "$file" ]; then
         echo "$label has not been run; $file is absent." >&2
         echo "training is not permitted until both gates pass." >&2
         exit 1
     fi
     "$MM" run -n "$LOT_ENV" python -m lot.phase5_receipt \
-        --receipt "$file" --config "$CONFIG" --label "$label" || exit 1
+        --receipt "$file" --config "$CONFIG" --label "$label" \
+        --kind "$kind" --gate-receipt "$GATE_RECEIPT" || exit 1
 done
 
 # One task per (fold, seed). The task never sees a test scene: the fold object

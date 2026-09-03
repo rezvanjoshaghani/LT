@@ -574,3 +574,68 @@ def test_margin_path_differences_are_their_own_paired_quantities():
         assert diff["estimate"] == pytest.approx(
             d["per_point"]["estimate"] - d["splat_pool"]["estimate"], abs=1e-9
         )
+
+
+# ---------------------------------------------------------------------------
+# The near-zero trigger is the reported effect, and the rule's scope
+# ---------------------------------------------------------------------------
+
+def test_a_reported_effect_inside_the_band_is_disclosed_even_when_the_terms_are_not():
+    """The defect this guards: the trigger read the intersection terms, so a
+    headline gap squarely inside the band could print with no disclosure."""
+    out = near_zero_disclosure(
+        "delta_learn_pp",
+        _pe(0.012, 0.010, 0.014),      # per-point term, outside the band
+        _pe(0.011, 0.009, 0.013),      # splat term, outside the band
+        ANALYSIS,
+        reported=_pe(0.0015, 0.0010, 0.0020),   # the effect the cell reports
+    )
+    assert out["near_zero"], "an effect inside the band was not disclosed"
+    assert out["reported"]["estimate"] == pytest.approx(0.0015)
+    # The wording still comes from the two path terms, as 3.9 requires.
+    assert out["per_point"]["estimate"] == pytest.approx(0.012)
+
+
+def test_the_reported_effect_defaults_to_the_per_point_term():
+    out = near_zero_disclosure(
+        "delta_learn_pp", _pe(0.0012, 0.0009, 0.0015), None, ANALYSIS
+    )
+    assert out["reported"]["estimate"] == pytest.approx(0.0012)
+
+
+def test_the_cell_disclosure_carries_the_estimate_the_cell_reports():
+    records = make_records(n_scenes=8, pairs_per_scene=5, noise=1e-6)
+    for r in records:
+        # Headline gap inside the band; intersection terms far outside it.
+        r["cl_centered"], r["predict_centered"] = 0.5015, 0.5000
+        r["x_cl_centered"], r["x_predict_centered"] = 0.62, 0.55
+        r["x_sp_transport_centered"], r["x_sp_predict_centered"] = 0.61, 0.54
+    cell = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS)
+    assert cell.estimate == pytest.approx(0.0015, abs=1e-5)
+    assert cell.disclosure["reported"]["estimate"] == pytest.approx(cell.estimate)
+    assert cell.disclosure["near_zero"], "the reported effect is inside the band"
+
+
+def test_the_near_zero_rule_applies_to_interpreted_effects_only():
+    """Its three licensed sentences are all claims about an advantage.
+
+    The defect this guards: SCORE_SPACE_QUANTITIES was frozenset of every
+    quantity, so path_difference_learn, which is itself the difference between
+    the two paths, was told it had no second evaluation path by construction.
+    """
+    from lot.phase5_estimands import INTERPRETED_EFFECTS, SCORE_SPACE_QUANTITIES
+
+    assert SCORE_SPACE_QUANTITIES == INTERPRETED_EFFECTS
+    for name in ("path_difference_learn", "x_delta_learn_pp", "x_sp_predict_margin",
+                 "cl_transport", "sp_transport", "tl_reference"):
+        out = near_zero_disclosure(name, _pe(0.001, 0.0005, 0.0015), None, ANALYSIS)
+        assert not out["applicable"], name
+        assert not out["near_zero"], name
+
+
+def test_a_disclosure_term_never_receives_the_single_path_sentence():
+    records = make_records(n_scenes=6, pairs_per_scene=4, noise=1e-6)
+    for name in ("path_difference_learn", "x_delta_learn_pp"):
+        cell = evaluate_quantity(records, name, "centered", ANALYSIS)
+        assert not cell.disclosure["applicable"]
+        assert "by construction" not in cell.disclosure.get("wording", "")

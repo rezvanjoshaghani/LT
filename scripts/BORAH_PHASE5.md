@@ -74,7 +74,9 @@ mismatch stops everything.
     ./scripts/run_phase5.sh overfit
 
 Refuses to run until `check` has passed, read from the gate's own receipt
-rather than from memory.
+rather than from memory. Its own receipt records the digest of that gate
+receipt, so an overfit result cannot be carried across to a run the gate never
+examined; rerunning `check` invalidates it and the overfit gate must be rerun.
 
 Stream U step 14. Eight pairs from training scenes only, spanning the three
 camera regimes, at the frozen threshold of centered cosine 0.98.

@@ -206,10 +206,12 @@ def test_scene_identity_fields_are_compared_when_recomputable(tmp_path, monkeypa
     from lot import phase5_receipt as m
     from lot.render_replica import REPLICA_SCENES
 
-    monkeypatch.setattr(enc, "load_cache_meta",
-                        lambda root, encoder, scene: {"features_digest": "f"})
-    monkeypatch.setattr(p4, "load_depth_archive",
-                        lambda root, encoder, scene: {"meta": {"depth_digest": "d"}})
+    def cache_meta(root, encoder, scene):
+        if encoder == "vggt_1b":
+            return {"depth_digest": "d"}
+        return {"features_digest": "f"}
+
+    monkeypatch.setattr(enc, "load_cache_meta", cache_meta)
     monkeypatch.setattr(p4, "manifest_digest", lambda root: "m")
     monkeypatch.setattr(chk, "sha256_file", lambda path: "p")
 
@@ -260,3 +262,100 @@ def test_receipt_scene_identities_merge_step2_and_step4_blocks():
     ]}
     merged = receipt_scene_identities(report)
     assert merged["a"] == {"features_digest": "f", "aligned_depth_digest": "z"}
+
+
+# ---------------------------------------------------------------------------
+# Receipt kinds: the overfit receipt must be verifiable
+# ---------------------------------------------------------------------------
+
+def _overfit_receipt(tmp_path: Path, gate_path: Path, **identity) -> Path:
+    from lot.phase5_receipt import KIND_OVERFIT, stamp_receipt
+
+    report = stamp_receipt(
+        {"passed": True, "reached_centered_cosine": 0.991},
+        CONFIG, KIND_OVERFIT, gate_receipt=gate_path,
+    )
+    report.update(identity)
+    path = tmp_path / "tiny_overfit.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return path
+
+
+def _gate_file(tmp_path: Path, body: str = "gate") -> Path:
+    path = tmp_path / "integration_gate.json"
+    path.write_text(json.dumps({"passed": True, "body": body}), encoding="utf-8")
+    return path
+
+
+def test_an_overfit_receipt_verifies_without_an_artifact_block(tmp_path):
+    """The defect this guards: applying the gate's bindings to every receipt
+    made the overfit receipt impossible to verify, so both gates could pass and
+    training would still refuse to start."""
+    from lot.phase5_receipt import KIND_OVERFIT
+
+    gate = _gate_file(tmp_path)
+    receipt = _overfit_receipt(tmp_path, gate)
+    assert verify(receipt, CONFIG, "overfit", kind=KIND_OVERFIT, gate_receipt=gate) == []
+
+
+def test_an_overfit_receipt_is_bound_to_the_gate_that_licensed_it(tmp_path):
+    from lot.phase5_receipt import KIND_OVERFIT
+
+    gate = _gate_file(tmp_path)
+    receipt = _overfit_receipt(tmp_path, gate)
+    # Rerunning the gate changes its receipt, which invalidates the binding.
+    gate.write_text(json.dumps({"passed": True, "body": "rerun"}), encoding="utf-8")
+    problems = verify(receipt, CONFIG, "overfit", kind=KIND_OVERFIT, gate_receipt=gate)
+    assert any("ran under a different integration gate" in p for p in problems)
+
+
+def test_an_overfit_receipt_without_its_gate_binding_is_refused(tmp_path):
+    from lot.phase5_receipt import KIND_OVERFIT
+
+    gate = _gate_file(tmp_path)
+    path = tmp_path / "unbound.json"
+    path.write_text(
+        json.dumps({"passed": True, "kind": KIND_OVERFIT, **current_identity(CONFIG)}),
+        encoding="utf-8",
+    )
+    problems = verify(path, CONFIG, "overfit", kind=KIND_OVERFIT, gate_receipt=gate)
+    assert any("does not record the integration receipt" in p for p in problems)
+
+
+def test_a_receipt_of_the_wrong_kind_is_refused(tmp_path):
+    from lot.phase5_receipt import KIND_INTEGRATION, KIND_OVERFIT
+
+    gate = _gate_file(tmp_path)
+    receipt = _overfit_receipt(tmp_path, gate)
+    problems = verify(
+        receipt, CONFIG, "gate", kind=KIND_INTEGRATION, gate_receipt=gate
+    )
+    assert any("required here" in p for p in problems)
+
+
+def test_an_unlabelled_receipt_defaults_to_the_stricter_kind(tmp_path):
+    """A receipt that does not say what it is gets the binding that refuses more."""
+    from lot.phase5_receipt import KIND_INTEGRATION, receipt_kind
+
+    assert receipt_kind({}) == KIND_INTEGRATION
+    assert receipt_kind({"kind": "nonsense"}) == KIND_INTEGRATION
+    problems = verify(_receipt(tmp_path), CONFIG, "gate")
+    assert any("no resolved-artifact block" in p for p in problems)
+
+
+def test_stamp_receipt_refuses_an_overfit_stamp_without_a_gate(tmp_path):
+    from lot.phase5_receipt import KIND_OVERFIT, stamp_receipt
+
+    with pytest.raises(ValueError, match="must be bound to the integration receipt"):
+        stamp_receipt({"passed": True}, CONFIG, KIND_OVERFIT, gate_receipt=None)
+    with pytest.raises(ValueError, match="unknown receipt kind"):
+        stamp_receipt({"passed": True}, CONFIG, "something-else")
+
+
+def test_stamp_receipt_supplies_the_identity_every_receipt_must_carry(tmp_path):
+    from lot.phase5_receipt import BOUND_FIELDS, KIND_INTEGRATION, stamp_receipt
+
+    stamped = stamp_receipt({"passed": True}, CONFIG, KIND_INTEGRATION)
+    assert stamped["kind"] == KIND_INTEGRATION
+    for field in BOUND_FIELDS:
+        assert stamped[field] == current_identity(CONFIG)[field]

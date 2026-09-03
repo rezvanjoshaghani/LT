@@ -105,6 +105,35 @@ def sha256_tree(root: Path, pattern: str = "**/*") -> tuple[str, int]:
     return outer.hexdigest(), len(files)
 
 
+def write_once(path: Path, text: str) -> dict[str, Any]:
+    """Write a file without destroying one that is already there.
+
+    CLAUDE.md: "outputs under outputs/{experiment_name}/, never overwrite
+    existing outputs". A gate receipt is the evidence that licensed training, so
+    replacing it in place loses the record of the run that actually gated the
+    experiment, including its commit and its resolved inputs.
+
+    Rerunning a gate is normal, so refusing outright would be wrong. The
+    existing file is moved aside to a numbered sibling instead, which keeps
+    every earlier receipt and lets the rerun proceed. Returns what happened, so
+    the caller can report it.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    archived = None
+    if path.exists():
+        index = 1
+        while True:
+            candidate = path.with_name(f"{path.stem}.superseded.{index}{path.suffix}")
+            if not candidate.exists():
+                break
+            index += 1
+        path.replace(candidate)
+        archived = str(candidate)
+    path.write_text(text, encoding="utf-8")
+    return {"written": str(path), "archived_previous": archived}
+
+
 def environment_identity() -> dict[str, Any]:
     """What ran this. Recorded so a later rerun can be compared against it."""
     identity = {
@@ -226,24 +255,47 @@ def verify_scene_identities(
     """
     from .encoders import load_cache_meta
     from .evaluate import read_run_metadata
-    from .phase4 import load_depth_archive, manifest_digest
+    from .phase4 import manifest_digest
 
     per_scene: dict[str, Any] = {}
     mismatches: list[dict[str, Any]] = []
+    # An input that is absent and an input that disagrees are different
+    # failures with different remedies: the first is fixed by copying a file,
+    # the second may require an amendment to the frozen design. They are
+    # collected separately so the stop can be classified correctly, rather than
+    # folding an absent parquet into "the live inputs disagree".
+    absent: list[dict[str, Any]] = []
     for scene in scenes:
         entry: dict[str, Any] = {}
         parquet = Path(cfg.phase4_dir) / "eval" / f"{scene}.parquet"
         if not parquet.exists():
-            mismatches.append({"scene": scene, "field": "phase4_parquet",
-                               "problem": f"missing: {parquet}"})
+            absent.append({"scene": scene, "input": "phase4_parquet",
+                           "path": str(parquet)})
             continue
         accepted = read_run_metadata(parquet) or {}
         entry["phase4_parquet_sha256"] = sha256_file(parquet)
         entry["phase4_parquet_bytes"] = parquet.stat().st_size
         entry["phase4_commit"] = accepted.get("git_commit")
 
-        feature_meta = load_cache_meta(cfg.cache_root, cfg.feature_encoder, scene)
-        live_features = feature_meta.get("features_digest")
+        try:
+            feature_meta = load_cache_meta(cfg.cache_root, cfg.feature_encoder, scene)
+            live_features = feature_meta.get("features_digest")
+            # The meta carries the digest; load_depth_archive would return the
+            # same value only after digesting and decompressing the whole
+            # archive, which step 4 does anyway when it builds this scene's
+            # inputs.
+            live_depth = load_cache_meta(
+                cfg.cache_root, cfg.depth_encoder, scene
+            ).get("depth_digest")
+            live_manifest = manifest_digest(Path(cfg.renders_root) / scene)
+        except (FileNotFoundError, OSError, ValueError) as error:
+            # Absent or unreadable, not disagreeing. Without this the loader's
+            # exception escapes to run_steps' catch-all and is reported as an
+            # implementation bug with a FileNotFoundError repr.
+            absent.append({
+                "scene": scene, "input": "cache_or_manifest", "error": repr(error),
+            })
+            continue
         entry["features_digest"] = live_features
         if live_features != accepted.get("features_digest"):
             mismatches.append({
@@ -251,8 +303,6 @@ def verify_scene_identities(
                 "accepted": accepted.get("features_digest"), "live": live_features,
             })
 
-        depth_meta = load_depth_archive(cfg.cache_root, cfg.depth_encoder, scene)["meta"]
-        live_depth = depth_meta.get("depth_digest")
         entry["depth_digest"] = live_depth
         if live_depth != accepted.get("depth_digest"):
             mismatches.append({
@@ -260,7 +310,6 @@ def verify_scene_identities(
                 "accepted": accepted.get("depth_digest"), "live": live_depth,
             })
 
-        live_manifest = manifest_digest(Path(cfg.renders_root) / scene)
         entry["manifest_digest"] = live_manifest
         if live_manifest != accepted.get("manifest_digest"):
             mismatches.append({
@@ -270,6 +319,14 @@ def verify_scene_identities(
         entry["accepted_mean_vector_digest"] = accepted.get("mean_vector_digest")
         per_scene[scene] = entry
 
+    if absent:
+        raise GateStop(
+            step,
+            f"{len(absent)} required per-scene input(s) are absent or unreadable; "
+            "the remedy is to supply them, not to amend the frozen design",
+            MISSING_ARTIFACT,
+            {"absent": absent, "scenes_checked": len(per_scene)},
+        )
     if mismatches:
         raise GateStop(
             step,

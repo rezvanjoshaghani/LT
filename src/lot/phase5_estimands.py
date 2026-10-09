@@ -9,8 +9,8 @@ Three populations, kept separate on purpose and never silently merged.
 
     V_P5_pp    the primary support. The GT-evaluable samples Context-Lift
                Transport-Only can validly transport with context-image-scaled
-               context depth. CL-Transport, Predict-with-Depth, and
-               No-Warp-Copy are all scored on exactly this set.
+               context depth. CL-Transport, Predict-with-Depth, No-Warp-Copy,
+               and Mean-Feature are all scored on exactly this set.
 
     V_form     the formulation-diagnostic support, the intersection of V_P5_pp
                with the accepted Phase 4 target-lift set, on the target patch
@@ -62,10 +62,14 @@ CROSS_PATH = "cross_path"
 # built on the cosines, as Phase 4's are; the L2 companions are aggregated
 # alongside so the shipped tables are schema-complete against the frozen
 # protocol rather than cosine-only.
+# The Mean-Feature floor sits beside No-Warp-Copy on each support, as CLAUDE.md
+# requires of every metric. PROTOCOL 3.7 defines it under raw cosine only, so it
+# carries its two raw columns and no centered ones.
 PRIMARY_FIELDS = (
     "cl_raw", "cl_centered", "cl_l2_raw", "cl_l2_centered",
     "predict_raw", "predict_centered", "predict_l2_raw", "predict_l2_centered",
     "nowarp_raw", "nowarp_centered", "nowarp_l2_raw", "nowarp_l2_centered",
+    "meanfeat_raw", "meanfeat_l2_raw",
 )
 FORMULATION_FIELDS = (
     "tl_form_raw", "tl_form_centered", "tl_form_l2_raw", "tl_form_l2_centered",
@@ -78,6 +82,7 @@ SPLAT_FIELDS = (
     "sp_predict_l2_raw", "sp_predict_l2_centered",
     "sp_nowarp_raw", "sp_nowarp_centered",
     "sp_nowarp_l2_raw", "sp_nowarp_l2_centered",
+    "sp_meanfeat_raw", "sp_meanfeat_l2_raw",
 )
 # Counts and diagnostics. Never bootstrapped as scores, and the near-zero rule
 # does not apply to them because they are not in score space.
@@ -89,6 +94,11 @@ INTERSECTION_FIELDS = tuple(
     f"x_{arm}_{column}"
     for arm in ("cl", "predict", "nowarp", "sp_transport", "sp_predict", "sp_nowarp")
     for column in ("raw", "centered", "l2_raw", "l2_centered")
+) + tuple(
+    # The Mean-Feature floor on each path, under raw metrics only.
+    f"x_{arm}_{column}"
+    for arm in ("meanfeat", "sp_meanfeat")
+    for column in ("raw", "l2_raw")
 )
 COUNT_FIELDS = (
     "n_primary", "n_formulation", "n_splat", "n_intersect", "n_predict_nonfinite",
@@ -226,6 +236,16 @@ def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], flo
         ),
     }
 
+    # The Mean-Feature floor on each record's own support. PROTOCOL 3.7 defines
+    # it under raw cosine only, so these cells do not exist under centering.
+    # Each is the absolute level of a floor, not an interpreted effect, so the
+    # near-zero rule does not apply to it.
+    if m == "raw":
+        forms["mean_feature"] = lambda v: v["meanfeat_raw"]
+        forms["sp_mean_feature"] = lambda v: v["sp_meanfeat_raw"]
+        forms["x_mean_feature"] = lambda v: v["x_meanfeat_raw"]
+        forms["x_sp_mean_feature"] = lambda v: v["x_sp_meanfeat_raw"]
+
     # The landing-offset diagnostic: the oracle level, the floor, and the margin
     # in every offset bin and on the whole diagnostic support, then the paired
     # read deficit, which is the near-grid bin minus the whole support.
@@ -253,6 +273,7 @@ QUANTITY_POPULATION = {
     "cl_transport": PER_POINT,
     "predict_with_depth": PER_POINT,
     "no_warp_copy": PER_POINT,
+    "mean_feature": PER_POINT,
     "cl_margin": PER_POINT,
     "predict_margin": PER_POINT,
     "delta_learn_pp": PER_POINT,
@@ -264,6 +285,7 @@ QUANTITY_POPULATION = {
     "sp_predict": SPLAT_POOL,
     "sp_transport_margin": SPLAT_POOL,
     "sp_predict_margin": SPLAT_POOL,
+    "sp_mean_feature": SPLAT_POOL,
     "x_delta_learn_pp": CROSS_PATH,
     "x_delta_learn_sp": CROSS_PATH,
     "x_cl_margin": CROSS_PATH,
@@ -273,6 +295,8 @@ QUANTITY_POPULATION = {
     "path_difference_learn": CROSS_PATH,
     "path_difference_cl_margin": CROSS_PATH,
     "path_difference_predict_margin": CROSS_PATH,
+    "x_mean_feature": CROSS_PATH,
+    "x_sp_mean_feature": CROSS_PATH,
     "read_deficit": READ_DEFICIT,
 }
 for _label in OFFSET_BINS + (OFFSET_WHOLE,):

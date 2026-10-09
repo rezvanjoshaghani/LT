@@ -8,13 +8,14 @@ import numpy as np
 import pytest
 import torch
 
-from lot.context_lift import context_lift_map, context_lift_support
+from lot.context_lift import ContextLiftMap, context_lift_map, context_lift_support
 from lot.encoders import PATCH_SIZE, patch_cell_index, sample_features_bilinear
 from lot.phase5_score import (
     MODEL_FAILURE_COSINE,
     formulation_support,
     primary_support,
     region_masks,
+    score_cross_path,
     score_predictions,
     score_primary,
     score_splat_pool,
@@ -144,9 +145,11 @@ def test_the_predictor_cannot_change_the_support():
     b = score_primary(lift, support, fc, ft, center, wrecked, (GRID, GRID))
     assert a.n_primary == b.n_primary
     assert np.array_equal(a.support_mask, b.support_mask)
-    # The explicit method and the floor are untouched by the predictor's output.
+    # The explicit method and both floors are untouched by the predictor's output.
     assert a.cl_centered == pytest.approx(b.cl_centered)
     assert a.nowarp_centered == pytest.approx(b.nowarp_centered)
+    assert a.meanfeat_raw == pytest.approx(b.meanfeat_raw)
+    assert a.meanfeat_l2_raw == pytest.approx(b.meanfeat_l2_raw)
     # And the all-failing predictor is scored at the failure value, not dropped.
     assert b.n_predict_nonfinite == b.n_primary
     assert b.predict_centered == pytest.approx(MODEL_FAILURE_COSINE)
@@ -199,6 +202,7 @@ def test_empty_support_yields_an_empty_record():
                            None, (GRID, GRID))
     assert scores.n_primary == 0
     assert math.isnan(scores.cl_raw)
+    assert math.isnan(scores.meanfeat_raw) and math.isnan(scores.meanfeat_l2_raw)
     fields = scores.as_fields()
     assert "support_mask" not in fields
 
@@ -268,6 +272,7 @@ def test_splat_scoring_on_no_cells():
     )
     assert scores.n_splat == 0
     assert math.isnan(scores.sp_transport_raw)
+    assert math.isnan(scores.sp_meanfeat_raw) and math.isnan(scores.sp_meanfeat_l2_raw)
 
 
 # ---------------------------------------------------------------------------
@@ -366,3 +371,147 @@ def test_the_splat_and_formulation_records_carry_l2_too():
     for method in ("sp_transport", "sp_predict", "sp_nowarp"):
         for column in ("raw", "centered", "l2_raw", "l2_centered"):
             assert f"{method}_{column}" in fields
+
+
+# ---------------------------------------------------------------------------
+# The Mean-Feature floor on each record's own support, per PROTOCOL 3.7
+# ---------------------------------------------------------------------------
+#
+# Mean-Feature predicts the frozen mean vector everywhere. Its raw cosine with a
+# target depends only on the angle between the two, which a hand-built grid
+# makes exact. The mean lies along the fourth axis. The 2 by 2 target cells
+# hold E0 + M, M, E1, and -M, whose raw cosines with the mean are 1/sqrt(2),
+# 1, 0, and -1.
+
+E0 = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+E1 = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float64)
+MEAN = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float64)
+FLOOR_HW = (28, 28)
+FLOOR_GRID = (2, 2)
+SQRT2 = math.sqrt(2.0)
+
+
+def _pixel(patch_x: float, patch_y: float) -> list[float]:
+    """Pixel coordinates of a patch-grid location: patch p sits at pixel 14 p + 6.5."""
+    return [14 * patch_x + 6.5, 14 * patch_y + 6.5]
+
+
+def _floor_scene():
+    """Three samples, A, B, and C, on the hand-built target grid.
+
+    A lands a quarter patch right of cell 0's center, so the frozen target there
+    is the read 0.75 (E0 + M) + 0.25 M = 0.75 E0 + M. Its raw cosine with the
+    mean is 1 / 1.25 = 0.8, where cell 0's own vector would give 1/sqrt(2).
+    B lands on the center of cell 2, which holds E1. C lands on the center of
+    cell 1, which holds M. The context grid never enters the floor.
+    """
+    ft = torch.zeros(4, 2, 2, dtype=torch.float64)
+    ft[:, 0, 0] = E0 + MEAN
+    ft[:, 0, 1] = MEAN
+    ft[:, 1, 0] = E1
+    ft[:, 1, 1] = -MEAN
+    fc = torch.ones_like(ft)
+    lift = ContextLiftMap(
+        uv_context=torch.tensor([_pixel(0, 0), _pixel(1, 0), _pixel(0, 1)],
+                                dtype=torch.float64),
+        uv_target=torch.tensor([_pixel(0.25, 0), _pixel(0, 1), _pixel(1, 0)],
+                               dtype=torch.float64),
+        z_target=torch.ones(3, dtype=torch.float64),
+        depth_context=torch.ones(3, dtype=torch.float64),
+        depth_valid=torch.ones(3, dtype=torch.bool),
+        landed=torch.ones(3, dtype=torch.bool),
+    )
+    return lift, fc, ft
+
+
+def _cross_path(lift, support, scored_cells, fc, ft):
+    flat_c, flat_t = fc.reshape(4, -1), ft.reshape(4, -1)
+    return score_cross_path(
+        lift, support, np.array(scored_cells, dtype=np.int64), fc, ft, MEAN, None,
+        flat_c, flat_c, flat_t, FLOOR_HW, FLOOR_GRID,
+    )
+
+
+def test_the_primary_floor_is_the_mean_scored_against_the_landing_read():
+    """Cosines 0.8, 0, and 1 at A, B, and C. The 0.8 shows the floor is scored
+    against the same landing read the other arms are, not the cell's vector."""
+    lift, fc, ft = _floor_scene()
+    support = torch.ones(3, dtype=torch.bool)
+    scores = score_primary(lift, support, fc, ft, MEAN, None, FLOOR_GRID)
+    assert scores.meanfeat_raw == pytest.approx((0.8 + 0.0 + 1.0) / 3)
+    assert scores.meanfeat_l2_raw == pytest.approx((math.sqrt(0.4) + SQRT2 + 0.0) / 3)
+
+
+def test_the_primary_floor_reads_only_the_support():
+    lift, fc, ft = _floor_scene()
+    support = torch.tensor([True, True, False])
+    scores = score_primary(lift, support, fc, ft, MEAN, None, FLOOR_GRID)
+    assert scores.n_primary == 2
+    assert scores.meanfeat_raw == pytest.approx((0.8 + 0.0) / 2)
+    assert scores.meanfeat_l2_raw == pytest.approx((math.sqrt(0.4) + SQRT2) / 2)
+
+
+def test_the_splat_floor_is_the_mean_scored_against_each_scored_cell():
+    """Cells 0, 2, and 3 hold E0 + M, E1, and -M: cosines 1/sqrt(2), 0, and -1."""
+    _, fc, ft = _floor_scene()
+    flat_c, flat_t = fc.reshape(4, -1), ft.reshape(4, -1)
+    scores = score_splat_pool(np.array([0, 2, 3]), flat_c, flat_c, flat_t, MEAN, None)
+    assert scores.n_splat == 3
+    assert scores.sp_meanfeat_raw == pytest.approx((1.0 / SQRT2 + 0.0 - 1.0) / 3)
+    assert scores.sp_meanfeat_l2_raw == pytest.approx(
+        (math.sqrt(2.0 - SQRT2) + SQRT2 + 2.0) / 3
+    )
+
+
+def test_each_cross_path_arm_scores_the_floor_against_its_own_target():
+    """The splat path scored cells 0, 2, and 3, and samples landed in 0, 2, and
+    1, so the common cells are 0 and 2. In cell 0 the per-point arm's pooled
+    target is the read at A, 0.75 E0 + M, and the splat arm's target is the
+    cell's own E0 + M. Cell 2 holds E1 on both arms."""
+    lift, fc, ft = _floor_scene()
+    scores = _cross_path(lift, torch.ones(3, dtype=torch.bool), [0, 2, 3], fc, ft)
+    assert scores.n_intersect == 2
+    assert scores.x_meanfeat_raw == pytest.approx((0.8 + 0.0) / 2)
+    assert scores.x_meanfeat_l2_raw == pytest.approx((math.sqrt(0.4) + SQRT2) / 2)
+    assert scores.x_sp_meanfeat_raw == pytest.approx((1.0 / SQRT2 + 0.0) / 2)
+    assert scores.x_sp_meanfeat_l2_raw == pytest.approx(
+        (math.sqrt(2.0 - SQRT2) + SQRT2) / 2
+    )
+
+
+def test_an_empty_intersection_gives_no_floor_score():
+    lift, fc, ft = _floor_scene()
+    scores = _cross_path(lift, torch.ones(3, dtype=torch.bool), [3], fc, ft)
+    assert scores.n_intersect == 0
+    for name in ("x_meanfeat_raw", "x_meanfeat_l2_raw",
+                 "x_sp_meanfeat_raw", "x_sp_meanfeat_l2_raw"):
+        assert math.isnan(getattr(scores, name)), name
+
+
+def test_each_record_writes_exactly_the_columns_the_estimand_layer_reads():
+    """One schema, named in lot.phase5_estimands and written by the scorer.
+    Mean-Feature has raw columns only. Its centered columns do not exist, so no
+    epsilon-regularized zero vector can stand in for them."""
+    from lot.phase5_estimands import INTERSECTION_FIELDS, PRIMARY_FIELDS, SPLAT_FIELDS
+
+    lift, fc, ft = _floor_scene()
+    support = torch.ones(3, dtype=torch.bool)
+    flat_c, flat_t = fc.reshape(4, -1), ft.reshape(4, -1)
+    records = {
+        "primary": (
+            score_primary(lift, support, fc, ft, MEAN, None, FLOOR_GRID).as_fields(),
+            set(PRIMARY_FIELDS) | {"n_primary", "n_predict_nonfinite"},
+        ),
+        "splat": (
+            score_splat_pool(np.array([0, 2, 3]), flat_c, flat_c, flat_t, MEAN, None)
+            .as_fields(),
+            set(SPLAT_FIELDS) | {"n_splat"},
+        ),
+        "cross_path": (
+            _cross_path(lift, support, [0, 2, 3], fc, ft).as_fields(),
+            set(INTERSECTION_FIELDS) | {"n_intersect"},
+        ),
+    }
+    for name, (fields, registered) in records.items():
+        assert set(fields) == registered, name
+        assert not [k for k in fields if "meanfeat" in k and "centered" in k], name

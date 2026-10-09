@@ -397,6 +397,19 @@ def test_every_pair_has_every_seed_and_region(evaluated):
     assert all(r["scene"] == TEST_SCENE and r["level"] == LEVEL for r in rows)
 
 
+# The Mean-Feature floor on each record's support, and the count that support
+# is measured by. PROTOCOL 3.7 defines it under raw metrics only.
+MEAN_FEATURE_SUPPORT = {
+    "meanfeat": "n_primary",
+    "sp_meanfeat": "n_splat",
+    "x_meanfeat": "n_intersect",
+    "x_sp_meanfeat": "n_intersect",
+}
+MEAN_FEATURE_COLUMNS = tuple(
+    f"{prefix}_{column}" for prefix in MEAN_FEATURE_SUPPORT for column in ("raw", "l2_raw")
+)
+
+
 def test_explicit_columns_do_not_depend_on_the_seed(evaluated):
     rows = read_rows(Path(evaluated["path"]))
     by_pair = {}
@@ -407,7 +420,8 @@ def test_explicit_columns_do_not_depend_on_the_seed(evaluated):
     for records in by_pair.values():
         for column in ("cl_centered", "nowarp_centered", "sp_transport_centered",
                        "tl_form_centered", "n_primary", "offset_n_all",
-                       "offset_cl_oracle_centered_all", "offset_nowarp_centered_b1"):
+                       "offset_cl_oracle_centered_all", "offset_nowarp_centered_b1",
+                       *MEAN_FEATURE_COLUMNS):
             # NaN is never equal to itself, so it is mapped to one marker; a pair
             # with no primary support has NaN explicit scores under every seed.
             values = {
@@ -417,6 +431,21 @@ def test_explicit_columns_do_not_depend_on_the_seed(evaluated):
                 for r in records
             }
             assert len(values) == 1, column
+
+
+def test_every_row_carries_the_mean_feature_floor_on_each_support(evaluated):
+    """CLAUDE.md: every reported metric travels with both floors. A record whose
+    support is empty carries no floor score, and no row carries a centered one."""
+    rows = read_rows(Path(evaluated["path"]))
+    for r in rows:
+        assert not [k for k in r if "meanfeat" in k and "centered" in k]
+        for prefix, count in MEAN_FEATURE_SUPPORT.items():
+            for column in ("raw", "l2_raw"):
+                value = r[f"{prefix}_{column}"]
+                assert math.isfinite(value) == (r[count] > 0), (prefix, column, r[count])
+    # Both branches occur on this fixture, so neither half of the rule is vacuous.
+    for count in set(MEAN_FEATURE_SUPPORT.values()):
+        assert {r[count] > 0 for r in rows} == {True, False}, count
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +490,10 @@ def _centered_cosines(a: np.ndarray, b: np.ndarray, center: np.ndarray) -> np.nd
     a = a / np.linalg.norm(a, axis=-1, keepdims=True)
     b = b / np.linalg.norm(b, axis=-1, keepdims=True)
     return (a * b).sum(-1)
+
+
+def _raw_cosines(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return _centered_cosines(a, b, np.zeros(a.shape[-1]))
 
 
 @pytest.fixture(scope="module")
@@ -563,8 +596,14 @@ def test_context_lift_lands_where_an_independent_reprojection_does(world, evalua
         record = _record(evaluated, item["key"])
         cl = _centered_cosines(item["carried"], item["target_read"], center).mean()
         nowarp = _centered_cosines(item["nowarp_read"], item["target_read"], center).mean()
+        # Mean-Feature predicts the frozen mean at every landing, against the
+        # same read, and is scored under raw cosine only.
+        meanfeat = _raw_cosines(
+            np.broadcast_to(center, item["target_read"].shape), item["target_read"]
+        ).mean()
         assert record["cl_centered"] == pytest.approx(cl, abs=1e-4), item["key"]
         assert record["nowarp_centered"] == pytest.approx(nowarp, abs=1e-4), item["key"]
+        assert record["meanfeat_raw"] == pytest.approx(meanfeat, abs=1e-4), item["key"]
 
 
 def test_context_lift_carries_the_surface_point_the_target_sees(world, landings):

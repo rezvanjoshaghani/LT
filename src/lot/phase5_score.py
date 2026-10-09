@@ -23,6 +23,11 @@ The support discipline this module implements, from Stream V:
     coordinates, which is the "assume nothing moved" prediction for the
     location being scored. That is the same floor Phase 3 uses, read in the
     forward direction rather than the backward one.
+
+Mean-Feature is the second floor CLAUDE.md requires beside every metric. It
+predicts the frozen mean vector everywhere. Each record scores it on its own
+support, against the same targets its other arms are scored against. PROTOCOL
+3.7 defines it under raw cosine only, so it has no centered columns.
 """
 
 from __future__ import annotations
@@ -149,7 +154,8 @@ class PrimaryScores:
     with their L2 companions. The reported Phase 5 quantities are built on the
     cosines, exactly as Phase 4's are, and the L2 columns travel in the record
     so the shipped schema is complete against the frozen protocol and
-    comparable with the Phase 3 and Phase 4 tables.
+    comparable with the Phase 3 and Phase 4 tables. The Mean-Feature floor
+    carries its two raw columns, the only ones PROTOCOL 3.7 defines for it.
     """
 
     n_primary: int
@@ -165,6 +171,8 @@ class PrimaryScores:
     nowarp_centered: float
     nowarp_l2_raw: float
     nowarp_l2_centered: float
+    meanfeat_raw: float
+    meanfeat_l2_raw: float
     n_predict_nonfinite: int
     support_mask: np.ndarray
 
@@ -182,6 +190,30 @@ def _prefixed(metrics: dict[str, Any], prefix: str) -> dict[str, float]:
         f"{prefix}_l2_raw": metrics["l2_raw"],
         f"{prefix}_l2_centered": metrics["l2_centered"],
     }
+
+
+def _raw_prefixed(metrics: dict[str, Any], prefix: str) -> dict[str, float]:
+    """Rename a raw-only floor's metric columns onto its record prefix.
+
+    Mean-Feature predicts the centering vector, so PROTOCOL 3.7 defines it under
+    raw cosine only. Its centered columns are not written at all. No
+    epsilon-regularized zero vector can then stand in for a centered score.
+    """
+    return {
+        f"{prefix}_raw": metrics["cosine_raw"],
+        f"{prefix}_l2_raw": metrics["l2_raw"],
+    }
+
+
+def _mean_feature(target: Tensor, center: Tensor, prefix: str) -> dict[str, float]:
+    """The Mean-Feature floor on one record's support, under its prefix.
+
+    target: [N, C], the targets the record's other arms are scored against.
+    center: [C], the frozen Phase 3 global mean. The floor predicts it at every
+    one of the N targets, as score_landing_offset does.
+    """
+    meanfeat = center.expand(target.shape[0], -1)
+    return _raw_prefixed(score_all_metrics(meanfeat, target, center), prefix)
 
 
 _EMPTY_METRICS = {
@@ -210,11 +242,11 @@ def score_primary(
     target_grid_hw: tuple[int, int],
     patch_size: int = PATCH_SIZE,
 ) -> PrimaryScores:
-    """Score the three primary methods on one fixed support.
+    """Score the three primary methods and the Mean-Feature floor on one support.
 
     features_context, features_target: [C, Hp, Wp] frozen patch-grid features.
     predicted_target_grid: [N_target, C] the predictor's complete grid, or None
-        to score only the explicit method and the floor.
+        to score only the explicit method and the floors.
 
     Every method is read at the same landing locations, so the comparison is
     between predictions of the same physical quantity at the same places.
@@ -226,6 +258,7 @@ def score_primary(
             **_prefixed(_EMPTY_METRICS, "cl"),
             **_prefixed(_EMPTY_METRICS, "predict"),
             **_prefixed(_EMPTY_METRICS, "nowarp"),
+            **_raw_prefixed(_EMPTY_METRICS, "meanfeat"),
             n_predict_nonfinite=0,
             support_mask=support.cpu().numpy().copy(),
         )
@@ -265,6 +298,8 @@ def score_primary(
         **_prefixed(cl_metrics, "cl"),
         **_prefixed(predict_metrics, "predict"),
         **_prefixed(nowarp_metrics, "nowarp"),
+        # Mean-Feature reads no location. It meets the same landing targets.
+        **_mean_feature(target, center, "meanfeat"),
         n_predict_nonfinite=predict_metrics["n_failures"],
         support_mask=support.cpu().numpy().copy(),
     )
@@ -425,7 +460,10 @@ def score_formulation(
 
 @dataclasses.dataclass
 class SplatScores:
-    """The secondary operational comparison on Phase 4's scored-cell support."""
+    """The secondary operational comparison on Phase 4's scored-cell support.
+
+    The Mean-Feature floor carries its two raw columns only, per PROTOCOL 3.7.
+    """
 
     n_splat: int
     sp_transport_raw: float
@@ -440,6 +478,8 @@ class SplatScores:
     sp_nowarp_centered: float
     sp_nowarp_l2_raw: float
     sp_nowarp_l2_centered: float
+    sp_meanfeat_raw: float
+    sp_meanfeat_l2_raw: float
 
     def as_fields(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -470,6 +510,7 @@ def score_splat_pool(
             **_prefixed(_EMPTY_METRICS, "sp_transport"),
             **_prefixed(_EMPTY_METRICS, "sp_predict"),
             **_prefixed(_EMPTY_METRICS, "sp_nowarp"),
+            **_raw_prefixed(_EMPTY_METRICS, "sp_meanfeat"),
         )
     index = torch.from_numpy(cells)
     target = features_target_flat[:, index].T
@@ -487,6 +528,7 @@ def score_splat_pool(
         **_prefixed(score_all_metrics(transport, target, center), "sp_transport"),
         **_prefixed(predict_metrics, "sp_predict"),
         **_prefixed(score_all_metrics(nowarp, target, center), "sp_nowarp"),
+        **_mean_feature(target, center, "sp_meanfeat"),
     )
 
 
@@ -521,6 +563,8 @@ def region_masks(
 # The cross-path common-valid set, for PROTOCOL 3.9's two-path disclosure
 # ---------------------------------------------------------------------------
 
+# The arms that carry all four PROTOCOL 3.7 columns. The Mean-Feature floor on
+# each path carries its raw columns only and is written beside them.
 CROSS_PATH_ARMS = ("cl", "predict", "nowarp", "sp_transport", "sp_predict", "sp_nowarp")
 
 
@@ -549,9 +593,13 @@ class CrossPathScores:
     cell before scoring, which is the same output-level rule the splat contract
     already applies, and both arms then average over the same cells.
 
-    Every arm carries all four PROTOCOL 3.7 columns. The common cells and the
-    per-point samples that fed them travel with the record, so the support an
-    aggregate rests on can be reconstructed and audited rather than inferred.
+    Every arm carries all four PROTOCOL 3.7 columns, except Mean-Feature. That
+    floor carries its two raw columns, the only ones PROTOCOL 3.7 defines for
+    it. The two paths score their cells against different targets, so each path
+    carries its own Mean-Feature floor, as each carries its own No-Warp-Copy.
+    The common cells and the per-point samples that fed them travel with the
+    record, so the support an aggregate rests on can be reconstructed and
+    audited rather than inferred.
     """
 
     n_intersect: int
@@ -568,6 +616,8 @@ class CrossPathScores:
     x_nowarp_centered: float
     x_nowarp_l2_raw: float
     x_nowarp_l2_centered: float
+    x_meanfeat_raw: float
+    x_meanfeat_l2_raw: float
     # Explicit and learned, splat arm, on the same cells.
     x_sp_transport_raw: float
     x_sp_transport_centered: float
@@ -581,6 +631,8 @@ class CrossPathScores:
     x_sp_nowarp_centered: float
     x_sp_nowarp_l2_raw: float
     x_sp_nowarp_l2_centered: float
+    x_sp_meanfeat_raw: float
+    x_sp_meanfeat_l2_raw: float
     # The support itself. Excluded from the aggregated fields, carried so an
     # aggregate can prove what it rests on.
     common_cells: np.ndarray
@@ -690,6 +742,8 @@ def score_cross_path(
         return CrossPathScores(
             n_intersect=0,
             **{f"x_{k}": v for arm in CROSS_PATH_ARMS for k, v in _empty_arm(arm).items()},
+            **_raw_prefixed(_EMPTY_METRICS, "x_meanfeat"),
+            **_raw_prefixed(_EMPTY_METRICS, "x_sp_meanfeat"),
             common_cells=common,
             per_point_mask=pp_mask.cpu().numpy().copy(),
             samples_per_cell=np.zeros(0, dtype=np.int64),
@@ -733,6 +787,8 @@ def score_cross_path(
         **_prefixed(score_all_metrics(cl_cells, target_cells, center), "x_cl"),
         **_prefixed(predict_pp_metrics, "x_predict"),
         **_prefixed(score_all_metrics(nowarp_cells, target_cells, center), "x_nowarp"),
+        # Every sample predicts the mean, so its pooled prediction is the mean.
+        **_mean_feature(target_cells, center, "x_meanfeat"),
         **_prefixed(
             score_all_metrics(transported_est[:, index].T, target_sp, center),
             "x_sp_transport",
@@ -742,6 +798,7 @@ def score_cross_path(
             score_all_metrics(features_context_flat[:, index].T, target_sp, center),
             "x_sp_nowarp",
         ),
+        **_mean_feature(target_sp, center, "x_sp_meanfeat"),
         common_cells=common,
         per_point_mask=pp_mask.cpu().numpy().copy(),
         samples_per_cell=samples_per_cell,

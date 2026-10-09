@@ -10,6 +10,7 @@ import pytest
 from lot.analysis_config import load_analysis_config
 from lot.phase5_estimands import (
     CL_TRANSPORT,
+    CROSS_PATH,
     FORMULATION,
     PER_POINT,
     QUANTITY_POPULATION,
@@ -35,11 +36,16 @@ def make_records(
     cl: float = 0.62,
     predict: float = 0.55,
     nowarp: float = 0.40,
+    meanfeat: float = 0.30,
     scene_spread: float = 0.10,
     noise: float = 1e-3,
     seed: int = 4,
 ) -> list[dict]:
-    """Pairs whose two methods share a large scene effect, as real scenes do."""
+    """Pairs whose two methods share a large scene effect, as real scenes do.
+
+    The Mean-Feature columns draw no noise, so adding them left every other
+    column of every record exactly as it was.
+    """
     rng = np.random.default_rng(seed)
     records = []
     for s in range(n_scenes):
@@ -55,24 +61,32 @@ def make_records(
                 "predict_centered": predict + level + rng.normal(0, noise),
                 "nowarp_raw": nowarp + level + rng.normal(0, noise),
                 "nowarp_centered": nowarp + level + rng.normal(0, noise),
+                # Mean-Feature is defined under raw metrics only, per PROTOCOL 3.7.
+                "meanfeat_raw": meanfeat + level, "meanfeat_l2_raw": 1.0 - meanfeat - level,
                 "tl_form_raw": cl + 0.02 + level, "tl_form_centered": cl + 0.02 + level,
                 "cl_form_raw": cl + level, "cl_form_centered": cl + level,
                 "sp_transport_raw": 0.7 + level, "sp_transport_centered": 0.7 + level,
                 "sp_predict_raw": 0.69 + level, "sp_predict_centered": 0.69 + level,
                 "sp_nowarp_raw": 0.5 + level, "sp_nowarp_centered": 0.5 + level,
+                "sp_meanfeat_raw": 0.32 + level, "sp_meanfeat_l2_raw": 0.68 - level,
                 # The cross-path common-valid columns. Both paths re-scored on
                 # the cells they share, which is the population PROTOCOL 3.9's
                 # disclosure is computed on.
                 **_intersection(cl + level, predict + level, nowarp + level,
-                                0.7 + level, 0.69 + level, 0.5 + level),
+                                0.7 + level, 0.69 + level, 0.5 + level,
+                                meanfeat + level, 0.32 + level),
                 "n_primary": 900, "n_formulation": 700, "n_splat": 800,
                 "n_intersect": 640, "n_predict_nonfinite": 0,
             })
     return records
 
 
-def _intersection(cl, predict, nowarp, sp_transport, sp_predict, sp_nowarp) -> dict:
-    """All six cross-path arms with all four columns, cosines set and L2 finite."""
+def _intersection(cl, predict, nowarp, sp_transport, sp_predict, sp_nowarp,
+                  meanfeat, sp_meanfeat) -> dict:
+    """All six cross-path arms with all four columns, cosines set and L2 finite.
+
+    The Mean-Feature floor on each path carries its two raw columns only.
+    """
     values = {
         "cl": cl, "predict": predict, "nowarp": nowarp,
         "sp_transport": sp_transport, "sp_predict": sp_predict, "sp_nowarp": sp_nowarp,
@@ -83,6 +97,9 @@ def _intersection(cl, predict, nowarp, sp_transport, sp_predict, sp_nowarp) -> d
         out[f"x_{arm}_centered"] = v
         out[f"x_{arm}_l2_raw"] = 1.0 - v
         out[f"x_{arm}_l2_centered"] = 1.0 - v
+    for arm, v in (("meanfeat", meanfeat), ("sp_meanfeat", sp_meanfeat)):
+        out[f"x_{arm}_raw"] = v
+        out[f"x_{arm}_l2_raw"] = 1.0 - v
     return out
 
 
@@ -639,3 +656,67 @@ def test_a_disclosure_term_never_receives_the_single_path_sentence():
         cell = evaluate_quantity(records, name, "centered", ANALYSIS)
         assert not cell.disclosure["applicable"]
         assert "by construction" not in cell.disclosure.get("wording", "")
+
+
+# ---------------------------------------------------------------------------
+# The Mean-Feature floor, beside No-Warp-Copy on every record, per CLAUDE.md
+# ---------------------------------------------------------------------------
+
+# Each Mean-Feature cell, the field it reads, and its population.
+MEAN_FEATURE_CELLS = {
+    "mean_feature": ("meanfeat_raw", PER_POINT),
+    "sp_mean_feature": ("sp_meanfeat_raw", SPLAT_POOL),
+    "x_mean_feature": ("x_meanfeat_raw", CROSS_PATH),
+    "x_sp_mean_feature": ("x_sp_meanfeat_raw", CROSS_PATH),
+}
+
+
+def test_the_registry_carries_mean_feature_under_raw_metrics_only():
+    """PROTOCOL 3.7: Mean-Feature predicts the centering vector, so its centered
+    score is not applicable. The columns do not exist rather than being filled."""
+    from lot.phase5_estimands import (
+        ALL_FIELDS, INTERSECTION_FIELDS, PRIMARY_FIELDS, SPLAT_FIELDS,
+    )
+
+    assert {"meanfeat_raw", "meanfeat_l2_raw"} <= set(PRIMARY_FIELDS)
+    assert {"sp_meanfeat_raw", "sp_meanfeat_l2_raw"} <= set(SPLAT_FIELDS)
+    assert {"x_meanfeat_raw", "x_meanfeat_l2_raw",
+            "x_sp_meanfeat_raw", "x_sp_meanfeat_l2_raw"} <= set(INTERSECTION_FIELDS)
+    assert not [f for f in ALL_FIELDS if "meanfeat" in f and "centered" in f]
+    assert len(set(ALL_FIELDS)) == len(ALL_FIELDS)
+
+
+def test_each_mean_feature_cell_reads_its_own_records_floor():
+    forms = quantity_formulas("raw")
+    means = {"meanfeat_raw": 0.31, "sp_meanfeat_raw": 0.33,
+             "x_meanfeat_raw": 0.35, "x_sp_meanfeat_raw": 0.37}
+    for quantity, (field, population) in MEAN_FEATURE_CELLS.items():
+        assert forms[quantity](means) == pytest.approx(means[field]), quantity
+        assert QUANTITY_POPULATION[quantity] == population, quantity
+
+
+def test_the_mean_feature_cells_exist_under_raw_cosine_only():
+    centered = quantity_formulas("centered")
+    for quantity in MEAN_FEATURE_CELLS:
+        assert quantity not in centered, quantity
+
+
+def test_a_mean_feature_cell_is_a_floor_and_never_gets_near_zero_wording():
+    """A floor is an absolute level, not a claim of one method over another. Its
+    value here sits inside the 0.003 band, and the near-zero rule still does not
+    apply to it."""
+    from lot.phase5_estimands import INTERPRETED_EFFECTS
+
+    records = make_records(n_scenes=8, pairs_per_scene=5)
+    for record in records:
+        for field, _ in MEAN_FEATURE_CELLS.values():
+            record[field] = 0.001
+    for quantity, (_, population) in MEAN_FEATURE_CELLS.items():
+        assert quantity not in INTERPRETED_EFFECTS, quantity
+        cell = evaluate_quantity(records, quantity, "raw", ANALYSIS)
+        assert cell.estimate == pytest.approx(0.001), quantity
+        assert cell.population == population, quantity
+        assert cell.n_camera_pairs == 40, quantity
+        assert not cell.disclosure["applicable"], quantity
+        assert not cell.disclosure["near_zero"], quantity
+        assert cell.as_row()["near_zero_wording"] == "", quantity

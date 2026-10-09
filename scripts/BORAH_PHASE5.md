@@ -15,12 +15,25 @@ estimator is retained as **TL-Reference**, a formulation diagnostic.
 
 ## 0. Environment
 
-Set once per shell. Account and partition are never hard-coded anywhere.
+Set in every new shell, from the repository root. Account and partition are
+never hard-coded anywhere.
 
     export SLURM_ACCOUNT=<account>
     export SLURM_PARTITION=<partition>
     export LOT_ENV=lot-encode            # the Phase 2/3/4 env, unchanged
     export MAMBA_ROOT_PREFIX=/bsuscratch/$USER/micromamba
+
+`sacctmgr show associations where user=$USER format=account%30,partition%30`
+lists your accounts, and `sinfo -o "%P %G %l"` lists each partition's GPUs and
+time limit.
+
+Choose a partition that holds a single GPU type, and use that same partition
+for every Phase 5 step. Two reasons. The integration gate measures whether the
+frozen training batch fits in the memory of the GPU it runs on, so it must run
+on the GPU type training will use. And the frozen training configuration allows
+TF32, which some GPU generations have and others lack, so training tasks spread
+over mixed hardware would not share one numerical contract. A partition that
+mixes GPU types breaks both.
 
 Inputs that must already be present, all of them Phase 4's:
 `data/replica_renders`, `cache/features` (both encoders, the VGGT cache
@@ -33,7 +46,17 @@ Phase 5 re-encodes nothing. It consumes the existing caches.
 
 ## 1. The integration gate
 
-    ./scripts/run_phase5.sh check
+    srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+         --ntasks=1 --cpus-per-task=4 --mem=48G --gres=gpu:1 \
+         --time=04:00:00 --pty ./scripts/run_phase5.sh check
+
+Run it inside a GPU allocation as above, never on the login node. Without a GPU
+the gate dry-runs the training batch on the CPU, and step 13 cannot measure
+whether the batch fits in GPU memory, so the gate would pass without that test.
+`--ntasks=1` is explicit because an allocation that inherits a larger task
+count runs one copy of the gate per task; that once happened to the Phase 4
+smoke run. The time limit is an estimate, since the gate has not yet run on
+real artifacts.
 
 A hard gate with no training side effects, and the only thing permitted to run
 first. It verifies the frozen blobs against FREEZE.md, asserts a clean tree,

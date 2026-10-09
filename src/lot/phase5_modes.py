@@ -39,6 +39,7 @@ from .phase5 import (
     SceneInputs,
     aligned_context_depth,
     build_scene_inputs,
+    landing_offset_edges,
     materialize_example,
     model_inputs,
     pair_cameras,
@@ -56,10 +57,12 @@ from .phase5_reference import (
 )
 from .phase5_score import (
     FormulationScores,
+    empty_landing_offset,
     primary_support,
     region_masks,
     score_cross_path,
     score_formulation,
+    score_landing_offset,
     score_primary,
     score_splat_pool,
 )
@@ -562,7 +565,9 @@ def evaluate_scene(
     For each pair, in order: the primary support from Context-Lift and ground
     truth; Phase 4's arms at this level, recomputed and reconciled against the
     accepted rows; the ground-truth region masks, recomputed and reconciled;
-    every seed's predicted grid; then every score on its own fixed population.
+    the pre-registered landing-offset diagnostic on its own ground-truth
+    support; every seed's predicted grid; then every score on its own fixed
+    population.
     """
     from PIL import Image
 
@@ -584,6 +589,8 @@ def evaluate_scene(
 
     scene_root = Path(cfg.renders_root) / scene
     dtype = cfg.torch_dtype
+    offset_edges = landing_offset_edges(cfg)
+    no_offset = empty_landing_offset().as_fields()
     rows: list[dict[str, Any]] = []
     audit = {"pairs": len(pairs), "evaluated": 0, "no_arm": 0,
              "worst_per_point_residual": 0.0, "worst_splat_residual": 0.0}
@@ -655,6 +662,22 @@ def evaluate_scene(
             arms.geometry.per_point_cells, arms.tl_reads, arms.reads_target,
             cams.target_hw,
         )
+        # The pre-registered landing-offset diagnostic. Context-Lift lifted with
+        # ground-truth context depth, on its own landed and evaluable samples.
+        # A reference condition only: ground truth never reaches a method's
+        # input, a support, or a headline score through it. It does not depend
+        # on the alignment level, so every level writes the same columns.
+        oracle = context_lift_map(
+            depth_c_gt, cams.K_context, cams.K_target, cams.T_target_from_context,
+            cams.context_hw, cams.target_hw,
+        )
+        oracle_support = primary_support(oracle, context_lift_support(
+            oracle, depth_c_gt, depth_t_gt, cams.K_context, cams.K_target,
+            cams.T_target_from_context, rel_tol=analysis.covisible_relative_depth_tol,
+        ))
+        offset = score_landing_offset(
+            oracle, oracle_support, fc, ft, center, offset_edges
+        ).as_fields()
         for seed, model in sorted(models.items()):
             with torch.no_grad():
                 predicted = model(
@@ -681,6 +704,7 @@ def evaluate_scene(
                         arms.transported_est, arms.flat_context, arms.flat_target,
                         cams.target_hw, grid,
                     ).as_fields(),
+                    **(offset if region == "all" else no_offset),
                 }
                 rows.append(record)
         audit["evaluated"] += 1

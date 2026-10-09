@@ -128,4 +128,18 @@ controls:
   depth_shuffle: true
   seed: 20260830
 
+# --- The landing-offset diagnostic, pre-registered 2026-10-09 ----------------
+# validation/evidence/phase5/landing_offset_diagnostic.md. Added by the user's
+# decision on validation/evidence/phase5/landing_read_asymmetry.md, before any
+# Phase 5 result on real data existed. It sizes the landing read: Context-Lift
+# with ground-truth context depth, scored against the frozen per-point target
+# and grouped by the landing's distance to the nearest target patch center, in
+# patch units. Model free, never an estimand, never subtracted from the
+# headline. The edges are fixed-width over the reachable range, from geometry
+# alone. Bins are closed on the right, as PROTOCOL 3.4 fixes, and one open bin
+# sits above the last edge, up to the corner distance sqrt(2) / 2.
+landing_offset:
+  depth: ground_truth
+  upper_edges_patch: [0.1, 0.2, 0.3, 0.4, 0.5]
+
 seed: 0

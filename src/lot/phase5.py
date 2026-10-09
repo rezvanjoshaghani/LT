@@ -78,6 +78,15 @@ class Phase5Config:
     training: dict[str, Any] = dataclasses.field(default_factory=dict)
     tiny_overfit: dict[str, Any] = dataclasses.field(default_factory=dict)
     controls: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # The landing-offset diagnostic, pre-registered 2026-10-09. The default is
+    # the registered specification, so a configuration built in code measures
+    # what the shipped one does; the shipped YAML states it explicitly.
+    landing_offset: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {
+            "depth": "ground_truth",
+            "upper_edges_patch": [0.1, 0.2, 0.3, 0.4, 0.5],
+        }
+    )
     seed: int = 0
 
     @property
@@ -139,6 +148,46 @@ def load_phase5_config(path: Path) -> Phase5Config:
         if key in raw and raw[key] is not None:
             raw[key] = tuple(raw[key])
     return Phase5Config(**raw)
+
+
+def landing_offset_edges(cfg: Phase5Config) -> tuple[float, ...]:
+    """The pre-registered offset bin edges, in patch units, refused if malformed.
+
+    validation/evidence/phase5/landing_offset_diagnostic.md registers the
+    diagnostic. Its depth is ground truth. Its edges are positive, strictly
+    increasing, below the cell-corner distance sqrt(2) / 2 so the open last bin
+    can hold a landing, and exactly as many as the estimand layer reads.
+    """
+    import math
+
+    from .phase5_estimands import N_OFFSET_BINS
+
+    spec = dict(cfg.landing_offset)
+    unknown = sorted(set(spec) - {"depth", "upper_edges_patch"})
+    if unknown:
+        raise ValueError(f"landing_offset: unknown keys {unknown}")
+    if spec.get("depth") != "ground_truth":
+        raise ValueError(
+            f"landing_offset.depth is {spec.get('depth')!r}; the diagnostic is "
+            "registered on ground_truth context depth, so that depth error cannot "
+            "mix into what it measures"
+        )
+    edges = tuple(float(edge) for edge in spec.get("upper_edges_patch", ()))
+    if len(edges) + 1 != N_OFFSET_BINS:
+        raise ValueError(
+            f"landing_offset: {len(edges)} edges make {len(edges) + 1} bins, but the "
+            f"estimand layer reads {N_OFFSET_BINS} bins"
+        )
+    if any(upper <= lower for lower, upper in zip((0.0,) + edges, edges)):
+        raise ValueError(
+            f"landing_offset edges must be positive and strictly increasing: {edges}"
+        )
+    if edges[-1] >= math.sqrt(0.5):
+        raise ValueError(
+            f"landing_offset: the last edge {edges[-1]} is at or beyond the cell "
+            "corner, sqrt(2) / 2, so the open last bin could never hold a landing"
+        )
+    return edges
 
 
 def predictor_config_from(cfg: Phase5Config, image_hw: tuple[int, int]) -> PredictorConfig:

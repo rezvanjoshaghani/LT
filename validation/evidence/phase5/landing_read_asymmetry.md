@@ -86,7 +86,10 @@ decision, open for the user.
 
 ## Options, for the user's decision before any real-data result
 
-Three responses are possible. None is implemented.
+Three responses were offered. On 2026-10-09 the user chose option 2, with the
+first of its two candidates. It is pre-registered and implemented in
+`landing_offset_diagnostic.md`. Options 1 and 3 were not taken, and the second
+candidate under option 2 is not built.
 
 1. Proceed as frozen and state the asymmetry as a limitation of the per-point
    estimand when the headline is reported.

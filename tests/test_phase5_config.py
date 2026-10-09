@@ -24,8 +24,13 @@ CONFIG_PATH = Path("configs/phase5.yaml")
 # change to any value it covers fails here, which is the point: the frozen
 # configuration is what makes "not tuned on the test set" checkable rather than
 # merely asserted.
+#
+# Moved once, on 2026-10-09, from 9e3508606bcaedb6068e95807aa27ea706d2d38b77f8c
+# 2df763d8f28968a0eca, by the pre-registered landing-offset diagnostic, the only
+# change. No Phase 5 gate, model, or result existed. The record is
+# validation/evidence/phase5/landing_offset_diagnostic.md.
 FROZEN_CONFIG_DIGEST = (
-    "9e3508606bcaedb6068e95807aa27ea706d2d38b77f8c2df763d8f28968a0eca"
+    "8d731c5e1dabe8764c40f3599037de530ae39de9f2537c1675e068f3c909b1f8"
 )
 
 
@@ -67,6 +72,7 @@ def test_the_digest_moves_with_any_value_it_covers():
         ("sensitivity_alignment_levels", ("none",)),
         ("diagnostic_alignment_levels", ()),
         ("controls", {"pose_shuffle": False}),
+        ("landing_offset", {**cfg.landing_offset, "upper_edges_patch": [0.2, 0.3, 0.4, 0.5, 0.6]}),
         ("seed", 99),
     ):
         moved = dataclasses.replace(cfg, **{field: value})

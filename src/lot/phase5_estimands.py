@@ -94,9 +94,71 @@ COUNT_FIELDS = (
     "n_primary", "n_formulation", "n_splat", "n_intersect", "n_predict_nonfinite",
 )
 
+# ---------------------------------------------------------------------------
+# The landing-offset diagnostic. Pre-registered 2026-10-09, before any Phase 5
+# result on real data existed, in
+# validation/evidence/phase5/landing_offset_diagnostic.md. It sizes the
+# landing read on real features. It is model free, it is not an estimand of the
+# phase, and it is never subtracted from the headline.
+# ---------------------------------------------------------------------------
+
+# Context-Lift Transport-Only with ground-truth context depth. A reference
+# condition, as Oracle-Transport is, and never a method under comparison.
+CL_ORACLE = "Context-Lift Oracle-Transport"
+
+# Five frozen upper edges in configs/phase5.yaml, closed on the right, and one
+# open bin above the last edge. lot.phase5.landing_offset_edges binds the
+# config to this count, so a record can never carry bins this layer does not
+# read.
+N_OFFSET_BINS = 6
+OFFSET_BINS = tuple(f"b{k}" for k in range(N_OFFSET_BINS))
+OFFSET_WHOLE = "all"
+OFFSET_ARMS = ("cl_oracle", "nowarp")
+METRIC_COLUMNS = ("raw", "centered", "l2_raw", "l2_centered")
+# Mean-Feature's prediction is the centering vector itself, so PROTOCOL 3.7
+# defines it under raw cosine only. Its centered columns do not exist rather
+# than being filled with a manufactured value.
+MEAN_FEATURE_COLUMNS = ("raw", "l2_raw")
+LANDING_OFFSET = "landing_offset"
+# The read deficit's population: pairs with at least one near-grid sample. It
+# reads the near-grid bin and the whole support of the same pairs, so one scene
+# draw serves both and the difference is paired.
+READ_DEFICIT = "landing_offset_deficit"
+
+
+def offset_count_field(label: str) -> str:
+    return f"offset_n_{label}"
+
+
+def offset_fields(label: str) -> tuple[str, ...]:
+    """The score columns of one offset bin, or of the whole diagnostic support.
+
+    Context-Lift with ground-truth depth and the No-Warp-Copy floor carry all
+    four PROTOCOL 3.7 columns; the Mean-Feature floor carries its raw ones.
+    """
+    return tuple(
+        f"offset_{arm}_{column}_{label}"
+        for arm in OFFSET_ARMS
+        for column in METRIC_COLUMNS
+    ) + tuple(f"offset_meanfeat_{column}_{label}" for column in MEAN_FEATURE_COLUMNS)
+
+
+def landing_offset_record_fields() -> tuple[str, ...]:
+    """Every per-pair column the diagnostic writes, in record order."""
+    return tuple(
+        name
+        for label in OFFSET_BINS + (OFFSET_WHOLE,)
+        for name in (offset_count_field(label), *offset_fields(label))
+    )
+
+
+def offset_population(label: str) -> str:
+    return f"{LANDING_OFFSET}_{label}"
+
+
 ALL_FIELDS = (
     PRIMARY_FIELDS + FORMULATION_FIELDS + SPLAT_FIELDS
-    + INTERSECTION_FIELDS + COUNT_FIELDS
+    + INTERSECTION_FIELDS + COUNT_FIELDS + landing_offset_record_fields()
 )
 
 
@@ -113,7 +175,7 @@ def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], flo
         raise ValueError(f"metric must be raw or centered, got {metric!r}")
     m = metric
 
-    return {
+    forms = {
         # Absolutes, primary per-point path.
         "cl_transport": lambda v: v[f"cl_{m}"],
         "predict_with_depth": lambda v: v[f"predict_{m}"],
@@ -164,6 +226,25 @@ def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], flo
         ),
     }
 
+    # The landing-offset diagnostic: the oracle level, the floor, and the margin
+    # in every offset bin and on the whole diagnostic support, then the paired
+    # read deficit, which is the near-grid bin minus the whole support.
+    for label in OFFSET_BINS + (OFFSET_WHOLE,):
+        cl = f"offset_cl_oracle_{m}_{label}"
+        nowarp = f"offset_nowarp_{m}_{label}"
+        forms[f"cl_oracle_offset_{label}"] = lambda v, cl=cl: v[cl]
+        forms[f"nowarp_offset_{label}"] = lambda v, nowarp=nowarp: v[nowarp]
+        forms[f"cl_oracle_offset_margin_{label}"] = (
+            lambda v, cl=cl, nowarp=nowarp: v[cl] - v[nowarp]
+        )
+        if m == "raw":
+            meanfeat = f"offset_meanfeat_raw_{label}"
+            forms[f"meanfeat_offset_{label}"] = lambda v, meanfeat=meanfeat: v[meanfeat]
+    near = f"offset_cl_oracle_{m}_{OFFSET_BINS[0]}"
+    whole = f"offset_cl_oracle_{m}_{OFFSET_WHOLE}"
+    forms["read_deficit"] = lambda v: v[near] - v[whole]
+    return forms
+
 
 # Which population each quantity is defined on. A quantity computed on the wrong
 # population is the single most damaging mistake available in this phase, so the
@@ -192,7 +273,13 @@ QUANTITY_POPULATION = {
     "path_difference_learn": CROSS_PATH,
     "path_difference_cl_margin": CROSS_PATH,
     "path_difference_predict_margin": CROSS_PATH,
+    "read_deficit": READ_DEFICIT,
 }
+for _label in OFFSET_BINS + (OFFSET_WHOLE,):
+    for _name in ("cl_oracle_offset", "nowarp_offset", "cl_oracle_offset_margin",
+                  "meanfeat_offset"):
+        QUANTITY_POPULATION[f"{_name}_{_label}"] = offset_population(_label)
+del _label, _name
 
 # Quantities that live in score space, and to which the frozen 0.003 near-zero
 # disclosure applies. Counts and fractions are excluded by Stream AB step 35's
@@ -518,10 +605,20 @@ def _fields_for(population: str) -> tuple[str, ...]:
         return SPLAT_FIELDS
     if population == CROSS_PATH:
         return INTERSECTION_FIELDS
+    if population == READ_DEFICIT:
+        return offset_fields(OFFSET_BINS[0]) + offset_fields(OFFSET_WHOLE)
+    for label in OFFSET_BINS + (OFFSET_WHOLE,):
+        if population == offset_population(label):
+            return offset_fields(label)
     raise ValueError(f"unknown population {population!r}")
 
 
 def _count_field_for(population: str) -> str:
+    if population == READ_DEFICIT:
+        return offset_count_field(OFFSET_BINS[0])
+    for label in OFFSET_BINS + (OFFSET_WHOLE,):
+        if population == offset_population(label):
+            return offset_count_field(label)
     return {
         PER_POINT: "n_primary",
         FORMULATION: "n_formulation",

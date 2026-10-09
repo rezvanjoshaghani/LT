@@ -197,8 +197,13 @@ Read `validation/evidence/phase5/landing_read_asymmetry.md` before interpreting
 the headline. Under the frozen landing-location read, a predictor that returns
 the true target grid scores exactly one, while Context-Lift with exact geometry
 is capped by the interpolation residual of the target features. That cap is a
-property of the frozen rule, not an implementation defect. Its size on DINOv2
-features is unmeasured.
+property of the frozen rule, not an implementation defect.
+
+Every parquet also carries the pre-registered landing-offset diagnostic,
+`validation/evidence/phase5/landing_offset_diagnostic.md`, which sizes that cap
+on DINOv2 features. It lifts with ground-truth context depth on its own support,
+groups the scores by landing offset, and writes its columns on the `all` rows.
+It is model free and never enters the headline.
 
 ## 5a. Sensitivity and diagnostic levels
 
@@ -220,6 +225,10 @@ Code cannot check that, so it is the operator's step.
 Stream AC. The headline table, the formulation-reference table labelled as a
 diagnostic rather than an estimand, the operational splat-pool table, and the
 five figures. Every figure regenerates from the tables alone.
+
+The landing-offset diagnostic's cells sit beside the headline, under the
+interpretation rules its pre-registration fixes: the read deficit is reported
+next to delta_learn_pp and never subtracted from it.
 
 ## 7. Acceptance
 

@@ -746,3 +746,126 @@ def score_cross_path(
         per_point_mask=pp_mask.cpu().numpy().copy(),
         samples_per_cell=samples_per_cell,
     )
+
+
+# ---------------------------------------------------------------------------
+# The landing-offset diagnostic, pre-registered 2026-10-09
+# ---------------------------------------------------------------------------
+#
+# validation/evidence/phase5/landing_offset_diagnostic.md defines it. Under the
+# frozen per-point read, a predictor's grid is read with the target's own
+# bilinear weights, so its ceiling is one at every landing. Context-Lift carries
+# one patch vector, which an off-grid read of the target grid cannot reproduce.
+# Context-Lift with ground-truth context depth, grouped by how far each landing
+# falls from the nearest target patch center, sizes that read on real features:
+# exact geometry has no dependence on the offset, and the read does. Model free,
+# never an estimand, never subtracted from the headline.
+
+
+def landing_offsets(uv_target: Tensor, patch_size: int = PATCH_SIZE) -> Tensor:
+    """[N] float64 distance, in patch units, from each landing to the nearest patch center.
+
+    uv_target: [N, 2] pixel coordinates in the target image, OpenCV convention.
+    The patch grid is the frozen one, through lot.encoders.pixel_to_patch_coords:
+    a patch center has integer patch coordinates and offset zero, and the
+    largest offset, at a cell corner, is sqrt(2) / 2. Computed in float64 from
+    the run's landings, so a bin assignment does not rest on float32 rounding
+    of the subtraction.
+    """
+    patch = pixel_to_patch_coords(uv_target.to(torch.float64), patch_size)
+    return (patch - torch.round(patch)).norm(dim=-1)
+
+
+def offset_bins(offsets: Any, upper_edges: Any) -> np.ndarray:
+    """The bin of each offset, closed on the right as PROTOCOL 3.4 fixes for bins.
+
+    Bin 0 holds offsets up to and including upper_edges[0]; bin k holds
+    upper_edges[k - 1] < offset <= upper_edges[k]; the last bin holds every
+    offset above the last edge.
+    """
+    edges = np.asarray(upper_edges, dtype=np.float64)
+    return np.searchsorted(edges, np.asarray(offsets, dtype=np.float64), side="left")
+
+
+@dataclasses.dataclass
+class LandingOffsetScores:
+    """One pair's diagnostic columns, named by lot.phase5_estimands."""
+
+    fields: dict[str, Any]
+
+    def as_fields(self) -> dict[str, Any]:
+        from .phase5_estimands import landing_offset_record_fields
+
+        return {name: self.fields[name] for name in landing_offset_record_fields()}
+
+
+def empty_landing_offset() -> LandingOffsetScores:
+    """The diagnostic's record where it is not computed: zero counts, no scores."""
+    from .phase5_estimands import (
+        OFFSET_BINS, OFFSET_WHOLE, offset_count_field, offset_fields,
+    )
+
+    fields: dict[str, Any] = {}
+    for label in OFFSET_BINS + (OFFSET_WHOLE,):
+        fields[offset_count_field(label)] = 0
+        fields.update({name: float("nan") for name in offset_fields(label)})
+    return LandingOffsetScores(fields)
+
+
+def score_landing_offset(
+    lift: ContextLiftMap,
+    support: Tensor,
+    features_context: Tensor,
+    features_target: Tensor,
+    center: Tensor,
+    upper_edges: Any,
+    patch_size: int = PATCH_SIZE,
+) -> LandingOffsetScores:
+    """Context-Lift and No-Warp-Copy, scored per offset bin against the landing read.
+
+    lift: a context-lift map built from ground-truth context depth. support: its
+    landed and ground-truth evaluable samples, the same rule as the primary
+    support. Each sample is scored exactly as score_primary scores Context-Lift
+    and the floor: the context patch's own vector, and the context map read at
+    the landing, both against the target grid read at the landing. The samples
+    are then grouped by landing offset, and the whole support is scored too.
+    """
+    from .phase5_estimands import (
+        MEAN_FEATURE_COLUMNS, METRIC_COLUMNS, N_OFFSET_BINS, OFFSET_BINS,
+        OFFSET_WHOLE, offset_count_field,
+    )
+
+    if len(upper_edges) + 1 != N_OFFSET_BINS:
+        raise ValueError(
+            f"{len(upper_edges)} edges make {len(upper_edges) + 1} bins, but the "
+            f"pre-registered diagnostic reads {N_OFFSET_BINS} bins"
+        )
+    chosen = torch.nonzero(support, as_tuple=False).reshape(-1)
+    if chosen.numel() == 0:
+        return empty_landing_offset()
+
+    uv_target = lift.uv_target[chosen]
+    target = sample_features_bilinear(features_target, uv_target, patch_size)
+    carried = sample_features_bilinear(features_context, lift.uv_context[chosen], patch_size)
+    nowarp = sample_features_bilinear(features_context, uv_target, patch_size)
+    bins = offset_bins(landing_offsets(uv_target, patch_size).cpu().numpy(), upper_edges)
+
+    metric_key = {"raw": "cosine_raw", "centered": "cosine_centered",
+                  "l2_raw": "l2_raw", "l2_centered": "l2_centered"}
+    groups = [(label, np.flatnonzero(bins == k)) for k, label in enumerate(OFFSET_BINS)]
+    groups.append((OFFSET_WHOLE, np.arange(chosen.numel())))
+    fields: dict[str, Any] = {}
+    for label, members in groups:
+        index = torch.from_numpy(members).to(target.device)
+        fields[offset_count_field(label)] = int(members.size)
+        for arm, values in (("cl_oracle", carried), ("nowarp", nowarp)):
+            metrics = score_all_metrics(values[index], target[index], center)
+            for column in METRIC_COLUMNS:
+                fields[f"offset_{arm}_{column}_{label}"] = metrics[metric_key[column]]
+        # The Mean-Feature floor predicts the centering vector at every sample.
+        # Only its raw columns are defined, so only they are read.
+        meanfeat = center.expand(int(members.size), -1)
+        metrics = score_all_metrics(meanfeat, target[index], center)
+        for column in MEAN_FEATURE_COLUMNS:
+            fields[f"offset_meanfeat_{column}_{label}"] = metrics[metric_key[column]]
+    return LandingOffsetScores(fields)

@@ -406,7 +406,8 @@ def test_explicit_columns_do_not_depend_on_the_seed(evaluated):
         by_pair.setdefault((r["context_frame_id"], r["target_frame_id"]), []).append(r)
     for records in by_pair.values():
         for column in ("cl_centered", "nowarp_centered", "sp_transport_centered",
-                       "tl_form_centered", "n_primary"):
+                       "tl_form_centered", "n_primary", "offset_n_all",
+                       "offset_cl_oracle_centered_all", "offset_nowarp_centered_b1"):
             # NaN is never equal to itself, so it is mapped to one marker; a pair
             # with no primary support has NaN explicit scores under every seed.
             values = {
@@ -680,6 +681,61 @@ def test_target_lift_on_aligned_depth_is_target_lift_on_ground_truth(world, eval
                 formulation.cl_form_centered, abs=1e-6), item["key"]
             checked += 1
     assert checked > 0
+
+
+# ---------------------------------------------------------------------------
+# The landing-offset diagnostic, pre-registered 2026-10-09
+# ---------------------------------------------------------------------------
+
+def test_the_offset_diagnostic_rides_only_on_the_whole_support_rows(evaluated):
+    from lot.phase5_estimands import OFFSET_BINS
+
+    rows = read_rows(Path(evaluated["path"]))
+    for r in rows:
+        if r["region"] != "all":
+            assert r["offset_n_all"] == 0
+            assert math.isnan(r["offset_cl_oracle_centered_all"])
+    whole = [r for r in rows if r["region"] == "all"]
+    assert any(r["offset_n_all"] > 0 for r in whole)
+    for r in whole:
+        assert r["offset_n_all"] == sum(r[f"offset_n_{label}"] for label in OFFSET_BINS)
+
+
+def test_on_this_fixture_the_oracle_support_is_the_primary_support(evaluated):
+    """Aligned depth is ground truth up to the fp16 cache here, so lifting with
+    either lands the same samples. On real data the two supports differ by
+    exactly the samples estimated depth moves across the landing rule."""
+    for r in read_rows(Path(evaluated["path"])):
+        if r["region"] == "all":
+            assert r["offset_n_all"] == r["n_primary"], (r["context_frame_id"],
+                                                         r["target_frame_id"])
+
+
+def test_the_offset_bins_match_an_independent_reprojection(world, evaluated, landings):
+    """Counts and scores per bin, from float64 landings computed without lot.
+
+    On this fixture ground truth and aligned depth land the same samples, so
+    the independent landings of the primary support are the oracle landings.
+    The closest fixture offset sits 4e-4 patch from an edge, far beyond float
+    noise, so the bin of every sample is decided the same way on both sides.
+    """
+    from lot.phase5_estimands import OFFSET_BINS
+
+    edges = np.array(world["cfg"].landing_offset["upper_edges_patch"])
+    center = world["center"].numpy().astype(np.float64)
+    for item in landings:
+        record = _record(evaluated, item["key"])
+        patch = (item["uv_target"] + 0.5) / 14 - 0.5
+        offset = np.linalg.norm(patch - np.round(patch), axis=1)
+        assert np.abs(offset[:, None] - edges[None, :]).min() > 1e-6
+        bins = (offset[:, None] > edges[None, :]).sum(axis=1)
+        cosines = _centered_cosines(item["carried"], item["target_read"], center)
+        for k, label in enumerate(OFFSET_BINS):
+            members = bins == k
+            assert record[f"offset_n_{label}"] == int(members.sum()), (item["key"], label)
+            if members.any():
+                assert record[f"offset_cl_oracle_centered_{label}"] == pytest.approx(
+                    cosines[members].mean(), abs=1e-4), (item["key"], label)
 
 
 def test_the_parquet_carries_its_run_record(evaluated):

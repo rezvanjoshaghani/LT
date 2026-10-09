@@ -120,18 +120,29 @@ def write_once(path: Path, text: str) -> dict[str, Any]:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    archived = None
-    if path.exists():
-        index = 1
-        while True:
-            candidate = path.with_name(f"{path.stem}.superseded.{index}{path.suffix}")
-            if not candidate.exists():
-                break
-            index += 1
-        path.replace(candidate)
-        archived = str(candidate)
+    archived = supersede(path)
     path.write_text(text, encoding="utf-8")
     return {"written": str(path), "archived_previous": archived}
+
+
+def supersede(path: Path) -> str | None:
+    """Move an existing output aside to a numbered sibling. Returns where.
+
+    The one place the project decides how an earlier output is kept when a run
+    is repeated, so receipts, checkpoints, and training records all follow the
+    same rule and none of them is ever destroyed in place.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    index = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}.superseded.{index}{path.suffix}")
+        if not candidate.exists():
+            break
+        index += 1
+    path.replace(candidate)
+    return str(candidate)
 
 
 def environment_identity() -> dict[str, Any]:

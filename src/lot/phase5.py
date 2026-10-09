@@ -297,7 +297,15 @@ def build_scene_inputs(
             analysis,
         )
         est_maps[frame.frame_id] = aligned
-        calibrations[frame.frame_id] = calibration
+        # The ratios array is the calibration population itself, float64 over
+        # every calibration pixel, about 2 MB per frame. Phase 5 reads only the
+        # fitted scale and affine terms, and the scene-scale level that needs
+        # the ratios is not a Phase 5 condition. Holding it would cost roughly
+        # 600 MB per resident scene for nothing; the fitted terms are kept
+        # exactly, so no aligned depth changes.
+        calibrations[frame.frame_id] = dataclasses.replace(
+            calibration, ratios=np.zeros(0, dtype=np.float64)
+        )
 
     return SceneInputs(
         scene=scene,
@@ -335,6 +343,172 @@ def aligned_context_depth(
 # Example assembly
 # ---------------------------------------------------------------------------
 
+@dataclasses.dataclass(frozen=True)
+class PairCameras:
+    """One pair's frames and camera quantities, in the frozen geometry dtype."""
+
+    context: Any
+    target: Any
+    K_context: Tensor
+    K_target: Tensor
+    T_target_from_context: Tensor
+    context_hw: tuple[int, int]
+    target_hw: tuple[int, int]
+
+
+def pair_cameras(cfg: Phase5Config, inputs: SceneInputs, pair: Any) -> PairCameras:
+    dtype = cfg.torch_dtype
+    context = inputs.frames[pair.context_frame_id]
+    target = inputs.frames[pair.target_frame_id]
+    return PairCameras(
+        context=context,
+        target=target,
+        K_context=context.K.to(dtype),
+        K_target=target.K.to(dtype),
+        T_target_from_context=relative_pose(
+            target.T_world_from_camera, context.T_world_from_camera
+        ).to(dtype),
+        context_hw=(context.height, context.width),
+        target_hw=(target.height, target.width),
+    )
+
+
+def context_valid_tokens(context_depth: np.ndarray) -> Tensor:
+    """[N_ctx] bool, row major: the context patch holds at least one valid depth.
+
+    Uses lot.visibility.fraction_per_patch, the one patch reduction the project
+    defines, so the token order is the patch-grid order the feature cache uses.
+    """
+    from .visibility import fraction_per_patch
+
+    valid = torch.from_numpy(np.isfinite(context_depth) & (context_depth > 0))
+    return (fraction_per_patch(valid, PATCH_SIZE) > 0).reshape(-1)
+
+
+def model_inputs(
+    cfg: Phase5Config,
+    inputs: SceneInputs,
+    pair: Any,
+    cams: PairCameras,
+    context_depth: np.ndarray,
+) -> dict[str, Tensor]:
+    """Exactly what Predict-with-Depth receives, for training and for evaluation.
+
+    One builder serves both, so the predictor at test time is handed precisely
+    the kind of input it was trained on. Every field is context side or camera
+    side; nothing here reads the target frame.
+    """
+    dtype = cfg.torch_dtype
+    features_context = inputs.cache.features(cfg.feature_encoder, pair.context_frame_id)
+    channels = features_context.shape[0]
+    return {
+        "features_context": features_context.to(dtype).reshape(channels, -1).T,
+        "depth_context_aligned": torch.from_numpy(context_depth).to(dtype),
+        "camera": camera_vector(
+            cams.T_target_from_context[None], cams.K_context[None],
+            cams.K_target[None], cams.context_hw, cams.target_hw,
+        )[0],
+        "context_valid": context_valid_tokens(context_depth),
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExamplePlan:
+    """The expensive, deterministic part of an example, computed once.
+
+    The primary support depends only on the aligned context depth, ground
+    truth, and the cameras, all of which are fixed, so it is computed once per
+    pair and reused for every pass. Rebuilding an example from its plan then
+    needs no visibility computation over the full image, which is the dominant
+    per-example cost. support is [N_ctx] bool over the context patch centres.
+    """
+
+    scene: str
+    pair: Any
+    level: str
+    support: np.ndarray
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.scene, self.pair.context_frame_id, self.pair.target_frame_id)
+
+
+def plan_example(
+    cfg: Phase5Config,
+    analysis: AnalysisConfig,
+    inputs: SceneInputs,
+    pair: Any,
+    level: str,
+) -> ExamplePlan | None:
+    """The primary support for one pair, or None when there is nothing to score.
+
+    None means either the level has no arm for this pair (an affine fit that
+    failed) or nothing survives the support rules. The caller counts both.
+    """
+    context_depth = aligned_context_depth(inputs, pair.context_frame_id, level)
+    if context_depth is None:
+        return None
+    dtype = cfg.torch_dtype
+    cams = pair_cameras(cfg, inputs, pair)
+    lift = context_lift_map(
+        torch.from_numpy(context_depth).to(dtype),
+        cams.K_context, cams.K_target, cams.T_target_from_context,
+        cams.context_hw, cams.target_hw,
+    )
+    evaluable = context_lift_support(
+        lift,
+        inputs.cache.depth(cams.context.depth_path).to(dtype),
+        inputs.cache.depth(cams.target.depth_path).to(dtype),
+        cams.K_context, cams.K_target, cams.T_target_from_context,
+        rel_tol=analysis.covisible_relative_depth_tol,
+    )
+    support = primary_support(lift, evaluable)
+    if not bool(support.any()):
+        return None
+    return ExamplePlan(inputs.scene, pair, level, support.cpu().numpy().copy())
+
+
+def materialize_example(
+    cfg: Phase5Config,
+    inputs: SceneInputs,
+    plan: ExamplePlan,
+    center: Tensor,
+) -> TrainingExample:
+    """Rebuild a training example from its plan. Cheap and exact.
+
+    The forward map is recomputed, which is a few thousand points, and the
+    cached support selects the supervised landings from it. The result is
+    identical to what plan_example's support would give if recomputed, because
+    the support is a deterministic function of fixed inputs.
+    """
+    from .encoders import pixel_to_patch_coords, sample_features_bilinear
+
+    dtype = cfg.torch_dtype
+    pair = plan.pair
+    context_depth = aligned_context_depth(inputs, pair.context_frame_id, plan.level)
+    cams = pair_cameras(cfg, inputs, pair)
+    lift = context_lift_map(
+        torch.from_numpy(context_depth).to(dtype),
+        cams.K_context, cams.K_target, cams.T_target_from_context,
+        cams.context_hw, cams.target_hw,
+    )
+    chosen = torch.nonzero(torch.from_numpy(plan.support), as_tuple=False).reshape(-1)
+    features_target = inputs.cache.features(cfg.feature_encoder, pair.target_frame_id)
+    target_features = sample_features_bilinear(
+        features_target.to(dtype), lift.uv_target[chosen], PATCH_SIZE
+    )
+    return TrainingExample(
+        scene=inputs.scene,
+        context_frame_id=pair.context_frame_id,
+        target_frame_id=pair.target_frame_id,
+        regime=pair.regime,
+        **model_inputs(cfg, inputs, pair, cams, context_depth),
+        query_patch_coords=pixel_to_patch_coords(lift.uv_target[chosen], PATCH_SIZE),
+        target_centered=target_features - center.to(dtype),
+        support=torch.ones(chosen.numel(), dtype=torch.bool),
+    )
+
+
 def build_example(
     cfg: Phase5Config,
     analysis: AnalysisConfig,
@@ -345,74 +519,11 @@ def build_example(
 ) -> TrainingExample | None:
     """One pair reduced to permitted model inputs plus its supervision support.
 
-    Returns None when the pair has no usable arm at this level, which happens
-    when an affine fit failed or when nothing survives the support rules. A
-    dropped pair is counted by the caller and never silently absorbed.
+    Returns None when the pair has no usable arm at this level. A dropped pair
+    is counted by the caller and never silently absorbed.
     """
-    dtype = cfg.torch_dtype
-    context = inputs.frames[pair.context_frame_id]
-    target = inputs.frames[pair.target_frame_id]
-    context_depth = aligned_context_depth(inputs, pair.context_frame_id, level)
-    if context_depth is None:
-        return None
-
-    K_context = context.K.to(dtype)
-    K_target = target.K.to(dtype)
-    T_target_from_context = relative_pose(
-        target.T_world_from_camera, context.T_world_from_camera
-    ).to(dtype)
-    context_hw = (context.height, context.width)
-    target_hw = (target.height, target.width)
-
-    lift = context_lift_map(
-        torch.from_numpy(context_depth).to(dtype),
-        K_context, K_target, T_target_from_context, context_hw, target_hw,
-    )
-    evaluable = context_lift_support(
-        lift,
-        inputs.cache.depth(context.depth_path).to(dtype),
-        inputs.cache.depth(target.depth_path).to(dtype),
-        K_context, K_target, T_target_from_context,
-        rel_tol=analysis.covisible_relative_depth_tol,
-    )
-    support = primary_support(lift, evaluable)
-    if not bool(support.any()):
-        return None
-
-    features_context = inputs.cache.features(cfg.feature_encoder, pair.context_frame_id)
-    features_target = inputs.cache.features(cfg.feature_encoder, pair.target_frame_id)
-    channels = features_context.shape[0]
-
-    from .encoders import pixel_to_patch_coords, sample_features_bilinear
-
-    chosen = torch.nonzero(support, as_tuple=False).reshape(-1)
-    target_features = sample_features_bilinear(
-        features_target.to(dtype), lift.uv_target[chosen], PATCH_SIZE
-    )
-    return TrainingExample(
-        scene=inputs.scene,
-        context_frame_id=pair.context_frame_id,
-        target_frame_id=pair.target_frame_id,
-        regime=pair.regime,
-        features_context=features_context.to(dtype).reshape(channels, -1).T,
-        depth_context_aligned=torch.from_numpy(context_depth).to(dtype),
-        camera=camera_vector(
-            T_target_from_context[None], K_context[None], K_target[None],
-            context_hw, target_hw,
-        )[0],
-        context_valid=torch.from_numpy(
-            (np.isfinite(context_depth) & (context_depth > 0))
-            .reshape(
-                patch_grid_shape(context_hw, PATCH_SIZE)[0], PATCH_SIZE,
-                patch_grid_shape(context_hw, PATCH_SIZE)[1], PATCH_SIZE,
-            )
-            .any(axis=(1, 3))
-            .reshape(-1)
-        ),
-        query_patch_coords=pixel_to_patch_coords(lift.uv_target[chosen], PATCH_SIZE),
-        target_centered=target_features - center.to(dtype),
-        support=torch.ones(chosen.numel(), dtype=torch.bool),
-    )
+    plan = plan_example(cfg, analysis, inputs, pair, level)
+    return None if plan is None else materialize_example(cfg, inputs, plan, center)
 
 
 def iter_examples(
@@ -467,6 +578,15 @@ def main(argv: list[str] | None = None) -> None:
         default="describe",
     )
     parser.add_argument("--task-index", type=int, default=0)
+    parser.add_argument(
+        "--level", default=None,
+        help="alignment level; defaults to the frozen primary level",
+    )
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument(
+        "--scene-index", type=int, default=None,
+        help="evaluate one test scene, by its index in the fixed evaluation order",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_phase5_config(args.config)
@@ -519,11 +639,204 @@ def main(argv: list[str] | None = None) -> None:
             print(f"previous receipt kept at {outcome['archived_previous']}")
         raise SystemExit(0 if report.passed else 1)
 
-    raise SystemExit(
-        f"mode {args.mode!r} needs the caches and the accepted Phase 4 artifacts, "
-        "which are cluster resident, and is only permitted after the integration "
-        "gate passes. Run it from Borah via scripts/run_phase5.sh."
+    run_mode(cfg, analysis, args)
+
+
+def scene_image_hw(cfg: Phase5Config, scene: str) -> tuple[int, int]:
+    """The rendered frame size of one scene, which fixes the predictor's grid."""
+    manifest = load_manifest(Path(cfg.renders_root) / scene / MANIFEST_NAME)
+    sizes = {(f.height, f.width) for f in manifest.frames}
+    if len(sizes) != 1:
+        raise ValueError(f"{scene}: frames have several sizes {sorted(sizes)}")
+    return next(iter(sizes))
+
+
+def require_receipts(cfg: Phase5Config, config_path: Path, mode: str) -> None:
+    """The authoritative gate check. Every launcher and worker passes through here.
+
+    The shell launcher and the SLURM template also check, for an early and
+    friendly refusal, but this is the boundary that cannot be bypassed: any way
+    of running a mode is a way of calling this entry point. overfit needs the
+    integration gate; everything after it needs both gates.
+    """
+    from .phase5_receipt import KIND_INTEGRATION, KIND_OVERFIT, verify
+
+    gate = cfg.evidence_dir / "integration_gate.json"
+    problems = verify(gate, config_path, "the Borah integration gate",
+                      kind=KIND_INTEGRATION)
+    if mode != "overfit":
+        problems += verify(
+            cfg.evidence_dir / "tiny_overfit.json", config_path,
+            "the tiny-subset overfit gate", kind=KIND_OVERFIT, gate_receipt=gate,
+        )
+    if problems:
+        import sys
+
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        raise SystemExit(
+            f"mode {mode!r} is not permitted: its prerequisite gates do not stand "
+            "for this commit, configuration, and set of inputs"
+        )
+
+
+def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
+    """overfit, train, controls, and evaluate, each behind its gates."""
+    from .phase5_check import write_once
+    from .phase5_modes import (
+        SceneStore,
+        evaluation_scenes,
+        load_checkpoint,
+        primary_evaluation_complete,
+        resolve_device,
+        run_controls,
+        run_evaluate_scene,
+        run_overfit,
+        run_train_task,
     )
+    from .phase5_receipt import KIND_OVERFIT, current_identity, stamp_receipt
+    from .train import training_config_from
+
+    mode = args.mode
+    level = args.level or cfg.primary_alignment_level
+    declared = (
+        cfg.primary_alignment_level,
+        *cfg.sensitivity_alignment_levels,
+        *cfg.diagnostic_alignment_levels,
+    )
+    if level not in declared:
+        raise SystemExit(f"level {level!r} is not declared in the frozen config: {declared}")
+
+    require_receipts(cfg, args.config, mode)
+
+    folds = frozen_folds()
+    if level != cfg.primary_alignment_level:
+        if mode == "overfit":
+            raise SystemExit(
+                "the overfit gate establishes that the trunk can represent the "
+                "mapping and runs once, at the primary level"
+            )
+        missing = primary_evaluation_complete(
+            cfg.run_dir, cfg.primary_alignment_level, evaluation_scenes(folds)
+        )
+        if missing:
+            raise SystemExit(
+                f"level {level!r} is a sensitivity or diagnostic condition and runs "
+                "after the primary result is complete; primary evaluation is "
+                f"missing for {missing}"
+            )
+
+    train_cfg = training_config_from(cfg.training)
+    convention = load_convention_record(cfg)
+    center = phase5_mean_vector(cfg)
+    device = resolve_device(args.device)
+    model_cfg = predictor_config_from(cfg, scene_image_hw(cfg, folds[0].train[0]))
+    gate_receipt = cfg.evidence_dir / "integration_gate.json"
+
+    with SceneStore(cfg, analysis, convention) as store:
+        if mode == "overfit":
+            tiny = cfg.tiny_overfit
+            result = run_overfit(
+                cfg, analysis, store, folds[0], model_cfg, train_cfg, center, device,
+                level, int(tiny["n_pairs"]), tuple(tiny["regimes"]),
+                float(tiny["threshold_centered_cosine"]), int(tiny["max_steps"]),
+                int(tiny["seed"]),
+            )
+            stamped = stamp_receipt(result, args.config, KIND_OVERFIT,
+                                    gate_receipt=gate_receipt)
+            outcome = write_once(
+                cfg.evidence_dir / "tiny_overfit.json",
+                json.dumps(stamped, indent=2, sort_keys=True, default=str),
+            )
+            verdict = "PASS" if result["passed"] else "FAIL"
+            print(f"TINY-SUBSET OVERFIT GATE: {verdict}")
+            print(f"  reached centered cosine {result['reached_centered_cosine']:.4f} "
+                  f"against {result['threshold']} in {result['steps']} steps")
+            for item in result["subset"]:
+                print(f"  {item['regime']:<12} {item['scene']} "
+                      f"{item['context_frame_id']} -> {item['target_frame_id']}")
+            print(f"receipt written to {outcome['written']}")
+            if not result["passed"]:
+                print("Phase 5 stops here: a predictor that cannot fit the frozen "
+                      "subset cannot support a scientific reading of its "
+                      "underperformance.")
+            raise SystemExit(0 if result["passed"] else 1)
+
+        if mode == "train":
+            fold, seed = fold_and_seed_for_task(args.task_index, train_cfg.seeds)
+            payload = run_train_task(
+                cfg, analysis, store, fold, seed, model_cfg, train_cfg, center,
+                device, level, cfg.run_dir,
+            )
+            print(f"fold {fold.index} seed {seed} level {level}: best validation "
+                  f"centered cosine {payload['best_validation_centered_cosine']:.4f} "
+                  f"at step {payload['best_step']} of {payload['steps_run']}")
+            print(f"checkpoint {payload['checkpoint']}")
+            return
+
+        if mode == "controls":
+            controls = cfg.controls
+            for key in ("pose_shuffle", "depth_shuffle"):
+                if controls.get(key) is not True:
+                    raise SystemExit(
+                        f"controls.{key} is {controls.get(key)!r}; both shuffles are "
+                        "run together and the config may not disable one"
+                    )
+            results: dict[str, Any] = {}
+            missing: list[str] = []
+            for fold in folds:
+                for seed in train_cfg.seeds:
+                    try:
+                        model = load_checkpoint(cfg.run_dir, level, fold, seed,
+                                                model_cfg, train_cfg, device)
+                    except FileNotFoundError as error:
+                        missing.append(str(error))
+                        continue
+                    results[f"fold{fold.index}_seed{seed}"] = run_controls(
+                        cfg, analysis, store, fold, model, model_cfg, center, level,
+                        train_cfg.batch_pairs, int(controls["seed"]),
+                    )
+                # A fold's validation scenes are not read again by later folds.
+                store.close()
+            payload = {
+                "level": level, "results": results, "missing": missing,
+                **current_identity(args.config),
+            }
+            outcome = write_once(
+                cfg.evidence_dir / f"input_use_controls_{level}.json",
+                json.dumps(payload, indent=2, sort_keys=True, default=str),
+            )
+            for name, result in results.items():
+                pose, depth = result["pose_shuffle"], result["depth_shuffle"]
+                print(f"{name}: pose {pose['degradation']:+.4f} "
+                      f"({pose['n_unchanged']} of {result['n_pairs']} unchanged)  "
+                      f"depth {depth['degradation']:+.4f} "
+                      f"({depth['n_unchanged']} of {result['n_pairs']} unchanged)")
+            print(f"written to {outcome['written']}")
+            if missing:
+                print(f"{len(missing)} checkpoint(s) missing; controls are incomplete")
+            raise SystemExit(1 if missing else 0)
+
+        if mode == "evaluate":
+            scenes = evaluation_scenes(folds)
+            if args.scene_index is not None:
+                if not 0 <= args.scene_index < len(scenes):
+                    raise SystemExit(
+                        f"scene index {args.scene_index} outside 0..{len(scenes) - 1}"
+                    )
+                scenes = [scenes[args.scene_index]]
+            for scene in scenes:
+                result = run_evaluate_scene(
+                    cfg, analysis, store, scene, fold_of_test_scene(scene, folds),
+                    train_cfg.seeds, model_cfg, train_cfg, center, level, device,
+                    cfg.run_dir,
+                )
+                # One test scene resident at a time.
+                store.close()
+                print(f"{scene}: {result['status']} {result['path']}")
+            return
+
+    raise SystemExit(f"unknown mode {mode!r}")
 
 
 if __name__ == "__main__":

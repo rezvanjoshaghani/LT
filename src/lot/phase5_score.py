@@ -296,7 +296,31 @@ def formulation_support(
 
 @dataclasses.dataclass
 class FormulationScores:
-    """Target-lift against context-lift on their common support. Diagnostic only."""
+    """Target-lift against context-lift on their common cells. Diagnostic only.
+
+    The unit is the target patch cell, on both arms, with one weight per cell,
+    and both arms are scored against the same target: the cell's own feature at
+    its centre. That is the only arrangement under which this diagnostic
+    measures a difference of formulation and nothing else.
+
+    TL-Reference is Phase 4's accepted per-point estimator, and Phase 4 defined
+    it at Phase 3's target patch centres, one sample per cell. It cannot be
+    moved to Context-Lift's landing locations without becoming a different
+    estimator. So Context-Lift comes to it: the supported context patches
+    landing in a cell are pooled to one vector, the output-level rule PROTOCOL
+    3.7 already applies to pooled outputs, and scored against the same cell
+    target TL-Reference is scored against.
+
+    An earlier version scored per Context-Lift sample at the landing location
+    and handed TL-Reference's cell-centre prediction to each of them. That
+    compared TL against a target it never predicted, which penalized it by an
+    interpolation residual unrelated to its formulation, and it counted TL once
+    per landing sample, so cells with more collisions weighed more. It was never
+    exercised, because nothing produced TL predictions until evaluate existed.
+
+    The common cells and the per-cell sample counts travel with the record so
+    the support an aggregate rests on can be reconstructed.
+    """
 
     n_formulation: int
     tl_form_raw: float
@@ -307,42 +331,95 @@ class FormulationScores:
     cl_form_centered: float
     cl_form_l2_raw: float
     cl_form_l2_centered: float
+    common_cells: np.ndarray
+    samples_per_cell: np.ndarray
 
     def as_fields(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        row = dataclasses.asdict(self)
+        row.pop("common_cells")
+        row.pop("samples_per_cell")
+        return row
+
+
+def formulation_cells(
+    lift: ContextLiftMap,
+    primary: Tensor,
+    pp_scored: np.ndarray,
+    target_hw: tuple[int, int],
+    patch_size: int = PATCH_SIZE,
+) -> tuple[np.ndarray, Tensor]:
+    """V_form as cells: TL-Reference scored them and Context-Lift landed in them.
+
+    pp_scored: [cells] bool, the cells the accepted Phase 4 per-point estimator
+        scored at the reference level for this pair.
+
+    Returns (common_cells, cl_mask), where cl_mask marks the supported
+    Context-Lift samples that land in a common cell. The headline support is
+    not narrowed in place; this population exists only for the diagnostic.
+    """
+    cells = patch_cell_index(lift.uv_target, target_hw, patch_size)
+    supported = primary.cpu().numpy()
+    landed_cells = np.unique(cells[supported]) if supported.any() else np.zeros(0, np.int64)
+    common = np.intersect1d(landed_cells, np.flatnonzero(pp_scored))
+    inside = torch.from_numpy(np.isin(cells, common)).to(primary.device)
+    return common, primary & inside
 
 
 def score_formulation(
     lift: ContextLiftMap,
-    support: Tensor,
+    primary: Tensor,
     features_context: Tensor,
-    features_target: Tensor,
     center: Tensor,
-    target_lift_prediction: Tensor,
+    pp_scored: np.ndarray,
+    per_point_cells: np.ndarray,
+    tl_reads: Tensor,
+    reads_target: Tensor,
+    target_hw: tuple[int, int],
     patch_size: int = PATCH_SIZE,
 ) -> FormulationScores:
-    """Score both explicit formulations on the shared population.
+    """Score both explicit formulations on the common cells, one weight each.
 
-    target_lift_prediction: [M, C] the accepted Phase 4 per-point predictions for
-        the supported samples, supplied by the caller from the Phase 4 artifacts
-        rather than recomputed here, so the diagnostic compares against what
-        Phase 4 actually reported.
+    pp_scored, per_point_cells, tl_reads, reads_target: Phase 4's per-point
+        quantities at the reference level, from lot.phase5_reference, which
+        reconciles them against the accepted Phase 4 rows before they get here.
+        tl_reads[k] and reads_target[k] are TL-Reference's prediction and the
+        target for the Phase 3 sample at cell per_point_cells[k].
     """
-    chosen = torch.nonzero(support, as_tuple=False).reshape(-1)
-    if chosen.numel() == 0:
+    common, cl_mask = formulation_cells(lift, primary, pp_scored, target_hw, patch_size)
+    if common.size == 0:
         return FormulationScores(
             n_formulation=0,
             **_prefixed(_EMPTY_METRICS, "tl_form"),
             **_prefixed(_EMPTY_METRICS, "cl_form"),
+            common_cells=common,
+            samples_per_cell=np.zeros(0, dtype=np.int64),
         )
-    uv_target = lift.uv_target[chosen]
-    target = sample_features_bilinear(features_target, uv_target, patch_size)
-    cl = sample_features_bilinear(features_context, lift.uv_context[chosen], patch_size)
+
+    # One Phase 3 sample per cell: the lookup is a bijection on its domain, and a
+    # duplicate would mean the universe is not what this diagnostic assumes.
+    sample_of_cell: dict[int, int] = {}
+    for k, cell in enumerate(np.asarray(per_point_cells, dtype=np.int64)):
+        if int(cell) in sample_of_cell:
+            raise ValueError(
+                f"cell {int(cell)} holds more than one Phase 3 per-point sample; "
+                "the formulation diagnostic assumes one sample per cell"
+            )
+        sample_of_cell[int(cell)] = k
+    index = torch.as_tensor([sample_of_cell[int(c)] for c in common], dtype=torch.long)
+    target_cells = reads_target[index]
+    tl_cells = tl_reads[index]
+
+    chosen = torch.nonzero(cl_mask, as_tuple=False).reshape(-1)
+    landed = patch_cell_index(lift.uv_target[chosen], target_hw, patch_size)
+    cl_samples = sample_features_bilinear(features_context, lift.uv_context[chosen], patch_size)
+    cl_cells, samples_per_cell = pool_per_point_to_cells(cl_samples, landed, common)
 
     return FormulationScores(
-        n_formulation=int(chosen.numel()),
-        **_prefixed(score_all_metrics(target_lift_prediction, target, center), "tl_form"),
-        **_prefixed(score_all_metrics(cl, target, center), "cl_form"),
+        n_formulation=int(common.size),
+        **_prefixed(score_all_metrics(tl_cells, target_cells, center), "tl_form"),
+        **_prefixed(score_all_metrics(cl_cells, target_cells, center), "cl_form"),
+        common_cells=common,
+        samples_per_cell=samples_per_cell,
     )
 
 
@@ -545,22 +622,36 @@ def pool_per_point_to_cells(
     """One value per common cell: the mean of the per-point values landing in it.
 
     values: [M, C] per-point vectors, cells: [M] the cell each landed in, common:
-    the ordered common cells. Returns ([n_common, C], samples_per_cell).
+    the common cells, sorted and unique. Returns ([n_common, C], samples_per_cell).
 
     Pooling happens at the vector level and the cosine is taken afterwards,
     which is PROTOCOL 3.7's output-level rule for pooled outputs. Averaging the
     per-sample cosines instead would be a different, un-frozen estimator.
+
+    Vectorized with one index_add rather than a loop over samples. Evaluation
+    calls this for every arm, region, and seed of every test pair, and the loop
+    form cost tens of milliseconds a call. Sums accumulate in a different order
+    from a sequential loop, so pooled vectors agree with it to floating-point
+    rounding rather than bit for bit.
     """
-    lookup = {int(cell): i for i, cell in enumerate(common)}
-    pooled = torch.zeros(len(common), values.shape[-1], dtype=values.dtype,
-                         device=values.device)
-    counts = np.zeros(len(common), dtype=np.int64)
-    for row, cell in enumerate(cells):
-        slot = lookup.get(int(cell))
-        if slot is None:
-            continue
-        pooled[slot] += values[row]
-        counts[slot] += 1
+    common = np.asarray(common, dtype=np.int64)
+    cells = np.asarray(cells, dtype=np.int64)
+    channels = values.shape[-1]
+    n_common = int(common.size)
+    if n_common == 0:
+        return values.new_zeros(0, channels), np.zeros(0, dtype=np.int64)
+    if n_common > 1 and not bool(np.all(common[1:] > common[:-1])):
+        raise ValueError("common cells must be sorted and unique")
+    slot = np.clip(np.searchsorted(common, cells), 0, n_common - 1)
+    inside = np.flatnonzero(common[slot] == cells)
+    kept_slots = slot[inside]
+    pooled = values.new_zeros(n_common, channels)
+    pooled.index_add_(
+        0,
+        torch.from_numpy(kept_slots).to(values.device),
+        values[torch.from_numpy(inside).to(values.device)],
+    )
+    counts = np.bincount(kept_slots, minlength=n_common).astype(np.int64)
     weights = torch.from_numpy(np.maximum(counts, 1)).to(pooled.dtype).to(pooled.device)
     return pooled / weights[:, None], counts
 

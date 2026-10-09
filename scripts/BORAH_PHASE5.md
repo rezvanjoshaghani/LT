@@ -69,6 +69,23 @@ the deferrals `validation/evidence/phase5/pin.md` records.
 A frozen-blob mismatch, a cache-digest mismatch, or a measurement-identity
 mismatch stops everything.
 
+## How the modes after `check` run
+
+`overfit`, `train`, `controls`, and `evaluate` are submitted to SLURM by the
+launcher rather than run on the login node. Each job's output is written under
+`outputs/phase5_rung2/evidence/`, named by mode and job id. Account and
+partition come from `SLURM_ACCOUNT` and `SLURM_PARTITION` only.
+
+The launcher checks each mode's receipts before it submits, so a refusal costs
+no queue time. The entry point checks them again inside the job, through
+`lot.phase5.require_receipts`. That second check is the real boundary: a job
+submitted by hand with `sbatch` is refused exactly as a launched one is, and a
+job cannot run past a gate that stopped standing while it waited in the queue.
+
+The templates are `scripts/phase5_train.sbatch` for the nine training tasks and
+`scripts/phase5_job.sbatch` for the other three modes. Both take the config and
+pass any further arguments to the entry point.
+
 ## 2. The tiny-subset overfit gate
 
     ./scripts/run_phase5.sh overfit
@@ -77,6 +94,13 @@ Refuses to run until `check` has passed, read from the gate's own receipt
 rather than from memory. Its own receipt records the digest of that gate
 receipt, so an overfit result cannot be carried across to a run the gate never
 examined; rerunning `check` invalidates it and the overfit gate must be rerun.
+
+The job prints `TINY-SUBSET OVERFIT GATE: PASS` or `FAIL`, the centered cosine
+reached, and the eight pairs, and writes the verdict to
+`outputs/phase5_rung2/evidence/tiny_overfit.json`. A rerun archives the earlier
+receipt as `*.superseded.N.*` rather than overwriting it. A FAIL receipt blocks
+every later mode, because verification requires a recorded pass. The gate runs
+only at the primary alignment level.
 
 Stream U step 14. Eight pairs from training scenes only, spanning the three
 camera regimes, at the frozen threshold of centered cosine 0.98.
@@ -94,10 +118,18 @@ interpretable rather than making it look good.
 which submits
 
     sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+           --output outputs/phase5_rung2/evidence/train_%A_%a.txt \
            --array 0-8 scripts/phase5_train.sbatch configs/phase5.yaml
 
 and refuses unless both the integration gate and the overfit gate have passed,
 each read from its own receipt rather than from memory.
+
+Each task writes `checkpoints/{level}/fold{f}_seed{s}.pt` under the run
+directory, with a JSON record beside it that carries the checkpoint's sha256,
+the training-config digest, the commit, and the plan census. Evaluation and the
+controls load a checkpoint only through that record and refuse one whose hash,
+fold, seed, or config digest disagrees. Retraining a task archives the previous
+checkpoint and record as `*.superseded.N.*` rather than overwriting them.
 
 Nine tasks: three folds by three seeds. Each task trains on its fold's nine
 training scenes, selects its checkpoint on its three validation scenes by
@@ -120,12 +152,34 @@ These are diagnostics. A shuffle that barely moves the score is reported exactly
 as observed, and is evidence about whether the network uses that input. It is
 never a reason to retrain, and it is never a threshold anything must pass.
 
+Run it after all nine training tasks have finished. It loops over every fold and
+seed in one job and writes `input_use_controls_{level}.json` to the evidence
+directory, archiving any earlier result rather than overwriting it. A missing
+checkpoint is listed in that file and the job exits nonzero, so a partial result
+is never mistaken for a complete one.
+
 ## 5. Evaluate
 
     ./scripts/run_phase5.sh evaluate
 
 Streams V and W. For every test scene, through the model of the fold that held
 it out, at each of the three seeds separately.
+
+The launcher submits one array task per test scene, eighteen in all, with the
+range read from the frozen folds. Each task writes
+`eval/{level}/{scene}.parquet` under the run directory once, with the run
+record inside the file: commit, digests, checkpoint hashes, the Phase 4 parquet
+hash, and the reconciliation audit. A scene that already has its parquet
+reports `exists` and is not recomputed, so a failed task is resubmitted alone:
+
+    sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+           --array <index> scripts/phase5_job.sbatch configs/phase5.yaml evaluate
+
+For every pair, TL-Reference and the splat arm are recomputed through Phase 4's
+code and reconciled with the accepted Phase 4 rows: masks bit for bit, scores
+within 1e-5. The region masks are reconciled the same way. Any disagreement, or
+a Phase 4 pair that Phase 5 would not evaluate, stops the scene with
+`ReferenceMismatch` rather than writing a record.
 
 Three populations, fixed before any scoring and never merged:
 
@@ -138,6 +192,25 @@ Three populations, fixed before any scoring and never merged:
 
 The predictor cannot narrow the primary support. A nonfinite prediction on a
 supported sample is scored as a model failure and counted, not dropped.
+
+Read `validation/evidence/phase5/landing_read_asymmetry.md` before interpreting
+the headline. Under the frozen landing-location read, a predictor that returns
+the true target grid scores exactly one, while Context-Lift with exact geometry
+is capped by the interpolation residual of the target features. That cap is a
+property of the frozen rule, not an implementation defect. Its size on DINOv2
+features is unmeasured.
+
+## 5a. Sensitivity and diagnostic levels
+
+    ./scripts/run_phase5.sh train --level affine
+    ./scripts/run_phase5.sh controls --level affine
+    ./scripts/run_phase5.sh evaluate --level affine
+
+The same sequence at a predeclared non-primary level: `affine` for sensitivity,
+`none` for the systems diagnostic. The entry point refuses any undeclared
+level, and refuses a non-primary level until every test scene has its primary
+parquet. The config also asks for the primary result to be interpreted first.
+Code cannot check that, so it is the operator's step.
 
 ## 6. Tables and figures
 
@@ -193,9 +266,15 @@ against the shapes Phase 4's own code produces, and the whole point of the gate
 is that this is an assumption until it runs. Expect step 3 or step 5 to be
 where a real mismatch first appears.
 
-Not yet implemented: `overfit`, `train`, `controls`, and `evaluate` beyond their
-data assembly, and `tables`, `figures`, and `acceptance` entirely. Those last
-three refuse with an explanation rather than a stack trace, deliberately: their
-inputs are the evaluation records the gate exists to make trustworthy, so
-building them before the gate passes would be building on an unverified
-foundation.
+`overfit`, `train`, `controls`, and `evaluate` are implemented.
+`tests/test_phase5_modes.py` runs all four end to end on synthetic scenes
+written to disk, with real Phase 3 and Phase 4 runs on the test scene, so
+evaluation reconciles against a genuine Phase 4 parquet. On that fixture the
+recomputed TL-Reference and splat arms match Phase 4 with a worst residual of
+zero. The CLI refuses every mode without its receipts. None of the four has run
+on real artifacts.
+
+Not yet implemented: `tables`, `figures`, and `acceptance`. They refuse with an
+explanation rather than a stack trace, deliberately: their inputs are the
+evaluation records the gate exists to make trustworthy, so building them before
+the gate passes would be building on an unverified foundation.

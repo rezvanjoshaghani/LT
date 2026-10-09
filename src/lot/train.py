@@ -97,6 +97,66 @@ class TrainingConfig:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# Keys the frozen training section may carry that are not TrainingConfig fields.
+# Each is either derived (and checked against what it is derived from) or a
+# declaration of something the loop implements in exactly one way (and checked
+# to name that one way). Anything else is refused, so a value added to the YAML
+# cannot be silently ignored by a loop that never reads it.
+_DECLARED_TRAINING_KEYS = {
+    "effective_batch_pairs": None,
+    "loss": "one_minus_centered_cosine",
+    "supervision": "context_lift_landings_gt_covisible",
+}
+
+
+def training_config_from(raw: dict) -> TrainingConfig:
+    """The frozen training configuration, read strictly from configs/phase5.yaml.
+
+    A configuration value the loop does not implement is refused rather than
+    accepted and ignored. train_fold has one optimizer, one precision, and no
+    gradient accumulation, so a YAML asking for anything else would describe a
+    run that never happened. Refusing makes the YAML a true record.
+    """
+    fields = {f.name for f in dataclasses.fields(TrainingConfig)}
+    unknown = sorted(set(raw) - fields - set(_DECLARED_TRAINING_KEYS))
+    if unknown:
+        raise ValueError(f"training: unknown keys {unknown}")
+    kwargs = {k: v for k, v in raw.items() if k in fields}
+    if "seeds" in kwargs:
+        kwargs["seeds"] = tuple(kwargs["seeds"])
+    cfg = TrainingConfig(**kwargs)
+
+    for key, expected in (
+        ("optimizer", "adamw"),
+        ("precision", "fp32"),
+        ("grad_accumulation_steps", 1),
+    ):
+        if getattr(cfg, key) != expected:
+            raise ValueError(
+                f"training.{key} is {getattr(cfg, key)!r}; the training loop "
+                f"implements only {expected!r}"
+            )
+    if cfg.scheduler not in ("cosine", "constant"):
+        raise ValueError(f"training.scheduler {cfg.scheduler!r} is not implemented")
+    if cfg.checkpoint_selection != "best_validation_centered_cosine":
+        raise ValueError(
+            f"training.checkpoint_selection {cfg.checkpoint_selection!r} is not "
+            "implemented; selection reads validation centered cosine only"
+        )
+    if "effective_batch_pairs" in raw and raw["effective_batch_pairs"] != cfg.effective_batch_pairs:
+        raise ValueError(
+            f"training.effective_batch_pairs is {raw['effective_batch_pairs']} but "
+            f"batch_pairs x grad_accumulation_steps is {cfg.effective_batch_pairs}"
+        )
+    for key in ("loss", "supervision"):
+        if key in raw and raw[key] != _DECLARED_TRAINING_KEYS[key]:
+            raise ValueError(
+                f"training.{key} is {raw[key]!r}; the loop implements only "
+                f"{_DECLARED_TRAINING_KEYS[key]!r}"
+            )
+    return cfg
+
+
 def learning_rate_at(step: int, cfg: TrainingConfig) -> float:
     """Linear warmup then cosine decay to the frozen floor.
 
@@ -468,7 +528,11 @@ def train_fold(
                 best_step = step
                 since_improvement = 0
                 if checkpoint_path is not None:
+                    # Through a temporary name and a rename, so a SLURM job
+                    # preempted mid-save leaves the previous best checkpoint
+                    # intact rather than a torn file evaluation cannot load.
                     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                    partial = checkpoint_path.with_name(checkpoint_path.name + ".partial")
                     torch.save(
                         {
                             "model": model.state_dict(),
@@ -478,8 +542,9 @@ def train_fold(
                             "seed": seed,
                             "training_config_digest": train_cfg.digest(),
                         },
-                        checkpoint_path,
+                        partial,
                     )
+                    partial.replace(checkpoint_path)
             else:
                 since_improvement += 1
                 if since_improvement >= train_cfg.early_stopping_patience:
@@ -616,6 +681,32 @@ def run_tiny_overfit_gate(
 # Stream U step 17: input-use controls
 # ---------------------------------------------------------------------------
 
+# The fields each input-use control moves between examples, defined once for the
+# in-memory controls here and the streaming controls in lot.phase5_modes.
+SHUFFLED_FIELDS: dict[str, tuple[str, ...]] = {
+    "pose_shuffle": ("camera",),
+    "depth_shuffle": ("depth_context_aligned", "context_valid"),
+}
+
+
+def derangement(n: int, seed: int) -> np.ndarray:
+    """A permutation of range(n) with no fixed point, where n allows one.
+
+    Example i receives the moved fields of example order[i]. Defined once, so a
+    control that streams its examples draws exactly the order the in-memory
+    control draws for the same n and seed.
+    """
+    order = np.arange(n)
+    if n < 2:
+        return order
+    rng = np.random.default_rng(seed)
+    for _ in range(64):
+        rng.shuffle(order)
+        if not np.any(order == np.arange(n)):
+            return order
+    return np.roll(np.arange(n), 1)
+
+
 def shuffle_pose(
     examples: Sequence[TrainingExample], seed: int
 ) -> list[TrainingExample]:
@@ -624,32 +715,37 @@ def shuffle_pose(
     A derangement where the sample allows one, so no example keeps its own
     camera by accident and dilutes the control.
     """
-    return _permute_field(examples, "camera", seed)
+    return _permute_fields(examples, SHUFFLED_FIELDS["pose_shuffle"], seed)
 
 
 def shuffle_depth(
     examples: Sequence[TrainingExample], seed: int
 ) -> list[TrainingExample]:
-    """Permute the aligned context depth maps, holding features and cameras fixed."""
-    return _permute_field(examples, "depth_context_aligned", seed)
+    """Permute the aligned context depth maps, holding features and cameras fixed.
+
+    The context validity mask moves with the depth, because it is computed from
+    the depth and from nothing else: it marks the context tokens whose patch
+    holds no valid depth pixel. An earlier version moved the depth and left the
+    validity behind, so the attention mask still described the original depth
+    while the depth embedding saw another frame's. That is not a depth shuffle;
+    it is a depth shuffle plus a mask/depth inconsistency, and a degradation
+    under it could not be attributed to the depth alone.
+    """
+    return _permute_fields(examples, SHUFFLED_FIELDS["depth_shuffle"], seed)
 
 
-def _permute_field(
-    examples: Sequence[TrainingExample], field: str, seed: int
+def _permute_fields(
+    examples: Sequence[TrainingExample], fields: Sequence[str], seed: int
 ) -> list[TrainingExample]:
+    """Move a group of fields together under one derangement."""
     n = len(examples)
     if n < 2:
         return list(examples)
-    rng = np.random.default_rng(seed)
-    order = np.arange(n)
-    for _ in range(64):
-        rng.shuffle(order)
-        if not np.any(order == np.arange(n)):
-            break
-    else:
-        order = np.roll(np.arange(n), 1)
+    order = derangement(n, seed)
     return [
-        dataclasses.replace(example, **{field: getattr(examples[order[i]], field)})
+        dataclasses.replace(
+            example, **{field: getattr(examples[order[i]], field) for field in fields}
+        )
         for i, example in enumerate(examples)
     ]
 
@@ -660,6 +756,9 @@ class ControlResult:
     baseline_centered_cosine: float
     shuffled_centered_cosine: float
     n_pairs: int
+    # Supervised samples behind both means. A shuffle moves inputs and never the
+    # support, so the baseline and the shuffled score rest on the same samples.
+    n_samples: int = 0
 
     @property
     def degradation(self) -> float:
@@ -690,17 +789,24 @@ def run_input_use_controls(
     assert_scenes_in_role(
         fold, [e.scene for e in examples], "val", "input-use controls"
     )
-    baseline = evaluate_validation(model, examples, grid_hw, batch_pairs).centered_cosine
+    baseline = evaluate_validation(model, examples, grid_hw, batch_pairs)
     results = []
-    for name, shuffler in (("pose_shuffle", shuffle_pose), ("depth_shuffle", shuffle_depth)):
-        shuffled = shuffler(examples, seed)
-        score = evaluate_validation(model, shuffled, grid_hw, batch_pairs).centered_cosine
+    for name, fields in SHUFFLED_FIELDS.items():
+        shuffled = _permute_fields(examples, fields, seed)
+        score = evaluate_validation(model, shuffled, grid_hw, batch_pairs)
+        if score.n_samples != baseline.n_samples:
+            raise RuntimeError(
+                f"{name} changed the supervised sample count from "
+                f"{baseline.n_samples} to {score.n_samples}; a shuffle must move "
+                "inputs only, never the support"
+            )
         results.append(
             ControlResult(
                 name=name,
-                baseline_centered_cosine=baseline,
-                shuffled_centered_cosine=score,
+                baseline_centered_cosine=baseline.centered_cosine,
+                shuffled_centered_cosine=score.centered_cosine,
                 n_pairs=len(examples),
+                n_samples=baseline.n_samples,
             )
         )
     return results

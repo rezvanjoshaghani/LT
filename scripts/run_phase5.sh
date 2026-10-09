@@ -5,9 +5,9 @@
 #
 #   ./scripts/run_phase5.sh check       # Borah integration gate, no side effects
 #   ./scripts/run_phase5.sh overfit     # tiny-subset adequacy gate, a stop condition
-#   ./scripts/run_phase5.sh train       # nine (fold, seed) tasks, or use the array
+#   ./scripts/run_phase5.sh train       # nine (fold, seed) tasks, one array
 #   ./scripts/run_phase5.sh controls    # pose and depth shuffle, validation only
-#   ./scripts/run_phase5.sh evaluate    # test scenes, after checkpoints are locked
+#   ./scripts/run_phase5.sh evaluate    # test scenes, one array task per scene
 #   ./scripts/run_phase5.sh tables      # Stream AC tables
 #   ./scripts/run_phase5.sh figures     # Stream AC figures
 #   ./scripts/run_phase5.sh acceptance  # Stream AD, re-derived from artifacts
@@ -25,6 +25,18 @@
 # mismatch found by check is reported as such and resolved deliberately, as an
 # amendment with a written rationale, never by editing the design in place.
 #
+# overfit, train, controls, and evaluate are submitted to SLURM rather than run
+# here, so the launcher itself never trains or evaluates on a login node. Each
+# job's output lands under the run's evidence directory. The entry point checks
+# every mode's gate receipts again inside the job, so a job cannot run past a
+# gate that stopped standing while it waited in the queue.
+#
+# Arguments after the mode are passed to the entry point. The one in use is
+# --level, for a sensitivity or diagnostic alignment level, which the entry
+# point refuses until the primary evaluation is complete:
+#
+#   ./scripts/run_phase5.sh evaluate --level affine
+#
 # Environment:
 #   LOT_ENV            micromamba env with torch and pyarrow (default lot-encode)
 #   SLURM_ACCOUNT      required only by the modes that submit jobs
@@ -36,6 +48,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 MODE="${1:-check}"
+[ "$#" -gt 0 ] && shift
+# Passed through to the entry point. Expanded with the +-guard below because
+# bash before 4.4 treats an empty array as unset under nounset.
+EXTRA=("$@")
 LOT_ENV="${LOT_ENV:-lot-encode}"
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
 
@@ -127,6 +143,23 @@ require_overfit_passed() {
         "run './scripts/run_phase5.sh overfit' first." overfit
 }
 
+require_slurm() {
+    : "${SLURM_ACCOUNT:?set SLURM_ACCOUNT before submitting}"
+    : "${SLURM_PARTITION:?set SLURM_PARTITION before submitting}"
+}
+
+# Submit one Phase 5 job. The first argument is its output file under the
+# evidence directory, as an sbatch filename pattern: %j for a single job, %A_%a
+# for an array. The rest go to sbatch, then the template and its arguments.
+# Account and partition come from the environment only.
+submit() {
+    local output="$1"
+    shift
+    sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+        --output "$EVIDENCE_DIR/$output.txt" \
+        "$@"
+}
+
 mkdir -p "$EVIDENCE_DIR"
 
 case "$MODE" in
@@ -159,13 +192,12 @@ overfit)
     verify_freeze
     require_gate_passed
     echo
+    require_slurm
     echo "=== Stream U step 14: tiny-subset overfit gate ==="
-    set +e
-    run_lot python -m lot.phase5 --config "$CONFIG" --mode overfit \
-        2>&1 | tee "$EVIDENCE_DIR/tiny_overfit.txt"
-    status="${PIPESTATUS[0]}"
-    set -e
-    exit "$status"
+    submit tiny_overfit_%j scripts/phase5_job.sbatch "$CONFIG" overfit \
+        ${EXTRA[@]+"${EXTRA[@]}"}
+    echo "the verdict is written to $OVERFIT_RECEIPT and printed in the job's"
+    echo "output under $EVIDENCE_DIR. A FAIL is a stop: nothing after it runs."
     ;;
 
 train)
@@ -173,36 +205,39 @@ train)
     verify_freeze
     require_gate_passed
     require_overfit_passed
-    : "${SLURM_ACCOUNT:?set SLURM_ACCOUNT before submitting}"
-    : "${SLURM_PARTITION:?set SLURM_PARTITION before submitting}"
+    require_slurm
     echo "submitting nine (fold, seed) tasks"
-    sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
-        --array 0-8 scripts/phase5_train.sbatch "$CONFIG"
+    submit train_%A_%a --array 0-8 scripts/phase5_train.sbatch "$CONFIG" \
+        ${EXTRA[@]+"${EXTRA[@]}"}
     ;;
 
 controls)
+    # Validation scenes only, through every locked checkpoint. Run after all
+    # nine training tasks have finished; a missing checkpoint is reported and
+    # the job exits nonzero rather than writing a partial result as complete.
     require_clean_tree
     require_gate_passed
-    set +e
-    run_lot python -m lot.phase5 --config "$CONFIG" --mode controls \
-        2>&1 | tee "$EVIDENCE_DIR/input_use_controls.txt"
-    status="${PIPESTATUS[0]}"
-    set -e
-    exit "$status"
+    require_overfit_passed
+    require_slurm
+    submit input_use_controls_%j scripts/phase5_job.sbatch "$CONFIG" controls \
+        ${EXTRA[@]+"${EXTRA[@]}"}
     ;;
 
 evaluate)
     # The only mode that touches test scenes, and it runs after checkpoints are
     # locked. Nothing it prints may be fed back into training or selection.
+    # One array task per test scene. The range is read from the frozen folds,
+    # so it cannot disagree with the order the entry point indexes.
     require_clean_tree
     require_gate_passed
     require_overfit_passed
-    set +e
-    run_lot python -m lot.phase5 --config "$CONFIG" --mode evaluate \
-        2>&1 | tee "$EVIDENCE_DIR/evaluate.txt"
-    status="${PIPESTATUS[0]}"
-    set -e
-    exit "$status"
+    require_slurm
+    last="$(run_lot python -c 'from lot.phase5_folds import frozen_folds
+from lot.phase5_modes import evaluation_scenes
+print(len(evaluation_scenes(frozen_folds())) - 1)')"
+    echo "submitting $((last + 1)) test scenes"
+    submit evaluate_%A_%a --array "0-$last" scripts/phase5_job.sbatch "$CONFIG" evaluate \
+        ${EXTRA[@]+"${EXTRA[@]}"}
     ;;
 
 tables|figures|acceptance)

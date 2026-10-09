@@ -96,13 +96,23 @@ def _assert_identical(a, b):
     np.testing.assert_array_equal(np.isnan(aligned_a), np.isnan(aligned_b))
     finite = ~np.isnan(aligned_a)
     np.testing.assert_array_equal(aligned_a[finite], aligned_b[finite])
-    for field in ("scale", "affine_failed"):
-        if hasattr(calib_a, field):
-            got, want = getattr(calib_a, field), getattr(calib_b, field)
-            if isinstance(got, float) and np.isnan(got):
-                assert np.isnan(want)
-            else:
-                assert got == want, field
+    # Every calibration field, named by the dataclass rather than by hand. An
+    # earlier version listed "scale", which is not a field, and skipped it under
+    # a hasattr guard, so only affine_failed was ever compared and the
+    # calibration half of this proof was nearly empty.
+    import dataclasses
+
+    names = [f.name for f in dataclasses.fields(calib_a)]
+    assert names == [f.name for f in dataclasses.fields(calib_b)]
+    assert "image_scale" in names and "ratios" in names
+    for field in names:
+        got, want = getattr(calib_a, field), getattr(calib_b, field)
+        if isinstance(got, np.ndarray):
+            np.testing.assert_array_equal(got, want, err_msg=field)
+        elif isinstance(got, float) and np.isnan(got):
+            assert np.isnan(want), field
+        else:
+            assert got == want, field
 
 
 @pytest.mark.parametrize("seed", [0, 1, 7])

@@ -76,30 +76,40 @@ def base_pose() -> torch.Tensor:
     return T
 
 
+def surface_field(world: np.ndarray) -> np.ndarray:
+    """The fixture's feature field: a fixed smooth function of the world point.
+
+    world: [..., 3] world coordinates in meters. Returns [CHANNELS, ...] float64.
+    Exposed so a test can ask what the field holds at any surface point, not
+    only at the patch centers the cache samples.
+    """
+    rng = np.random.default_rng(4242)
+    out = np.zeros((CHANNELS, *world.shape[:-1]))
+    for c in range(CHANNELS):
+        k = rng.normal(size=3) * 1.4
+        out[c] = np.sin(world @ k + rng.uniform(0, 6.28))
+    return out
+
+
 def surface_features(frame: FrameRecord, depth: np.ndarray) -> np.ndarray:
-    """Features that are a fixed smooth function of the world point."""
+    """The field sampled at the frame's patch centers, as the cache stores it."""
     K = frame.K.numpy().astype(np.float64)
     T = frame.T_world_from_camera.numpy().astype(np.float64)
-    hp, wp = SIDE // 14, SIDE // 14
+    hp = SIDE // 14
     centers = np.arange(hp) * 14 + 6.5
     vv, uu = np.meshgrid(centers, centers, indexing="ij")
     d = depth.astype(np.float64)[np.rint(vv).astype(int), np.rint(uu).astype(int)]
     x = (uu - K[0, 2]) * d / K[0, 0]
     y = (vv - K[1, 2]) * d / K[1, 1]
     world = np.stack((x, y, d), axis=-1) @ T[:3, :3].T + T[:3, 3]
-    rng = np.random.default_rng(4242)
-    out = np.zeros((CHANNELS, hp, wp))
-    for c in range(CHANNELS):
-        k = rng.normal(size=3) * 1.4
-        out[c] = np.sin(world @ k + rng.uniform(0, 6.28))
-    return out.astype(np.float16)
+    return surface_field(world).astype(np.float16)
 
 
-def build_scene(root, est_transform=lambda gt: gt / EST_SCALE):
+def build_scene(root, est_transform=lambda gt: gt / EST_SCALE, scene=SCENE):
     """A full synthetic scene with feature and estimated-depth caches."""
     from PIL import Image
 
-    scene_root = root / SCENE
+    scene_root = root / scene
     (scene_root / "rgb").mkdir(parents=True)
     (scene_root / "depth").mkdir(parents=True)
     K = intrinsics_from_hfov(SIDE, SIDE, 90.0)
@@ -118,11 +128,11 @@ def build_scene(root, est_transform=lambda gt: gt / EST_SCALE):
     for frame in posed:
         index = counters.get(frame.regime, 0)
         counters[frame.regime] = index + 1
-        fid = f"{SCENE}_vp00_{frame.regime}_{index:03d}"
+        fid = f"{scene}_vp00_{frame.regime}_{index:03d}"
         Image.fromarray(rgb).save(scene_root / f"rgb/{fid}.png")
         np.save(scene_root / f"depth/{fid}.npy", depth)
         record = FrameRecord(
-            frame_id=fid, scene=SCENE, regime=frame.regime,
+            frame_id=fid, scene=scene, regime=frame.regime,
             params=dict(frame.params, viewpoint=0),
             T_world_from_camera=frame.T_world_from_camera, K=K,
             height=SIDE, width=SIDE,
@@ -134,18 +144,18 @@ def build_scene(root, est_transform=lambda gt: gt / EST_SCALE):
         est_depth[f"{fid}__conf"] = np.ones_like(depth, dtype=np.float16)
 
     manifest = Manifest(
-        scene=SCENE,
+        scene=scene,
         metadata={"depth_convention": {"raw_verdict": "planar_z", "stored_depth": "planar_z"}},
         frames=frames,
     )
     write_manifest(scene_root / "manifest.json", manifest)
     write_frame_stats(scene_root, manifest)
 
-    feature_dir = cache_dir(root / "cache", "dinov2_vitb14", SCENE)
+    feature_dir = cache_dir(root / "cache", "dinov2_vitb14", scene)
     feature_dir.mkdir(parents=True)
     np.savez(feature_dir / "features.npz", **features)
     (feature_dir / "meta.json").write_text(json.dumps({
-        "cache_version": CACHE_VERSION, "encoder": "dinov2_vitb14", "scene": SCENE,
+        "cache_version": CACHE_VERSION, "encoder": "dinov2_vitb14", "scene": scene,
         "channels": CHANNELS, "patch_size": 14, "patch_grid": [SIDE // 14, SIDE // 14],
         "image_hw": [SIDE, SIDE], "dtype": "float16", "frame_count": len(features),
         "frame_ids": [f.frame_id for f in frames], "has_depth": False,
@@ -154,11 +164,11 @@ def build_scene(root, est_transform=lambda gt: gt / EST_SCALE):
         "depth_digest": None,
     }, indent=1))
 
-    depth_dir = cache_dir(root / "cache", "vggt_1b", SCENE)
+    depth_dir = cache_dir(root / "cache", "vggt_1b", scene)
     depth_dir.mkdir(parents=True)
     np.savez(depth_dir / "depth.npz", **est_depth)
     (depth_dir / "meta.json").write_text(json.dumps({
-        "cache_version": CACHE_VERSION, "encoder": "vggt_1b", "scene": SCENE,
+        "cache_version": CACHE_VERSION, "encoder": "vggt_1b", "scene": scene,
         "channels": 2048, "patch_size": 14, "patch_grid": [SIDE // 14, SIDE // 14],
         "image_hw": [SIDE, SIDE], "dtype": "float16", "frame_count": len(frames),
         "frame_ids": [f.frame_id for f in frames], "has_depth": True,
@@ -194,7 +204,7 @@ def planar_authority() -> dict:
     }
 
 
-def run_phase3(root, cfg, analysis):
+def run_phase3(root, cfg, analysis, scene=SCENE):
     """The Phase 3 evaluation whose pair population Phase 4 inherits.
 
     Produced by the real evaluator so the inheritance check in
@@ -208,15 +218,15 @@ def run_phase3(root, cfg, analysis):
     phase3 = EvalConfig(
         experiment_name="experiment_zero", renders_root=root,
         cache_root=root / "cache", output_root=root / "p3",
-        scenes=[SCENE], encoders=["dinov2_vitb14"], seed=cfg.seed,
-        mean_vector_scenes=[SCENE],
+        scenes=[scene], encoders=["dinov2_vitb14"], seed=cfg.seed,
+        mean_vector_scenes=[scene],
     )
     mean_vector = load_or_build_mean_vector(
-        phase3.cache_root, "dinov2_vitb14", [SCENE],
+        phase3.cache_root, "dinov2_vitb14", [scene],
         phase3.output_root / phase3.experiment_name,
     )
-    rows, meta = evaluate_scene(phase3, SCENE, {"dinov2_vitb14": mean_vector}, analysis)
-    write_rows(phase3.eval_dir / f"{SCENE}.parquet", rows, meta)
+    rows, meta = evaluate_scene(phase3, scene, {"dinov2_vitb14": mean_vector}, analysis)
+    write_rows(phase3.eval_dir / f"{scene}.parquet", rows, meta)
     return phase3.eval_dir, mean_vector
 
 

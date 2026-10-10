@@ -295,8 +295,8 @@ by row against it. The 4.5 gates passed on all 18 scenes under Amendment
 A7 with the forced identity gap exactly zero at every alignment level.
 Numbers are centered cosine; the tables carry raw as well, and both
 evaluation paths. Evidence: outputs/phase4_rung1/tables/, and
-scripts/phase4_acceptance_check.py re-verifies the acceptance conditions
-from the shipped artifacts.
+scripts/phase4_acceptance_check.py, which re-verifies every acceptance
+condition from the shipped artifacts and passed all five on this run.
 
 Phase 4 accepted 2026-08-30. PLAN.md asks for the ladder's first two
 rungs plotted together and an error-localization visualization; both
@@ -455,24 +455,68 @@ the evaluation layer asserted set equality per pair at run time and the
 acceptance check re-verifies the persisted counts. Reading 0.8064 to
 0.9660 to 0.9677 as a Step 10 failure would be reading the wrong set.
 
-### Accounting, stated precisely
+### Accounting, verified rather than asserted
 
-The affine fit is computed once per context image, before any evaluation
-path, so its failures are path independent; the run records carry that
-count as affine_failed_pairs. The ladder's per-scope column is a
-different quantity, pairs the scope scored at some level and not at
-affine, which is path dependent because a level can have no scored cells
-on one path; it reads 236 on the per-point path and 215 on the splat
-path. An earlier version of this file called those fit failures, which
-was wrong.
+scripts/phase4_acceptance_check.py re-derives the following from the
+shipped parquets, their run records, the tables, and the validator
+summary. All five conditions pass.
 
-The near-zero disclosure flags 225 cells, 130 not robust, 92 small and
-sign-consistent under both paths, 3 path-sensitive in magnitude. That
-total should not be quoted as a summary: it mixes the pure-rotation
-zeros, which the protocol predicts as an invariant, with genuinely
-ambiguous small effects such as low-parallax calibrated tax. The
-acceptance check decomposes it by regime, level, and quantity, and that
-decomposition is what belongs in any write-up.
+The 4.4 invariant holds on the persisted rows, not only in the run-time
+assertion: 33,730 (pair, path) groups carry the identical
+transport-valid count across the no-alignment, scene-scale and
+image-scale levels, and none differ. That is the source set, finite and
+positive depth, which positive scaling cannot change.
+
+The affine counts separate cleanly once they are named correctly. Affine
+fits that genuinely failed, computed once per context image from depth
+and the ground-truth calibration pixels, before any evaluation path
+exists: 215 over the 18 scenes. Pairs in scope with no affine arm: 215 on
+the splat path, exactly the fit failures, and 236 on the per-point path.
+The 21-pair excess is not a fit failure. It is pairs whose fit succeeded
+and whose per-point path then scored no cells at the affine level, which
+is the landing rule of validity 5d doing its work: the fitted shift can
+move a sample off its landing. The run total over (pair, path) slots is
+453, which is 236 plus 215 exactly. An earlier version of this file, and
+of the ladder column and the figures stdout, called the path-dependent
+number a fit-failure count; it is not one.
+
+Both metrics are present over the same cells: 32 ladder cells and 248 bin
+cells in each of raw and centered, with no asymmetry. The bootstrap ran
+at the frozen settings, 1000 resamples at seed 20260825 and 0.95
+confidence, and every one of the 64 ladder rows carries both the primary
+scene interval and the secondary camera-pair interval for the depth tax,
+the oracle margin, and the retained fraction. Validator 2.3 stands at
+PASS over 930 pairs and 9,300 rows with zero mask and count mismatches
+and a worst residual of 5.07e-07 against the frozen 1e-4.
+
+### The near-zero disclosure, decomposed, is reassuring rather than alarming
+
+The 225 flagged cells should never be quoted as a total, because the
+decomposition says something quite different from the count.
+
+By quantity, 169 of the 225 are the selection differential, 55 are the
+depth tax, and 1 is an estimated margin. The selection differential being
+near the operator band in three quarters of the disclosed cells is the
+result the matched-ceiling machinery was built to produce: the population
+that survives estimated-depth validity is barely easier than the full
+co-visible set, so the taxes are not an artifact of dropping hard points.
+
+By regime, 96 of the 225 sit in pure rotation, where the depth tax is
+exactly zero by the 4.5 invariant. Those cells are labelled not robust
+because a quantity that is exactly zero has an interval containing zero;
+the label is a correct consequence of the classifier's rule and a
+misleading description of an invariant the protocol predicts. The
+classifier was not changed after seeing this, which would be tuning a
+reporting rule to the results; the decomposition is reported instead.
+
+What remains is small and is where attention belongs. Outside pure
+rotation, only 7 depth-tax cells sit near the operator band at all: 3
+under orbit at affine, 2 under orbit at image scale, and 2 under
+translation at affine. The translation depth tax at no alignment, scene
+scale and image scale never enters the disclosure, which means both
+evaluation paths put it outside the band in every reported cell. The
+headline translation result is therefore not at the scale of
+evaluation-path choice, and the cells that are have been named.
 
 ## Phase 3: Experiment Zero, corrected verdict (Stream D, 2026-08-27)
 

@@ -116,6 +116,45 @@ The templates are `scripts/phase5_train.sbatch` for the nine training tasks and
 `scripts/phase5_job.sbatch` for the other three modes. Both take the config and
 pass any further arguments to the entry point.
 
+`tables`, `figures`, and `acceptance` run after `evaluate`, inside a CPU
+allocation the operator opens with `srun`, as sections 7 to 9 show. They check
+no receipt in the launcher. The next section says why.
+
+## One commit from `check` to `evaluate`
+
+`validation/evidence/phase5/reporting_rules.md` decision 1 runs the chain once,
+at one commit E:
+
+    check -> overfit -> train -> controls -> lock -> evaluate
+
+Every receipt, training record, controls file, and evaluation record names E,
+and every mode of the chain checks its receipts against the commit it runs at.
+So **Borah must not pull new code between `check` and `evaluate`.** Do not
+pull, merge, check out, or commit in the Borah clone from the moment `check`
+starts until the last evaluation task has finished. A new commit in the middle
+stops every later mode at its receipt check, and the chain must then start
+again from `check`, which retrains everything. Sync the reporting code to
+Borah before `check`, as decision 1 requires: it is committed first.
+
+The reporting modes are the one planned exception. `tables`, `figures`, and
+`acceptance` may run at a later commit R, for instance after a fix to a figure
+is pulled. They are licensed by the evaluated run's own provenance, never by
+receipts at R, so the launcher checks no receipt for them. The entry point
+refuses a commit R unless all of these hold:
+
+- the worktree at R is clean, and E is an ancestor of R;
+- no file of decision 1's frozen class changed since E:
+  `src/lot/phase5_estimands.py`, `src/lot/paired_bootstrap.py`,
+  `src/lot/phase5_outcomes.py`, and `reporting_rules.md`;
+- no file that decides what is measured changed since E, and no file outside
+  the known classes;
+- every other reporting file changed since E is named, with its reason, in
+  `validation/evidence/phase5/post_evaluation_changes.md`, as a list item that
+  starts with the path in backticks.
+
+`lot.phase5_provenance` holds the classes. A change to tests, to evidence, or
+to a document outside those classes is allowed.
+
 ## 2. The tiny-subset overfit gate
 
     ./scripts/run_phase5.sh overfit
@@ -265,10 +304,20 @@ leaves its start alone, and reads as unfinished. Each record is its own file,
 created exclusively, because the eighteen tasks run at once on a network file
 system, where appends from several nodes can interleave or be lost.
 `reporting_rules.md` section 7 names one appended file,
-`evaluation_ledger.jsonl`. `lot.phase5_modes.build_evaluation_ledger` renders
-the directory to that file, one line per attempt, and must run once, after
-every task has ended. Whether this reading of section 7 stands is the user's
-decision to record before commit E.
+`evaluation_ledger.jsonl`, and its section 9 records this reading of it. The
+acceptance mode renders the directory to that file, one line per attempt,
+through `lot.phase5_modes.build_evaluation_ledger`, after every task has ended.
+A rerun keeps the earlier rendering.
+
+An attempt killed outright stays on the ledger as unfinished. Acceptance
+passes it when the record shows that it left nothing at the scene's path: it
+found the live parquet at its start, so it could only resume, or it started
+before the attempt that wrote the live parquet, and that attempt found no
+parquet at its start. So a task killed by the out-of-memory killer or a lost
+node, and then resubmitted as above, passes. If any attempt found another file
+at the path, a file was moved aside, and a killed attempt before it is not
+explained. Acceptance fails on any unfinished attempt the record does not
+explain.
 
 For every pair, TL-Reference and the splat arm are recomputed through Phase 4's
 code and reconciled with the accepted Phase 4 rows: masks bit for bit, scores
@@ -313,26 +362,168 @@ level, and refuses a non-primary level until every test scene has its primary
 parquet. The config also asks for the primary result to be interpreted first.
 Code cannot check that, so it is the operator's step.
 
-## 7. Tables and figures
+`reporting_rules.md` decision 4 runs this sequence under the same chain as the
+primary level. So it runs at E, under the primary run's integration and
+overfit receipts, which bind E. Run it before a reporting commit is checked
+out, or from a clean `git checkout <E>` of the Borah clone, and return to R
+for the reporting modes afterwards. Never rerun `check` or `overfit` to unlock
+it at a later commit: a level run under other gate receipts, or at another
+commit, is not the primary run's chain, and is not reported beside it.
 
-    ./scripts/run_phase5.sh tables
-    ./scripts/run_phase5.sh figures
+The reporting modes take the same argument, inside the allocation of sections 7
+to 9. Each refuses a non-primary level until the primary level's tables are
+published and verify, as the figures mode verifies them, with every file they
+name still at its sha256:
 
-Stream AC. The headline table, the formulation-reference table labelled as a
-diagnostic rather than an estimand, the operational splat-pool table, and the
-five figures. Every figure regenerates from the tables alone.
+    srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+         --ntasks=1 --cpus-per-task=4 --mem=32G --time=02:00:00 \
+         --pty ./scripts/run_phase5.sh tables --level affine
+
+Each also refuses a level whose run is not the primary run's in all but its
+level: another commit E, other digests, seeds, folds, or scenes, or other
+integration or overfit receipts, through
+`lot.phase5_provenance.require_primary_chain`. Every output's run record names
+the level's role, and Figures 1 and 2 at such a level say that the headline is
+the primary level's.
+
+The overfit gate is not rerun at a non-primary level. Its verdict at the
+primary level is reported for every level.
+
+## 7. Tables
+
+    srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+         --ntasks=1 --cpus-per-task=4 --mem=32G --time=02:00:00 \
+         --pty ./scripts/run_phase5.sh tables
+
+Stream AC, after every evaluation task has finished. Run it inside a CPU
+allocation as above. Started on the login node, the launcher refuses and
+prints this command with the arguments given. The memory and time are
+estimates for about 17,000 pairs, since the mode has not run on real
+artifacts. Check them on the first run. `--pty` ties the job to the terminal,
+so start it from `tmux` or `screen` if the connection may drop.
+
+The launcher requires a clean tree and the frozen blobs, and checks no
+receipt. It prints the run identity and the mode's output into
+`outputs/phase5_rung2/evidence/tables_{level}_{UTC time}.txt`, and exits with
+the mode's own status: 0 when the tables are published, 1 on a stop.
+
+Before it reads a row, the entry point asks
+`lot.phase5_provenance.require_evaluated_run` whether the run licenses a
+report. The eighteen parquets must be complete and be one run, bound to this
+configuration and analysis. The receipts that licensed them must verify
+against E. The lock must bind the live checkpoints, training records, and
+controls file. The code at R must be allowed to report a run evaluated at E.
+A refusal lists every field that is wrong.
+
+It writes `outputs/phase5_rung2/tables/{level}/`:
+
+- `phase5_primary.parquet`, the headline, with both methods, the floors, both
+  margins, the disclosure terms, seed spread, failures, and, at the primary
+  level, the read deficit and its flags beside delta_learn_pp;
+- `phase5_formulation.parquet`, labelled an information/formulation
+  diagnostic, not the learned-versus-explicit estimand;
+- `phase5_splat_pool.parquet`, the secondary operational target-grid
+  comparison, and `phase5_cross_path.parquet`, its cross-path terms;
+- `phase5_landing_offset.parquet` at the primary level, in the headline's
+  cells;
+- `phase5_regions.parquet`, `phase5_per_seed.parquet`, and `phase5_l2.parquet`;
+- `phase5_adequacy.parquet` and `phase5_validation_history.parquet`, from the
+  training records each run record embeds;
+- `phase5_references.parquet`, the Phase 3 ceiling and the Phase 4 depth tax
+  read from the Phase 4 parquets, with the three rungs kept apart;
+- `phase5_measured_outcome.parquet`, one outcome per regime and metric, plus
+  the pooled row, labelled a summary;
+- `phase5_near_zero.json`, every interpreted-effect cell's disclosure, and
+  `phase5_accounting.json`, what happened to every pair;
+- `MANIFEST.json`, written last, every file's sha256 with the run record.
+
+Every table carries the run record inside it. The directory is built under a
+staging name and published by one rename, so it is whole or absent. It is
+written once. To build it again, add `--supersede`: the earlier output moves to
+`tables/{level}.superseded.N`, and nothing is deleted.
+
+    srun ... --pty ./scripts/run_phase5.sh tables --supersede
 
 The landing-offset diagnostic's cells sit beside the headline, under the
 interpretation rules its pre-registration fixes: the read deficit is reported
 next to delta_learn_pp and never subtracted from it.
 
-## 8. Acceptance
+A stop here is a finding, not a defect to tune away, per CLAUDE.md. Examples
+are a supported cell without a finite interval, an estimate outside its own
+interval, seeds that disagree on an explicit field, a region split that does
+not sum to its whole, and a pair outside its regime's definition. Report it.
 
-    ./scripts/run_phase5.sh acceptance
+## 8. Figures
+
+    srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+         --ntasks=1 --cpus-per-task=4 --mem=32G --time=02:00:00 \
+         --pty ./scripts/run_phase5.sh figures
+
+After the tables, in the same kind of allocation, with its output kept in
+`evidence/figures_{level}_{UTC time}.txt`. The entry point licenses the run as
+the tables mode does. It then checks the tables against their `MANIFEST.json`
+and binds them to the run before a figure is drawn. The figures are drawn from
+the published tables alone, never from an evaluation parquet.
+
+It writes `outputs/phase5_rung2/figures/{level}/`: Figure 1, the headline gap
+against parallax; Figure 2, the gap against rotation; Figure 3, the
+formulation gap; Figure 4, the per-point and splat-pool gaps; Figure 5, the
+error regions; supplementary figure S1, every validation curve; and, at the
+primary level only, supplementary figure S2, the landing-offset curves.
+`MANIFEST.json`, written last, names each figure's sha256 and the sha256 of
+every table it was drawn from. Like the tables, the directory is written once,
+published by one rename, and built again with `--supersede`.
+
+## 9. Acceptance
+
+    srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+         --ntasks=1 --cpus-per-task=4 --mem=32G --time=02:00:00 \
+         --pty ./scripts/run_phase5.sh acceptance
 
 Stream AD step 45, re-derived from the shipped artifacts rather than asserted.
-Every condition is checked, and any failure is a stop that forbids interpreting
-the model-versus-explicit difference.
+Run it after the tables and the figures, with its output kept in
+`evidence/acceptance_{level}_{UTC time}.txt`.
+
+The entry point first asks `require_evaluated_run` whether the run licenses a
+report at all. If it does not, no verdict is written, every problem is
+printed, and the exit is 1. Past that licence, acceptance renders the
+evaluation ledger to `evidence/evaluation_ledger.jsonl`. It then re-derives
+each of the eighteen conditions of step 45, and the three that
+`reporting_rules.md` section 8 adds: every training run's validation curve is
+stable, the headline figures are present and built from the current tables,
+and the full suite is green at R. A condition that cannot be re-derived
+fails. It never passes. The verdict goes to `evidence/acceptance_{level}.json`,
+and a rerun keeps the earlier verdict as `*.superseded.N.*`, so acceptance
+takes no `--supersede`.
+
+The full suite runs inside the job, in a subprocess at R. It took about a
+quarter of an hour on a workstation, which the allocation's two hours cover.
+Condition 1 reruns `scripts/phase4_acceptance_check.py` on the accepted
+Phase 4 run, which needs `validation/evidence/reaudit/borah_check_2_3.json` in
+the clone. Condition 12
+recounts the support of a few sampled pairs from the scene inputs when the
+caches are on the node, and says so when they are not.
+
+Several conditions also read the suite's results for the test files that cover
+them. Those results count only for the tests registered at E. So each of those
+files, and `tests/conftest.py` and `tests/scenes.py`, must be unchanged since E,
+or named with its reason in `validation/evidence/phase5/post_evaluation_changes.md`
+as a reporting change is. The verdict records each file's sha256 at E and at R.
+
+The job prints every condition with its notes, then ACCEPTED or NOT
+SATISFIED. On ACCEPTED it prints the measured outcome: one outcome per regime
+and metric, plus the pooled row, labelled a summary. The verdict records it,
+each published row whole. On NOT SATISFIED the outcome is withheld, from the
+report and from the verdict, which names the failed conditions instead. Exit 0
+means every condition holds. Any failure is a stop that forbids interpreting
+the learned-versus-explicit difference.
+
+Only the primary level's verdict is the Rung 2 verdict. At a sensitivity or
+diagnostic level the job prints SATISFIED rather than ACCEPTED when every
+condition holds, says that it is not the Rung 2 verdict, and names the primary
+level, whose verdict alone decides Rung 2. Its measured outcome is printed as
+that level's, beside the primary result. `reporting_rules.md` decision 4 makes
+the affine level a sensitivity, never an acceptance condition.
 
 ## What must not happen
 
@@ -381,15 +572,27 @@ refuses every mode without its receipts, and refuses evaluate without a lock
 that matches the live files. None of the five has run on real artifacts.
 
 The outcome and wording code of `reporting_rules.md` decision 2 is implemented
-in `lot.phase5_report` and covered by `tests/test_phase5_report.py`: the call
-of each supported cell as outcome 46, 47, or 48, the near-zero qualifier, the
-outcome 49 and metric-sensitive flags, the landing-offset flags, and the
+in `lot.phase5_outcomes` and covered by `tests/test_phase5_outcomes.py`: the
+call of each supported cell as outcome 46, 47, or 48, the near-zero qualifier,
+the outcome 49 and metric-sensitive flags, the landing-offset flags, and the
 measured outcome per regime with the pooled row labelled a summary. Decision 1
-freezes it at commit E.
+freezes it at commit E, with the estimand layer and the paired bootstrap.
 
-Not yet implemented: the `tables`, `figures`, and `acceptance` modes, the rest
-of Streams AC and AD. They refuse with an explanation rather than a stack
-trace. Decision 1 of `reporting_rules.md` is what holds the chain back: the
-reporting code of its section 8 is built and committed first, and the chain
-then runs once, at one commit E. So the chain, from `check` through
-`evaluate`, does not start until these modes are committed.
+`tables`, `figures`, and `acceptance`, the rest of Streams AC and AD, are
+implemented in `lot.phase5_report`, `lot.phase5_figures`, and
+`lot.phase5_acceptance`, and licensed through `lot.phase5_provenance`. Their
+own test files build synthetic record sets of three scenes, which is what
+supported cells, the outcome calls, and every acceptance condition need. The
+end of `tests/test_phase5_modes.py` then runs the chain on fold 0 through the
+command line, under real stamped receipts and a real lock, on a test scene
+with all three regimes. It publishes the tables and figures from that genuine
+evaluation and writes an acceptance verdict of all twenty-one conditions. That
+fixture holds one test scene, so every cell is below support, and acceptance
+fails for want of the cluster's artifacts and of commit E, saying so per
+condition. The launcher's reporting branch is run with its helpers replaced,
+outside and inside an allocation. None of the three has run on real artifacts.
+
+Decision 1 of `reporting_rules.md` is what held the chain back: the reporting
+code of its section 8 is built and committed first, and the chain then runs
+once, at one commit E. Once these modes are committed, the chain can start
+at `check`.

@@ -37,12 +37,29 @@
 # checkpoint_lock_{level}.json, binds them all by sha256, and evaluate refuses
 # to start without a lock that still matches the live files.
 #
+# tables, figures, and acceptance run after evaluate, at its commit or at a
+# later one. reporting_rules.md decision 1 binds every receipt to the commit
+# the chain ran at, so the launcher checks none of them for these modes. The
+# entry point licenses each one by the evaluated run's own provenance. Each
+# hashes and reads the whole evaluated run, which is work for a compute node.
+# None needs a GPU, so each runs inside a CPU allocation and refuses to start
+# on the login node. Each run's output is kept under the evidence directory,
+# in a log named by mode, level, and time:
+#
+#   srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+#        --ntasks=1 --cpus-per-task=4 --mem=32G --time=02:00:00 \
+#        --pty ./scripts/run_phase5.sh tables
+#
 # Arguments after the mode are passed to the entry point. The one in use is
 # --level, for a sensitivity or diagnostic alignment level, which the entry
-# point refuses until the primary evaluation is complete:
+# point refuses until the primary evaluation is complete, and for the
+# reporting modes until the primary tables are published:
 #
 #   ./scripts/run_phase5.sh lock --level affine
 #   ./scripts/run_phase5.sh evaluate --level affine
+#
+# --supersede rebuilds a published tables or figures output, moving the
+# earlier one aside and deleting nothing. No other mode takes it.
 #
 # Environment:
 #   LOT_ENV            micromamba env with torch and pyarrow (default lot-encode)
@@ -302,14 +319,45 @@ print(len(evaluation_scenes(frozen_folds())) - 1)')"
     ;;
 
 tables|figures|acceptance)
+    # Streams AC and AD, reporting_rules.md decision 1. The chain ran once, at
+    # commit E, and its receipts are bound to E, so none is checked here: at a
+    # later reporting commit they would no longer describe HEAD. The entry
+    # point licenses each mode by the evaluated run's own provenance instead,
+    # through lot.phase5_provenance. That checks the receipts against E, the
+    # code changed since E, and every file the run is read from. Each mode
+    # hashes and reads the whole evaluated run, which is work for a compute
+    # node. None needs a GPU, so each runs inside a CPU allocation.
     require_clean_tree
-    require_gate_passed
-    echo "mode '$MODE' is not implemented yet." >&2
-    echo "It is part of Streams AC and AD. reporting_rules.md decision 1 requires" >&2
-    echo "the reporting code, with the outcome and wording code in" >&2
-    echo "src/lot/phase5_report.py, to be committed before the chain runs once at" >&2
-    echo "one commit E. The chain, from check through evaluate, waits for it." >&2
-    exit 2
+    verify_freeze
+    if [ -z "${SLURM_JOB_ID:-}" ]; then
+        echo "mode '$MODE' hashes and reads the whole evaluated run, so it runs inside" >&2
+        echo "a SLURM allocation and never on the login node. It needs no GPU. Run:" >&2
+        echo >&2
+        echo "    srun --account \"\$SLURM_ACCOUNT\" --partition \"\$SLURM_PARTITION\" \\" >&2
+        echo "         --ntasks=1 --cpus-per-task=4 --mem=32G --time=02:00:00 \\" >&2
+        echo "         --pty ./scripts/run_phase5.sh$(printf ' %q' "$MODE" ${EXTRA[@]+"${EXTRA[@]}"})" >&2
+        exit 1
+    fi
+    level="$(resolved_level)"
+    log="$EVIDENCE_DIR/${MODE}_${level}_$(date -u +%Y%m%dT%H%M%SZ).txt"
+    set +e
+    # The identity goes into the log first, and the mode runs only after it.
+    {
+        print_identity && echo && echo "=== Phase 5 $MODE, level $level ===" &&
+            run_lot python -m lot.phase5 --config "$CONFIG" --mode "$MODE" \
+                ${EXTRA[@]+"${EXTRA[@]}"}
+    } 2>&1 | tee "$log"
+    # The status is read from PIPESTATUS, as in check: the mode's own status,
+    # not tee's. It is 0 on a pass and 1 on a stop or a failed acceptance.
+    status="${PIPESTATUS[0]}"
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo
+        echo "$MODE did not pass at level $level. Output kept in $log" >&2
+    else
+        echo "output kept in $log"
+    fi
+    exit "$status"
     ;;
 
 *)

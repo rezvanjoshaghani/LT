@@ -19,7 +19,10 @@ hashes the receipts it just verified and passes the licence in. This module
 records what it is handed. Each of those artifacts also records when it was
 written, in UTC. Every evaluation attempt writes a start to the evaluation
 ledger before any work, and a close when it ends inside Python. An attempt
-killed outright leaves its start alone, so it is still on record.
+killed outright leaves its start alone, so it is still on record. Each
+evaluation run record also embeds its fold's training records, its controls
+entries, and the overfit verdict, so the tables need nothing beside the
+evaluation parquets. lot.phase5_provenance checks all of it against the files.
 
 The checkpoint lock, reporting_rules.md section 7, runs after the controls and
 before evaluation. This module checks what the lock binds and assembles its
@@ -36,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import itertools
 import json
 import os
@@ -110,7 +114,17 @@ REGIONS = ("all", "boundary", "interior", "low_texture", "high_texture")
 
 # The layout of the evaluation run record. Version 1 adds the provenance of
 # reporting_rules.md section 7. A record without this field predates it.
+# Version 1 also embeds the fold's training records, its controls entries, and
+# the overfit verdict, so every table is regenerable from the evaluation
+# parquets alone. No Phase 5 evaluation had run when they were added.
 PHASE5_EVAL_VERSION = 1
+
+# The overfit receipt's fields every evaluation run record carries: the
+# verdict, and the gate's own fold, level, and seed.
+OVERFIT_VERDICT_FIELDS = (
+    "passed", "reached_centered_cosine", "threshold", "steps", "n_pairs",
+    "regimes", "subset", "fold", "level", "seed",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1147,6 +1161,9 @@ def evaluation_metadata(
     - written_utc, when this record was assembled, just before the write.
 
     The pairs with no arm are in the audit, as no_arm_pairs.
+
+    Three more entries make every table regenerable from the evaluation
+    parquets alone, as CLAUDE.md requires. See embedded_evidence.
     """
     from .phase5_folds import fold_digest, frozen_folds
 
@@ -1159,6 +1176,7 @@ def evaluation_metadata(
             "commit": record.get("commit"),
             "config_digest": record.get("config_digest"),
         }
+    embedded = embedded_evidence(cfg, run_dir, level, fold, seeds, training_records)
 
     return {
         "phase": 5,
@@ -1185,6 +1203,98 @@ def evaluation_metadata(
         "aligned_depth_digest": aligned_depth_digest,
         "environment": environment_identity(),
         "written_utc": utc_timestamp(),
+        **embedded,
+    }
+
+
+def _read_bound_json(path: Path) -> tuple[str, Any]:
+    """A JSON file's sha256 and its content, from one read of its bytes."""
+    data = Path(path).read_bytes()
+    return hashlib.sha256(data).hexdigest(), json.loads(data.decode("utf-8"))
+
+
+def embedded_evidence(
+    cfg: Phase5Config,
+    run_dir: Path,
+    level: str,
+    fold: Fold,
+    seeds: Sequence[int],
+    training_records: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """What an evaluation run record embeds beyond its provenance.
+
+    CLAUDE.md requires every table and figure to be regenerable from the
+    evaluation parquets alone. The training-adequacy table, the validation
+    curves, and the controls read files beside the run, so each run record
+    carries their content for its fold:
+
+    - training_record_contents, each seed's training record whole, keyed by
+      seed. training_records names each by sha256, and the bytes embedded
+      must be the bytes it names, or a record changed between the two reads;
+    - controls, the controls file's entries for this fold's (fold, seed)
+      keys: each result and the sha256 of the checkpoint it ran on, with the
+      file's own sha256 and written_utc;
+    - overfit_verdict, the overfit receipt's OVERFIT_VERDICT_FIELDS, with the
+      receipt's sha256.
+
+    Each file is read where the command line writes it. The command line
+    verified the receipts and the lock before evaluating, so a file that is
+    absent now, or lacks this fold's entries, moved under the run. A record
+    without it could never be reported, so it raises instead.
+    """
+    contents: dict[str, Any] = {}
+    for seed in seeds:
+        path = training_record_path(run_dir, level, fold.index, seed)
+        sha, record = _read_bound_json(path)
+        if sha != training_records[str(seed)]["sha256"]:
+            raise ValueError(
+                f"{path} changed while this run record was assembled: it hashed to "
+                f"{training_records[str(seed)]['sha256']} and then to {sha}"
+            )
+        contents[str(seed)] = record
+
+    controls_file = controls_path(cfg.evidence_dir, level)
+    if not controls_file.exists():
+        raise FileNotFoundError(
+            f"no controls file at {controls_file}; the evaluation run record embeds "
+            "the controls entries of its fold, and the lock bound that file"
+        )
+    controls_sha, controls = _read_bound_json(controls_file)
+    controls = controls if isinstance(controls, dict) else {}
+    keys = [fold_seed_key(fold.index, seed) for seed in seeds]
+    results = controls.get("results") if isinstance(controls.get("results"), dict) else {}
+    hashes = (controls.get("checkpoints")
+              if isinstance(controls.get("checkpoints"), dict) else {})
+    absent = [key for key in keys if key not in results or key not in hashes]
+    if absent:
+        raise ValueError(
+            f"the controls file {controls_file} has no result or checkpoint hash for "
+            f"{absent}, so this fold's controls cannot be embedded"
+        )
+
+    # Where the command line writes the overfit receipt and verifies it.
+    overfit_file = Path(cfg.evidence_dir) / "tiny_overfit.json"
+    if not overfit_file.exists():
+        raise FileNotFoundError(
+            f"no overfit receipt at {overfit_file}; the evaluation run record "
+            "embeds its verdict"
+        )
+    overfit_sha, receipt = _read_bound_json(overfit_file)
+    if not isinstance(receipt, dict):
+        raise ValueError(f"{overfit_file} does not hold one receipt")
+
+    return {
+        "training_record_contents": contents,
+        "controls": {
+            "sha256": controls_sha,
+            "written_utc": controls.get("written_utc"),
+            "results": {key: results[key] for key in keys},
+            "checkpoints": {key: hashes[key] for key in keys},
+        },
+        "overfit_verdict": {
+            "sha256": overfit_sha,
+            **{field: receipt.get(field) for field in OVERFIT_VERDICT_FIELDS},
+        },
     }
 
 
@@ -1406,8 +1516,8 @@ def resume_problems(
 # created exclusively, and nothing is ever appended or overwritten.
 # read_evaluation_ledger reads the directory back as the one ledger it is.
 # build_evaluation_ledger renders it to the file the rule names, one line per
-# attempt, written once by a single writer after every task has ended. Whether
-# this reading of section 7 stands is for the user to confirm before commit E.
+# attempt, written once by a single writer after every task has ended.
+# reporting_rules.md section 9 records this reading of section 7.
 #
 # An attempt begins when run_evaluate_scene is entered for one scene and level.
 # A refusal before that, by a receipt, the lock, the level, or the scene index,
@@ -1417,17 +1527,11 @@ def resume_problems(
 #
 # An attempt writes two records under one attempt id: a start before any work,
 # and a close when it ends inside Python. A start with no close is an attempt
-# that was killed outright. What acceptance is to read from the ledger, once
-# Stream AD is built:
-#
-# - every start is an attempt, and every unfinished one is listed;
-# - an evaluation is a written close;
-# - each scene and level has exactly one written close, and its parquet sha256
-#   is the live parquet's;
-# - a live parquet that no written close names is reported, never passed.
-#   An unfinished attempt, or an error close that names the parquet's sha256,
-#   whose start precedes the parquet's written_utc may be reported as the
-#   attempt that wrote it.
+# that was killed outright, and is listed as unfinished. What acceptance reads
+# from the ledger is lot.phase5_acceptance.ledger_problems, under
+# reporting_rules.md sections 7 and 9. Its docstring states each rule: every
+# start is an attempt, an evaluation is a written close, and each scene and
+# level has exactly one attempt on record as having written its live parquet.
 
 LEDGER_EVENT = "evaluate"
 LEDGER_STARTED = "started"

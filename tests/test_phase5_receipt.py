@@ -676,3 +676,117 @@ def test_the_command_line_verifier_checks_a_lock(tmp_path, capsys):
         main(arguments)
     assert stop.value.code == 1
     assert "checkpoint fold0_seed0 changed" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The identity-parameterized core, reporting_rules.md decision 1
+# ---------------------------------------------------------------------------
+#
+# The reporting modes run at a commit R after the chain ran at E. They verify
+# the receipts that licensed E against E's identity, never against HEAD's.
+# verify is the HEAD-bound wrapper over that core, and its behaviour is the
+# one every test above pins.
+
+# The commit of a run evaluated before the checkout under test.
+EVALUATED_AT = "e" * 40
+
+
+def test_verify_is_the_core_bound_to_the_current_identity(tmp_path):
+    from lot.phase5_receipt import verify_against
+
+    for passed in (True, False):
+        for overrides in ({}, {"commit": EVALUATED_AT}, {"fold_digest": "moved"}):
+            path = _receipt(tmp_path, passed=passed, **overrides)
+            assert verify(path, CONFIG, "gate") == verify_against(
+                path, CONFIG, "gate", current_identity(CONFIG), reference="current"
+            )
+
+
+def test_verify_against_binds_the_identity_it_is_given(tmp_path):
+    """A receipt stamped at E stands against E's identity and fails against HEAD's."""
+    from lot.phase5_receipt import KIND_OVERFIT, verify_against
+
+    gate = _gate_file(tmp_path)
+    receipt = _overfit_receipt(tmp_path, gate, commit=EVALUATED_AT)
+    at_e = {**current_identity(CONFIG), "commit": EVALUATED_AT}
+    assert verify_against(receipt, CONFIG, "overfit", at_e, kind=KIND_OVERFIT,
+                          gate_receipt=gate) == []
+    problems = verify(receipt, CONFIG, "overfit", kind=KIND_OVERFIT, gate_receipt=gate)
+    assert any("commit moved since the receipt was written" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("field", BOUND_FIELDS)
+def test_verify_against_names_the_field_and_the_identity_it_used(tmp_path, field):
+    from lot.phase5_receipt import verify_against
+
+    expected = {**current_identity(CONFIG), field: "something-else"}
+    problems = verify_against(_receipt(tmp_path), CONFIG, "gate", expected,
+                              reference="evaluated run")
+    assert field in problems[0], problems
+    assert "evaluated run: something-else" in problems[0], problems
+
+
+def test_verify_against_needs_every_bound_field(tmp_path):
+    """An identity that leaves a field out would leave that field unbound."""
+    from lot.phase5_receipt import verify_against
+
+    expected = current_identity(CONFIG)
+    expected.pop("fold_digest")
+    with pytest.raises(ValueError, match="fold_digest"):
+        verify_against(_receipt(tmp_path), CONFIG, "gate", expected)
+
+
+def test_verify_against_checks_a_lock_like_verify(tmp_path):
+    """The lock's bindings and its files are the core's, whichever identity it is given."""
+    from lot.phase5_receipt import KIND_LOCK, verify_against
+
+    lock = _lock(tmp_path)
+    identity = current_identity(lock["config"])
+    arguments = {"kind": KIND_LOCK, "gate_receipt": lock["gate"],
+                 "overfit_receipt": lock["overfit"], "level": LOCK_LEVEL}
+    assert verify_against(lock["lock"], lock["config"], "lock", identity, **arguments) == []
+    checkpoint = Path(lock["report"]["checkpoints"]["fold1_seed1"]["path"])
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"x")
+    problems = verify_against(lock["lock"], lock["config"], "lock", identity, **arguments)
+    assert problems == _verify_lock(lock)
+    assert len(problems) == 1 and "checkpoint fold1_seed1 changed" in problems[0]
+
+
+# The overfit verdict exactly as lot.phase5_modes.run_overfit returns it and the
+# overfit mode stamps it. Its "steps" is the optimizer step count, an int, and
+# not the integration gate's list of step records.
+OVERFIT_RESULT = {
+    "passed": True, "reached_centered_cosine": 0.9917, "threshold": 0.98, "steps": 1460,
+    "n_pairs": 8, "regimes": ["rotation", "translation", "orbit"], "fold": 0,
+    "level": "image", "seed": 0,
+    "subset": [{"scene": "apartment_1", "context_frame_id": "000",
+                "target_frame_id": "004", "regime": "rotation", "n_supported": 812}],
+}
+
+
+def test_the_overfit_receipt_the_overfit_mode_writes_verifies(tmp_path):
+    """Every receipt in the suite above had no "steps" key, so none showed that
+    reading the identity iterated the overfit step count as gate steps and
+    raised TypeError. That would have stopped train at its receipt check after
+    a passing overfit gate."""
+    from lot.phase5_receipt import KIND_OVERFIT, receipt_identity, stamp_receipt, verify_against
+
+    gate = _gate_file(tmp_path)
+    report = stamp_receipt(OVERFIT_RESULT, CONFIG, KIND_OVERFIT, gate_receipt=gate)
+    receipt = tmp_path / "tiny_overfit.json"
+    receipt.write_text(json.dumps(report), encoding="utf-8")
+    assert receipt_identity(report) == current_identity(CONFIG)
+    assert verify(receipt, CONFIG, "overfit", kind=KIND_OVERFIT, gate_receipt=gate) == []
+    assert verify_against(receipt, CONFIG, "overfit", current_identity(CONFIG),
+                          kind=KIND_OVERFIT, gate_receipt=gate) == []
+    # A step count is never read as evidence, and an identity in real gate
+    # steps still is.
+    assert receipt_identity({"steps": 3, "commit": "c"}) == {"commit": "c"}
+    assert receipt_identity({"steps": [7, {"evidence": {"commit": "s"}}]}) == {"commit": "s"}
+
+
+def test_an_unreadable_receipt_is_refused_before_any_identity_is_read(tmp_path):
+    """verify reads the receipt first, so a configuration it cannot load does not
+    turn a missing receipt into an exception."""
+    problems = verify(tmp_path / "absent.json", tmp_path / "no_config.yaml", "gate")
+    assert len(problems) == 1 and "could not be read" in problems[0]

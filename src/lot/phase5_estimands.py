@@ -32,6 +32,12 @@ The headline estimand is
 and it is the only quantity that may be called the learned-versus-explicit
 transformation limitation. The Phase 4 target-lift score is never substituted
 into it; a helper below raises if a caller tries.
+
+The end of the module holds what the reporting tables read, added before
+commit E so it freezes with the rest: the public interval with its replicate
+count, the disclosure terms with theirs, the comparison-weighted diagnostic,
+the region contrasts, and the L2 companions. None of them changes a quantity,
+a population, or a wording.
 """
 
 from __future__ import annotations
@@ -722,18 +728,21 @@ def _count_field_for(population: str) -> str:
     }[population]
 
 
-def _interval_for(
+def _population_interval(
     records: Sequence[dict],
-    quantity: str,
-    metric: str,
+    population: str,
+    formula: Callable[[dict[str, float]], float],
     analysis: AnalysisConfig,
     unit: str,
 ) -> tuple[dict[str, Any], SupportCounts]:
-    """One quantity's paired interval on its own population, without disclosure."""
-    population = QUANTITY_POPULATION[quantity]
+    """A statistic's paired interval over the records that hold its population.
+
+    A record contributes when its population count is above zero. The
+    statistic reads that population's score fields, so one scene draw serves
+    every field it reads.
+    """
     fields = _fields_for(population)
     count_field = _count_field_for(population)
-    formula = quantity_formulas(metric)[quantity]
     contributing = [
         r for r in records
         if isinstance(r.get(count_field), (int, float)) and (r.get(count_field) or 0) > 0
@@ -746,6 +755,19 @@ def _interval_for(
         unit=unit,
     )
     return interval, support_counts(contributing, count_field)
+
+
+def _interval_for(
+    records: Sequence[dict],
+    quantity: str,
+    metric: str,
+    analysis: AnalysisConfig,
+    unit: str,
+) -> tuple[dict[str, Any], SupportCounts]:
+    """One quantity's paired interval on its own population, without disclosure."""
+    population = QUANTITY_POPULATION[quantity]
+    formula = quantity_formulas(metric)[quantity]
+    return _population_interval(records, population, formula, analysis, unit)
 
 
 def evaluate_quantity(
@@ -893,4 +915,447 @@ def three_rung_decomposition(
             "n_replicates": delta_learn_pp.n_replicates,
             "supported": delta_learn_pp.supported,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# What the reporting tables read. Added before commit E, so they freeze with
+# the rest of this module. None of them changes a quantity, a population, or
+# a wording above. Each is a public form of what evaluate_quantity already
+# computes, or a quantity the tables need beside it.
+# ---------------------------------------------------------------------------
+
+def population_fields(population: str) -> tuple[str, ...]:
+    """The score fields every interval on one population reads."""
+    return _fields_for(population)
+
+
+def population_count_field(population: str) -> str:
+    """The count field that decides which records hold one population.
+
+    A record contributes to a cell on the population when this count is
+    above zero. The read deficit's population is its near-grid bin's.
+    """
+    return _count_field_for(population)
+
+
+# The L2 companions. PROTOCOL 3.7 pairs every cosine with an L2 distance on
+# unit-normalized features, and CLAUDE.md requires every reported metric to
+# carry both. Lower is closer. Each difference is named for its sign: positive
+# means the first-named method is farther from the target. So
+# l2_predict_minus_cl has the sign of delta_learn_pp, and l2_nowarp_minus_cl
+# the sign of cl_margin.
+#
+# The L2 quantities live in their own registry, apart from the cosine one.
+# None is an interpreted effect, and evaluate_quantity, the only path to
+# near-zero wording, refuses an L2 metric. PROTOCOL 3.9 calibrates the 0.003
+# band on cosine, so no L2 cell is worded.
+L2_METRICS = ("l2_raw", "l2_centered")
+
+
+def l2_quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], float]]:
+    """Every L2 companion as a closed form over one replicate's field means.
+
+    metric is 'l2_raw' or 'l2_centered'. The Mean-Feature floor exists under
+    l2_raw only, as its cosine exists under raw only, per PROTOCOL 3.7.
+    """
+    if metric not in L2_METRICS:
+        raise ValueError(f"an L2 metric is l2_raw or l2_centered, got {metric!r}")
+    m = metric
+    forms = {
+        # Primary per-point support, V_P5_pp.
+        "l2_cl_transport": lambda v: v[f"cl_{m}"],
+        "l2_predict_with_depth": lambda v: v[f"predict_{m}"],
+        "l2_no_warp_copy": lambda v: v[f"nowarp_{m}"],
+        "l2_predict_minus_cl": lambda v: v[f"predict_{m}"] - v[f"cl_{m}"],
+        "l2_nowarp_minus_cl": lambda v: v[f"nowarp_{m}"] - v[f"cl_{m}"],
+        "l2_nowarp_minus_predict": lambda v: v[f"nowarp_{m}"] - v[f"predict_{m}"],
+        # The formulation diagnostic's support, V_form.
+        "l2_tl_reference": lambda v: v[f"tl_form_{m}"],
+        "l2_cl_on_formulation_support": lambda v: v[f"cl_form_{m}"],
+        "l2_no_warp_copy_form": lambda v: v[f"nowarp_form_{m}"],
+        "l2_cl_form_minus_tl_form": lambda v: v[f"cl_form_{m}"] - v[f"tl_form_{m}"],
+        # The splat-pool support, V_sp.
+        "l2_sp_transport": lambda v: v[f"sp_transport_{m}"],
+        "l2_sp_predict": lambda v: v[f"sp_predict_{m}"],
+        "l2_sp_no_warp_copy": lambda v: v[f"sp_nowarp_{m}"],
+        "l2_sp_predict_minus_transport": (
+            lambda v: v[f"sp_predict_{m}"] - v[f"sp_transport_{m}"]
+        ),
+        "l2_sp_nowarp_minus_transport": (
+            lambda v: v[f"sp_nowarp_{m}"] - v[f"sp_transport_{m}"]
+        ),
+        "l2_sp_nowarp_minus_predict": lambda v: v[f"sp_nowarp_{m}"] - v[f"sp_predict_{m}"],
+    }
+    if m == "l2_raw":
+        forms["l2_mean_feature"] = lambda v: v["meanfeat_l2_raw"]
+        forms["l2_mean_feature_form"] = lambda v: v["meanfeat_form_l2_raw"]
+        forms["l2_sp_mean_feature"] = lambda v: v["sp_meanfeat_l2_raw"]
+    return forms
+
+
+# Which population each L2 companion is defined on, in table order.
+L2_QUANTITY_POPULATION = {
+    "l2_cl_transport": PER_POINT,
+    "l2_predict_with_depth": PER_POINT,
+    "l2_no_warp_copy": PER_POINT,
+    "l2_mean_feature": PER_POINT,
+    "l2_predict_minus_cl": PER_POINT,
+    "l2_nowarp_minus_cl": PER_POINT,
+    "l2_nowarp_minus_predict": PER_POINT,
+    "l2_tl_reference": FORMULATION,
+    "l2_cl_on_formulation_support": FORMULATION,
+    "l2_no_warp_copy_form": FORMULATION,
+    "l2_mean_feature_form": FORMULATION,
+    "l2_cl_form_minus_tl_form": FORMULATION,
+    "l2_sp_transport": SPLAT_POOL,
+    "l2_sp_predict": SPLAT_POOL,
+    "l2_sp_no_warp_copy": SPLAT_POOL,
+    "l2_sp_mean_feature": SPLAT_POOL,
+    "l2_sp_predict_minus_transport": SPLAT_POOL,
+    "l2_sp_nowarp_minus_transport": SPLAT_POOL,
+    "l2_sp_nowarp_minus_predict": SPLAT_POOL,
+}
+
+
+def quantity_population(quantity: str, metric: str) -> str:
+    """The population a quantity is defined on, under one metric.
+
+    Cosine quantities are read from QUANTITY_POPULATION and L2 companions
+    from L2_QUANTITY_POPULATION. A quantity that is not defined under the
+    metric's registry raises ValueError naming it.
+    """
+    if metric in L2_METRICS:
+        registry = L2_QUANTITY_POPULATION
+    elif metric in ("raw", "centered"):
+        registry = QUANTITY_POPULATION
+    else:
+        raise ValueError(f"unknown metric {metric!r}")
+    if quantity not in registry:
+        raise ValueError(f"{quantity!r} is not a quantity under metric {metric!r}")
+    return registry[quantity]
+
+
+def _formula_for(quantity: str, metric: str) -> Callable[[dict[str, float]], float]:
+    forms = l2_quantity_formulas(metric) if metric in L2_METRICS else quantity_formulas(metric)
+    if quantity not in forms:
+        raise ValueError(f"{quantity!r} is not defined under metric {metric!r}")
+    return forms[quantity]
+
+
+def quantity_interval(
+    records: Sequence[dict],
+    quantity: str,
+    metric: str,
+    analysis: AnalysisConfig,
+    unit: str = "scene",
+) -> tuple[dict[str, Any], SupportCounts]:
+    """One quantity's paired interval on its own population, and its support.
+
+    The public form of the interval evaluate_quantity reports, without the
+    near-zero disclosure. unit 'scene' is PROTOCOL 3.4's primary interval and
+    'camera_pair' its secondary one. For the camera-pair unit every record
+    carries a camera_pair key. Under an L2 metric the quantity is an L2
+    companion, read through l2_quantity_formulas.
+
+    The interval holds the estimate, lo, hi, n_units, and n_replicates, the
+    number of draws in which the quantity was defined.
+    """
+    if metric in L2_METRICS:
+        population = quantity_population(quantity, metric)
+        return _population_interval(
+            records, population, _formula_for(quantity, metric), analysis, unit
+        )
+    return _interval_for(records, quantity, metric, analysis, unit)
+
+
+def _term(name: str, interval: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "quantity": name,
+        "estimate": interval["estimate"],
+        "lo": interval["lo"],
+        "hi": interval["hi"],
+        "n_units": interval["n_units"],
+        "n_replicates": interval["n_replicates"],
+    }
+
+
+def disclosure_terms(
+    records: Sequence[dict],
+    quantity: str,
+    metric: str,
+    analysis: AnalysisConfig,
+    unit: str = "scene",
+) -> dict[str, Any]:
+    """Every term of one interpreted effect's disclosure, with its replicates.
+
+    evaluate_quantity returns each term's estimate and interval inside the
+    cell's disclosure. This returns the same terms, computed by the same
+    calls, with what the disclosure leaves out: each term's n_replicates and
+    n_units, the reported effect's own support, and the support of the
+    cross-path common cells the terms rest on.
+
+    - reported: the effect on its own population, with its support counts;
+    - per_point, splat_pool, path_difference: the three cross-path terms,
+      each named by its quantity, for an effect with a second path;
+    - cross_path_support: n_scenes, n_camera_pairs, n_feature_comparisons,
+      and whether the shared cells meet the frozen support thresholds.
+
+    A quantity with no second path by construction has per_point equal to the
+    reported effect, and None for the rest, as its disclosure does. A
+    quantity that is not an interpreted effect has no disclosure terms and
+    raises ValueError.
+    """
+    if quantity not in INTERPRETED_EFFECTS:
+        raise ValueError(
+            f"{quantity!r} is not an interpreted effect, so PROTOCOL 3.9's disclosure "
+            "has no terms for it"
+        )
+    pair = DISCLOSURE_PAIR.get(quantity)
+    if pair is None and quantity not in SINGLE_PATH_BY_CONSTRUCTION:
+        raise ValueError(
+            f"{quantity} is an interpreted effect with no disclosure pair and is "
+            "not declared single-path by construction"
+        )
+    interval, counts = _interval_for(records, quantity, metric, analysis, unit)
+    out: dict[str, Any] = {
+        "quantity": quantity,
+        "metric": metric,
+        "unit": unit,
+        "reported": {
+            **_term(quantity, interval),
+            "population": QUANTITY_POPULATION[quantity],
+            "n_scenes": counts.n_scenes,
+            "n_camera_pairs": counts.n_camera_pairs,
+            "n_feature_comparisons": counts.n_feature_comparisons,
+            "supported": counts.is_supported(analysis),
+        },
+        "per_point": None,
+        "splat_pool": None,
+        "path_difference": None,
+        "cross_path_support": None,
+    }
+    if pair is None:
+        out["per_point"] = _term(quantity, interval)
+        return out
+    pp_name, sp_name, diff_name = pair
+    pp, cross = _interval_for(records, pp_name, metric, analysis, unit)
+    sp, _ = _interval_for(records, sp_name, metric, analysis, unit)
+    diff, _ = _interval_for(records, diff_name, metric, analysis, unit)
+    out["per_point"] = _term(pp_name, pp)
+    out["splat_pool"] = _term(sp_name, sp)
+    out["path_difference"] = _term(diff_name, diff)
+    out["cross_path_support"] = {
+        "n_scenes": cross.n_scenes,
+        "n_camera_pairs": cross.n_camera_pairs,
+        "n_feature_comparisons": cross.n_feature_comparisons,
+        "supported": cross.is_supported(analysis),
+    }
+    return out
+
+
+def comparison_weighted(records: Sequence[dict], quantity: str, metric: str) -> float:
+    """PROTOCOL 3.4's comparison-weighted diagnostic for one quantity.
+
+    Each field's mean is weighted by the record's count of feature
+    comparisons on the quantity's population, its count field, and the
+    quantity's closed form is applied to those means. A record outside the
+    population carries no weight. It is a diagnostic shown beside the
+    estimate, never the estimate: the estimand is the unweighted mean over
+    camera pairs.
+
+    The read deficit has none. Its two terms rest on different counts, the
+    near-grid bin and the whole diagnostic support, so no one weight
+    describes it, and asking raises ValueError.
+    """
+    population = quantity_population(quantity, metric)
+    if population == READ_DEFICIT:
+        raise ValueError(
+            f"{quantity!r} is read on the read_deficit population, whose two terms "
+            "rest on different counts, so it has no comparison-weighted value"
+        )
+    formula = _formula_for(quantity, metric)
+    fields = _fields_for(population)
+    count_field = _count_field_for(population)
+    totals = dict.fromkeys(fields, 0.0)
+    weights = dict.fromkeys(fields, 0.0)
+    for record in records:
+        weight = record.get(count_field)
+        if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                or not math.isfinite(weight) or weight <= 0):
+            continue
+        for field in fields:
+            value = record.get(field)
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                totals[field] += float(value) * weight
+                weights[field] += weight
+    means = {
+        field: (totals[field] / weights[field] if weights[field] else float("nan"))
+        for field in fields
+    }
+    return float(formula(means))
+
+
+# The region contrasts of Stream Z, specification steps 31 and 32: boundary
+# minus interior, and low minus high texture. Each is a difference between two
+# regions of the same pairs, so a pair contributes only when it holds both
+# regions, and the difference is recomputed inside each replicate from one
+# scene draw. No near-zero wording applies to a contrast. reporting_rules.md
+# section 6 registers none, and PROTOCOL 3.9's two paths do not define one.
+REGION_CONTRASTS = {
+    "boundary_minus_interior": ("boundary", "interior"),
+    "low_minus_high_texture": ("low_texture", "high_texture"),
+}
+# The populations a region contrast is read on. Both carry per-region records.
+CONTRAST_POPULATIONS = (PER_POINT, SPLAT_POOL)
+
+
+def contrast_field(field: str, region: str) -> str:
+    """A field of one region, as a pivoted contrast record names it."""
+    return f"{field}@{region}"
+
+
+def _positive_count(value: Any) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value) and value > 0)
+
+
+def pivot_regions(
+    records: Sequence[dict], contrast: str, population: str
+) -> list[dict[str, Any]]:
+    """One record per camera pair that holds both regions of a contrast.
+
+    records are per-region records, each with scene, camera_pair, and region.
+    Records of other regions are ignored. A pair contributes only when both
+    regions' records exist and both have a positive count on the population,
+    so the two sides of the contrast average over one set of pairs.
+
+    Each pivoted record carries scene, camera_pair, every field of the
+    population under both regions as contrast_field names it, each region's
+    count, and the population's count field as the sum of the two: the
+    comparisons the contrast rests on. Pairs come in sorted order. A region
+    record seen twice for one pair raises ValueError.
+    """
+    if contrast not in REGION_CONTRASTS:
+        raise ValueError(
+            f"unknown contrast {contrast!r}; the registered contrasts are "
+            f"{sorted(REGION_CONTRASTS)}"
+        )
+    if population not in CONTRAST_POPULATIONS:
+        raise ValueError(
+            f"a region contrast is read on the {CONTRAST_POPULATIONS} populations, "
+            f"not on population {population!r}"
+        )
+    left, right = REGION_CONTRASTS[contrast]
+    fields = _fields_for(population)
+    count_field = _count_field_for(population)
+    by_pair: dict[str, dict[str, dict]] = {}
+    for record in records:
+        region = record.get("region")
+        if region not in (left, right):
+            continue
+        slot = by_pair.setdefault(record["camera_pair"], {})
+        if region in slot:
+            raise ValueError(
+                f"camera pair {record['camera_pair']!r} holds its {region} record twice"
+            )
+        slot[region] = record
+    pivot: list[dict[str, Any]] = []
+    for pair in sorted(by_pair):
+        slot = by_pair[pair]
+        if left not in slot or right not in slot:
+            continue
+        a, b = slot[left], slot[right]
+        if not (_positive_count(a.get(count_field)) and _positive_count(b.get(count_field))):
+            continue
+        if a["scene"] != b["scene"]:
+            raise ValueError(
+                f"camera pair {pair!r} names scene {a['scene']!r} in {left} and "
+                f"{b['scene']!r} in {right}"
+            )
+        record: dict[str, Any] = {
+            "scene": a["scene"],
+            "camera_pair": pair,
+            count_field: a[count_field] + b[count_field],
+            contrast_field(count_field, left): a[count_field],
+            contrast_field(count_field, right): b[count_field],
+        }
+        for field in fields:
+            record[contrast_field(field, left)] = a.get(field)
+            record[contrast_field(field, right)] = b.get(field)
+        pivot.append(record)
+    return pivot
+
+
+def evaluate_contrast(
+    pivot: Sequence[dict],
+    contrast: str,
+    quantity: str,
+    metric: str,
+    analysis: AnalysisConfig,
+    unit: str = "scene",
+) -> dict[str, Any]:
+    """One region contrast of a quantity, with its paired interval and support.
+
+    The statistic is the quantity on the left region minus the quantity on
+    the right region, both read from one replicate's field means, so the
+    contrast is paired through lot.paired_bootstrap.paired_interval. pivot
+    comes from pivot_regions on the quantity's own population, which must be
+    per-point or splat-pool. Support is counted on the both-region pairs.
+    The contrast carries no near-zero wording.
+    """
+    if contrast not in REGION_CONTRASTS:
+        raise ValueError(
+            f"unknown contrast {contrast!r}; the registered contrasts are "
+            f"{sorted(REGION_CONTRASTS)}"
+        )
+    population = quantity_population(quantity, metric)
+    if population not in CONTRAST_POPULATIONS:
+        raise ValueError(
+            f"{quantity!r} is on population {population!r}, which has no region contrast"
+        )
+    formula = _formula_for(quantity, metric)
+    left, right = REGION_CONTRASTS[contrast]
+    fields = _fields_for(population)
+    count_field = _count_field_for(population)
+    markers = (contrast_field(count_field, left), contrast_field(count_field, right))
+    for record in pivot:
+        if not all(marker in record for marker in markers):
+            raise ValueError(
+                f"the pivot was not built on population {population!r}, which "
+                f"{quantity!r} is defined on"
+            )
+    left_fields = [contrast_field(field, left) for field in fields]
+    right_fields = [contrast_field(field, right) for field in fields]
+
+    def statistic(means: dict[str, float]) -> float:
+        on_left = {field: means[name] for field, name in zip(fields, left_fields)}
+        on_right = {field: means[name] for field, name in zip(fields, right_fields)}
+        return formula(on_left) - formula(on_right)
+
+    interval = paired_interval(
+        pivot, left_fields + right_fields, statistic,
+        resamples=analysis.bootstrap_resamples,
+        seed=analysis.bootstrap_seed,
+        confidence=analysis.bootstrap_confidence,
+        unit=unit,
+    )
+    counts = support_counts(pivot, count_field)
+    return {
+        "contrast": contrast,
+        "quantity": quantity,
+        "metric": metric,
+        "unit": unit,
+        "population": population,
+        "left": left,
+        "right": right,
+        "estimate": interval["estimate"],
+        "lo": interval["lo"],
+        "hi": interval["hi"],
+        "n_units": interval["n_units"],
+        "n_replicates": interval["n_replicates"],
+        "n_scenes": counts.n_scenes,
+        "n_camera_pairs": counts.n_camera_pairs,
+        "n_feature_comparisons": counts.n_feature_comparisons,
+        "supported": counts.is_supported(analysis),
     }

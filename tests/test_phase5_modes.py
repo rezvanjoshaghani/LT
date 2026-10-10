@@ -115,10 +115,19 @@ def _ledger(world) -> Path:
 @pytest.fixture(scope="module")
 def world(tmp_path_factory):
     """Three scenes on disk, and real Phase 3 and Phase 4 runs on the test one."""
+    return _build_world(tmp_path_factory.mktemp("phase5"))
+
+
+def _build_world(root: Path, orbit_azimuths_deg=()) -> dict:
+    """The world's three scenes under root, with genuine Phase 3 and Phase 4 runs.
+
+    orbit_azimuths_deg adds an orbit sweep to the test scene's camera program.
+    The default adds none, which is the world every mode test reads.
+    """
     assert TEST_SCENE in FOLD.test, "the test scene must be sealed in fold 0"
-    root = tmp_path_factory.mktemp("phase5")
-    for scene in (TRAIN_SCENE, VAL_SCENE, TEST_SCENE):
+    for scene in (TRAIN_SCENE, VAL_SCENE):
         build_scene(root, scene=scene)
+    build_scene(root, scene=TEST_SCENE, orbit_azimuths_deg=orbit_azimuths_deg)
 
     analysis = load_analysis_config()
     p4 = Phase4Config(
@@ -793,8 +802,59 @@ def test_the_lock_needs_the_licence_it_binds(world, trained, tmp_path):
 # evaluate
 # ---------------------------------------------------------------------------
 
+# The overfit receipt as the command line stamps it. Evaluation embeds its
+# verdict fields in every run record. The values are synthetic, because the
+# modes record what they read and never check receipts themselves.
+OVERFIT_RECEIPT = {
+    "passed": True, "reached_centered_cosine": 0.9912, "threshold": 0.98, "steps": 140,
+    "n_pairs": 8, "regimes": ["rotation", "translation", "orbit"], "fold": 0,
+    "level": LEVEL, "seed": 0,
+    "subset": [{"scene": TRAIN_SCENE, "context_frame_id": "000", "target_frame_id": "001",
+                "regime": "rotation", "n_supported": 12}],
+    "kind": "overfit", "commit": "c" * 40, "config_digest": "d" * 64,
+    "fold_digest": "f" * 64, "measurement_digest": "m" * 32,
+    "gate_receipt_sha256": "1" * 64, "stamped_utc": "2026-10-10T07:00:00.000000+00:00",
+}
+
+
+def _write_evaluation_evidence(cfg, run_dir: Path) -> dict[str, Path]:
+    """The controls file and the overfit receipt, where the command line writes them.
+
+    Evaluation embeds the controls entries of its fold and the overfit verdict
+    in each run record. The controls file covers fold 0's two checkpoints by
+    sha256, and one entry of another fold, which a fold 0 record must leave out.
+    """
+    from lot.phase5_modes import controls_path, controls_payload, fold_seed_key
+
+    evidence = Path(cfg.evidence_dir)
+    evidence.mkdir(parents=True, exist_ok=True)
+    hashes = {
+        fold_seed_key(FOLD.index, seed): sha256_file(
+            checkpoint_path(run_dir, LEVEL, FOLD.index, seed))
+        for seed in SEEDS
+    }
+    hashes[fold_seed_key(FOLD.index + 1, SEEDS[0])] = "5" * 64
+    results = {
+        key: {"n_pairs": 2 + i, "val_scenes_planned": [VAL_SCENE],
+              "pose_shuffle": {"degradation": 0.1 * i, "n_unchanged": 0},
+              "depth_shuffle": {"degradation": 0.0, "n_unchanged": 2}}
+        for i, key in enumerate(hashes)
+    }
+    identity = {"commit": "c" * 40, "config_digest": cfg.digest(),
+                "fold_digest": "f" * 64, "measurement_digest": "m" * 32}
+    controls = controls_path(evidence, LEVEL)
+    controls.write_text(json.dumps(
+        controls_payload(LEVEL, results, [], identity, LICENCE, hashes,
+                         written_utc="2026-10-10T08:00:00.000000+00:00"),
+        indent=2, sort_keys=True), encoding="utf-8")
+    overfit = evidence / "tiny_overfit.json"
+    overfit.write_text(json.dumps(OVERFIT_RECEIPT, indent=2, sort_keys=True), encoding="utf-8")
+    return {"controls": controls, "overfit": overfit}
+
+
 @pytest.fixture(scope="module")
 def evaluated(world, trained):
+    _write_evaluation_evidence(world["cfg"], Path(world["cfg"].run_dir))
     with SceneStore(world["cfg"], world["analysis"], world["convention"]) as store:
         result = run_evaluate_scene(
             world["cfg"], world["analysis"], store, TEST_SCENE, FOLD, SEEDS, MODEL,
@@ -1348,6 +1408,10 @@ EVAL_RECORD_PROVENANCE = (
     "eval_version", "analysis_reporting_digest", "licence", "training_records",
     "aligned_depth_digest", "environment", "written_utc",
 )
+# What the run record embeds so every table is regenerable from the evaluation
+# parquets alone: the fold's training records whole, its controls entries,
+# and the overfit verdict.
+EVAL_RECORD_EMBEDDED = ("training_record_contents", "controls", "overfit_verdict")
 AUDIT_BASE_FIELDS = (
     "pairs", "evaluated", "no_arm", "worst_per_point_residual", "worst_splat_residual",
 )
@@ -1360,7 +1424,8 @@ def test_the_run_record_carries_its_provenance(world, evaluated):
     from lot.phase5_modes import PHASE5_EVAL_VERSION
 
     meta = read_run_metadata(Path(evaluated["path"]))
-    assert set(meta) == set(EVAL_RECORD_BASE_FIELDS) | set(EVAL_RECORD_PROVENANCE)
+    assert set(meta) == (set(EVAL_RECORD_BASE_FIELDS) | set(EVAL_RECORD_PROVENANCE)
+                         | set(EVAL_RECORD_EMBEDDED))
     assert meta["eval_version"] == PHASE5_EVAL_VERSION == 1
     assert meta["analysis_reporting_digest"] == world["analysis"].reporting_digest()
     assert meta["licence"] == LICENCE
@@ -1387,6 +1452,109 @@ def test_the_run_record_carries_its_provenance(world, evaluated):
     assert set(audit) == set(AUDIT_BASE_FIELDS) | {"no_arm_pairs"}
     assert audit["no_arm"] == len(audit["no_arm_pairs"]) == 0
     assert audit == evaluated["audit"]
+
+
+def test_the_run_record_embeds_what_the_tables_read(world, evaluated):
+    """CLAUDE.md: every table and figure is regenerable from the evaluation
+    parquets alone. So each run record carries its fold's training records
+    whole, one per seed, the controls entries of its fold, and the overfit
+    verdict, each with the sha256 of the file it was read from."""
+    from lot.evaluate import read_run_metadata
+    from lot.phase5_modes import OVERFIT_VERDICT_FIELDS
+
+    meta = read_run_metadata(Path(evaluated["path"]))
+    run_dir = Path(world["cfg"].run_dir)
+    evidence = Path(world["cfg"].evidence_dir)
+
+    assert set(meta["training_record_contents"]) == {str(seed) for seed in SEEDS}
+    for seed in SEEDS:
+        path = training_record_path(run_dir, LEVEL, FOLD.index, seed)
+        assert meta["training_record_contents"][str(seed)] == json.loads(path.read_text())
+        assert meta["training_records"][str(seed)]["sha256"] == sha256_file(path)
+
+    # This fold's entries, and nothing of another fold.
+    controls_file = evidence / f"input_use_controls_{LEVEL}.json"
+    controls = json.loads(controls_file.read_text())
+    keys = [f"fold{FOLD.index}_seed{seed}" for seed in SEEDS]
+    assert len(controls["results"]) == len(keys) + 1
+    assert meta["controls"] == {
+        "sha256": sha256_file(controls_file),
+        "written_utc": controls["written_utc"],
+        "results": {key: controls["results"][key] for key in keys},
+        "checkpoints": {key: controls["checkpoints"][key] for key in keys},
+    }
+
+    assert OVERFIT_VERDICT_FIELDS == ("passed", "reached_centered_cosine", "threshold",
+                                      "steps", "n_pairs", "regimes", "subset", "fold",
+                                      "level", "seed")
+    overfit = evidence / "tiny_overfit.json"
+    assert meta["overfit_verdict"] == {
+        "sha256": sha256_file(overfit),
+        **{field: OVERFIT_RECEIPT[field] for field in OVERFIT_VERDICT_FIELDS},
+    }
+
+
+def _metadata_at(world, cfg, run_dir):
+    """evaluation_metadata for the test scene, reading evidence under cfg."""
+    from lot.phase5_modes import evaluation_metadata
+
+    audit = {"pairs": 1, "evaluated": 1, "no_arm": 0, "worst_per_point_residual": 0.0,
+             "worst_splat_residual": 0.0, "no_arm_pairs": []}
+    return evaluation_metadata(
+        cfg, world["analysis"], TEST_SCENE, FOLD, LEVEL, world["center"], run_dir, SEEDS,
+        {"metadata": {"git_commit": "4" * 40}},
+        Path(world["cfg"].phase4_dir) / "eval" / f"{TEST_SCENE}.parquet", audit,
+        licence=LICENCE, aligned_depth_digest="a" * 64,
+    )
+
+
+def _drop_fold_entry(files):
+    controls = json.loads(files["controls"].read_text())
+    for group in ("results", "checkpoints"):
+        controls[group].pop(f"fold{FOLD.index}_seed{SEEDS[1]}")
+    files["controls"].write_text(json.dumps(controls), encoding="utf-8")
+
+
+@pytest.mark.parametrize("damage, message", [
+    (lambda files: files["controls"].unlink(), "no controls file"),
+    (lambda files: files["overfit"].unlink(), "no overfit receipt"),
+    (_drop_fold_entry, f"fold{FOLD.index}_seed{SEEDS[1]}"),
+    (lambda files: files["overfit"].write_text("[]", encoding="utf-8"),
+     "does not hold one receipt"),
+], ids=["controls absent", "overfit receipt absent", "fold entry absent",
+        "overfit receipt not a receipt"])
+def test_a_run_record_without_its_evidence_is_refused(
+    world, trained, tmp_path, damage, message
+):
+    """The command line verified the receipts and the lock before evaluating, so
+    a controls file or overfit receipt missing now moved under the run. A record
+    that cannot embed them could never be reported, so none is written."""
+    cfg = dataclasses.replace(world["cfg"], output_root=str(tmp_path / "relocated"))
+    run_dir = Path(world["cfg"].run_dir)
+    files = _write_evaluation_evidence(cfg, run_dir)
+    assert set(_metadata_at(world, cfg, run_dir)) >= set(EVAL_RECORD_EMBEDDED)
+    damage(files)
+    with pytest.raises((FileNotFoundError, ValueError), match=message):
+        _metadata_at(world, cfg, run_dir)
+
+
+def test_the_embedded_training_record_is_the_one_its_hash_names(
+    world, trained, tmp_path, monkeypatch
+):
+    """The contents are read once and hashed. They must be the bytes the record's
+    training_records entry names, or a record changed between the two reads."""
+    import lot.phase5_modes as modes
+
+    cfg = dataclasses.replace(world["cfg"], output_root=str(tmp_path / "relocated"))
+    run_dir = Path(world["cfg"].run_dir)
+    _write_evaluation_evidence(cfg, run_dir)
+    real = modes.sha256_file
+    monkeypatch.setattr(
+        modes, "sha256_file",
+        lambda path: "0" * 64 if Path(path).suffix == ".json" else real(path),
+    )
+    with pytest.raises(ValueError, match="changed while"):
+        _metadata_at(world, cfg, run_dir)
 
 
 def test_pairs_with_no_arm_are_named_in_the_audit(world, trained, store, monkeypatch):
@@ -2587,3 +2755,878 @@ def test_step_seventeen_checks_every_rotation_pair_of_the_scene(world, store):
         assert summary["worst"][name]["max_residual_px"] <= tol
         assert summary["worst"][name]["pair"].startswith(TEST_SCENE)
     json.dumps(summary)
+
+
+# ---------------------------------------------------------------------------
+# The reporting modes: tables, figures, and acceptance
+# ---------------------------------------------------------------------------
+#
+# reporting_rules.md decision 1. The chain runs once, at commit E, and its
+# receipts are bound to E. The tables, figures, and acceptance modes may run
+# later, at a reporting commit R. They are licensed by the evaluated run's own
+# provenance, through lot.phase5_provenance.require_evaluated_run, and never by
+# receipts at R. The command line dispatches them before the chain's receipt
+# check, which binds every receipt to HEAD.
+
+REPORTING_MODES = ("tables", "figures", "acceptance")
+REPO = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def reporting_cli(world, tmp_path, monkeypatch):
+    """The reporting modes through the command line, each mode's function recorded.
+
+    The chain's receipt check and its mode runner fail if they are reached.
+    tables and figures publish a stub directory whose MANIFEST.json names a
+    run. The licence acceptance asks for is granted, and acceptance returns
+    the status in state["verdict"].
+    """
+    import lot.phase5 as phase5
+    import lot.phase5_acceptance as acceptance
+    import lot.phase5_figures as figures
+    import lot.phase5_provenance as provenance
+    import lot.phase5_report as report
+
+    path = _config_file(world, tmp_path)
+    cfg = phase5.load_phase5_config(path)
+    calls: list[tuple[str, str, dict]] = []
+    state = {"verdict": 0}
+
+    def never(*args, **kwargs):
+        raise AssertionError("a reporting mode reached the chain's receipt check")
+
+    def same_run(cfg_, config_path) -> None:
+        assert cfg_.digest() == cfg.digest() and Path(config_path) == path
+
+    def publisher(kind):
+        def publish(cfg_, analysis, config_path, level, supersede=False, **kwargs):
+            same_run(cfg_, config_path)
+            calls.append((kind, level, {"supersede": supersede, **kwargs}))
+            final = Path(cfg_.run_dir) / kind / level
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "MANIFEST.json").write_text(json.dumps({"run_record": {
+                "evaluation_commit": "e" * 40, "report_commit": "f" * 40}}), encoding="utf-8")
+            return {"published": str(final), "superseded": None,
+                    "written": ["MANIFEST.json"], "not_drawn": {}}
+        return publish
+
+    def licence(cfg_, analysis, config_path, level, **kwargs):
+        same_run(cfg_, config_path)
+        calls.append(("licence", level, kwargs))
+        return SimpleNamespace(level=level, commit="e" * 40)
+
+    def accept(cfg_, analysis, config_path, level, **kwargs):
+        same_run(cfg_, config_path)
+        calls.append(("acceptance", level, kwargs))
+        return state["verdict"]
+
+    monkeypatch.setattr(phase5, "require_receipts", never)
+    monkeypatch.setattr(phase5, "run_mode", never)
+    monkeypatch.setattr(report, "run_tables", publisher("tables"))
+    monkeypatch.setattr(figures, "run_figures", publisher("figures"))
+    monkeypatch.setattr(provenance, "require_evaluated_run", licence)
+    monkeypatch.setattr(acceptance, "run_acceptance", accept)
+
+    def run(*args):
+        """The status main exits with: a number, or the refusal it raised."""
+        with pytest.raises(SystemExit) as stop:
+            phase5.main(["--config", str(path), *args])
+        return stop.value.code
+
+    return SimpleNamespace(cfg=cfg, path=path, calls=calls, state=state, run=run)
+
+
+def test_the_reporting_modes_are_licensed_by_the_run_and_not_by_receipts_at_r(
+    reporting_cli, capsys
+):
+    """Each mode runs its own function once, at the primary level, and exits 0
+    when it passes. Neither the chain's receipt check nor its mode runner is
+    reached. Acceptance first asks the evaluated run for its licence, with every
+    check on, and then exits with its verdict."""
+    cli = reporting_cli
+    for mode in REPORTING_MODES:
+        assert cli.run("--mode", mode) == 0
+    assert [(kind, level) for kind, level, _ in cli.calls] == [
+        ("tables", LEVEL), ("figures", LEVEL), ("licence", LEVEL), ("acceptance", LEVEL)]
+    assert [kwargs for _, _, kwargs in cli.calls] == [
+        {"supersede": False}, {"supersede": False}, {}, {}]
+    out = capsys.readouterr().out
+    for kind in ("tables", "figures"):
+        assert str(Path(cli.cfg.run_dir) / kind / LEVEL) in out
+    assert "e" * 40 in out and "f" * 40 in out
+
+    cli.state["verdict"] = 1
+    assert cli.run("--mode", "acceptance") == 1
+    assert [kind for kind, _, _ in cli.calls[-2:]] == ["licence", "acceptance"]
+
+
+def test_a_run_that_licenses_no_report_gets_no_verdict(reporting_cli, monkeypatch, capsys):
+    """require_evaluated_run refuses, so acceptance re-derives nothing and writes
+    nothing. Every field the refusal names is printed, and the exit is 1."""
+    import lot.phase5_provenance as provenance
+    from lot.phase5_provenance import ProvenanceError
+
+    def refuse(*args, **kwargs):
+        raise ProvenanceError([("licence", "names no checkpoint lock"),
+                               ("commit", "'e-dirty' is not a full commit hash")])
+
+    monkeypatch.setattr(provenance, "require_evaluated_run", refuse)
+    assert reporting_cli.run("--mode", "acceptance") == 1
+    err = capsys.readouterr().err
+    assert "licence: names no checkpoint lock" in err
+    assert "commit: 'e-dirty' is not a full commit hash" in err
+    assert reporting_cli.calls == []
+
+
+def _reporting_stops() -> list:
+    """Each stop a reporting mode can meet, with the function that raises it."""
+    from lot.phase5_estimands import HeadlineSubstitutionError
+    from lot.phase5_figures import FiguresStop
+    from lot.phase5_outcomes import OutcomeAnomaly
+    from lot.phase5_provenance import ProvenanceError
+    from lot.phase5_report import TablesStop
+
+    tables, figures = ("tables", "lot.phase5_report", "run_tables"), (
+        "figures", "lot.phase5_figures", "run_figures")
+    return [
+        pytest.param(*tables, TablesStop("a supported cell has no finite interval"),
+                     id="tables stop"),
+        pytest.param(*tables, OutcomeAnomaly("the estimate lies outside its own interval"),
+                     id="outcome anomaly"),
+        pytest.param(*tables, HeadlineSubstitutionError("TL-Reference in the headline"),
+                     id="headline substitution"),
+        pytest.param(*tables, FileExistsError("tables/image exists; outputs are written once"),
+                     id="written once"),
+        pytest.param(*figures, FiguresStop("the tables lack phase5_regions.parquet"),
+                     id="figures stop"),
+        pytest.param(*figures, ProvenanceError([("sha256", "phase5_primary.parquet changed")]),
+                     id="provenance"),
+    ]
+
+
+@pytest.mark.parametrize("mode,module,function,error", _reporting_stops())
+def test_a_stopped_reporting_mode_exits_one_and_prints_its_problems(
+    reporting_cli, monkeypatch, capsys, mode, module, function, error
+):
+    import importlib
+
+    def stop(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(importlib.import_module(module), function, stop)
+    assert reporting_cli.run("--mode", mode) == 1
+    err = capsys.readouterr().err
+    assert str(error) in err and f"{mode} stopped" in err
+    assert reporting_cli.calls == []
+
+
+def test_an_unexpected_error_in_a_reporting_mode_keeps_its_traceback(reporting_cli, monkeypatch):
+    """Only a named stop is printed as one. A defect propagates as itself."""
+    import lot.phase5 as phase5
+    import lot.phase5_report as report
+
+    def broken(*args, **kwargs):
+        raise KeyError("a defect, not a stop")
+
+    monkeypatch.setattr(report, "run_tables", broken)
+    with pytest.raises(KeyError, match="a defect"):
+        phase5.main(["--config", str(reporting_cli.path), "--mode", "tables"])
+
+
+def test_supersede_rebuilds_tables_and_figures_and_nothing_else(reporting_cli):
+    """--supersede moves an earlier tables or figures output aside, deleting
+    nothing, and builds it again. Acceptance keeps every earlier verdict anyway,
+    and no mode of the chain rebuilds anything, so elsewhere the flag is refused
+    before anything runs."""
+    cli = reporting_cli
+    assert cli.run("--mode", "tables", "--supersede") == 0
+    assert cli.run("--mode", "figures", "--supersede") == 0
+    assert [kwargs["supersede"] for _, _, kwargs in cli.calls] == [True, True]
+    for mode in ("acceptance", "describe", "check", "lock", "evaluate"):
+        refusal = cli.run("--mode", mode, "--supersede")
+        assert isinstance(refusal, str) and "--supersede" in refusal, refusal
+    assert len(cli.calls) == 2
+
+
+def test_a_non_primary_level_is_reported_only_after_the_primary_tables(reporting_cli, capsys,
+                                                                      monkeypatch):
+    """Every reporting mode at a sensitivity level waits for the primary level's
+    published tables, verified as the figures mode verifies them. Acceptance
+    then binds the level's run to the primary run's chain before any condition
+    is re-derived, reporting_rules.md decision 4. The tables and figures modes
+    bind it inside their own functions, which tests/test_phase5_report.py and
+    tests/test_phase5_figures.py cover."""
+    import lot.phase5_provenance as provenance
+    import lot.phase5_report as report
+
+    cli = reporting_cli
+    for mode in REPORTING_MODES:
+        assert cli.run("--mode", mode, "--level", "affine") == 1
+        assert "primary" in capsys.readouterr().err
+    assert cli.calls == []
+
+    # A manifest that only lists hashes is not the tables mode's, and licenses
+    # nothing.
+    primary = Path(cli.cfg.run_dir) / "tables" / LEVEL
+    primary.mkdir(parents=True)
+    table = primary / "phase5_primary.parquet"
+    table.write_bytes(b"the headline rows")
+    (primary / "MANIFEST.json").write_text(
+        json.dumps({"files": {table.name: sha256_file(table)}}), encoding="utf-8")
+    for mode in REPORTING_MODES:
+        assert cli.run("--mode", mode, "--level", "affine") == 1
+        assert "manifest" in capsys.readouterr().err
+    assert cli.calls == []
+
+    # Verified primary tables: each mode runs, and acceptance binds the chain.
+    record = {"evaluation_commit": "e" * 40, "level": LEVEL}
+    verified, bound = [], []
+
+    def tables_of_the_primary_level(directory, *, primary_level):
+        verified.append((Path(directory), primary_level))
+        return SimpleNamespace(run_record=record)
+
+    def same_chain(primary_record, identity):
+        bound.append((primary_record, identity.level))
+
+    monkeypatch.setattr(report, "require_primary_tables", tables_of_the_primary_level)
+    monkeypatch.setattr(provenance, "require_primary_chain", same_chain)
+    for mode in REPORTING_MODES:
+        assert cli.run("--mode", mode, "--level", "affine") == 0
+    assert [(kind, level) for kind, level, _ in cli.calls] == [
+        ("tables", "affine"), ("figures", "affine"), ("licence", "affine"),
+        ("acceptance", "affine")]
+    assert verified == [(primary, LEVEL)] * 3
+    assert bound == [(record, "affine")]
+
+    # A level run under another chain gets no verdict.
+    def another_chain(primary_record, identity):
+        raise provenance.ProvenanceError(
+            [("evaluation_commit", "the level ran at another commit")],
+            "level 'affine' was not run under the primary level's chain")
+
+    monkeypatch.setattr(provenance, "require_primary_chain", another_chain)
+    assert cli.run("--mode", "acceptance", "--level", "affine") == 1
+    assert "evaluation_commit" in capsys.readouterr().err
+    assert [kind for kind, _, _ in cli.calls][-1] == "licence"
+    refusal = cli.run("--mode", "tables", "--level", "scene")
+    assert isinstance(refusal, str) and "not declared" in refusal
+    assert len(cli.calls) == 5
+
+
+# ---------------------------------------------------------------------------
+# The launcher's reporting modes
+# ---------------------------------------------------------------------------
+
+def _usable_bash() -> str | None:
+    """A bash that runs a script file this process names, or None.
+
+    On Windows the bash on PATH may be the WSL launcher, which cannot read a
+    path such as C:/..., so the one Git ships beside git itself is tried
+    first, and each candidate must run a probe script by its path.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    candidates: list[Path] = []
+    git = shutil.which("git")
+    if git:
+        # git.exe sits in cmd, bin, or mingw64/bin under Git's root.
+        for root in Path(git).resolve().parents[:3]:
+            candidates += [root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"]
+    found = shutil.which("bash")
+    if found:
+        candidates.append(Path(found))
+    with tempfile.TemporaryDirectory() as scratch:
+        probe = Path(scratch) / "probe.sh"
+        probe.write_text("echo ok\n", encoding="utf-8", newline="\n")
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                done = subprocess.run([str(candidate), probe.as_posix()], capture_output=True,
+                                      text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if done.returncode == 0 and done.stdout.strip() == "ok":
+                return str(candidate)
+    return None
+
+
+# The launcher's receipt checks. A reporting mode reaches none of them.
+LAUNCHER_RECEIPT_CHECKS = ("require_receipt", "require_gate_passed", "require_overfit_passed",
+                           "require_lock_written")
+
+
+def _bash_or_skip() -> str:
+    bash = _usable_bash()
+    if bash is None:
+        pytest.skip("no bash that runs scripts is available")
+    return bash
+
+
+def _run_reporting_branch(tmp_path: Path, *, allocation: str | None, status: int):
+    """The launcher's reporting branch, run with every helper it calls replaced.
+
+    The branch is read from scripts/run_phase5.sh, from its case pattern to
+    its ;;, and run as the body of a function for the figures mode at level
+    affine. The tree and freeze checks echo that they ran. Each receipt check
+    exits 97 if it is reached. run_lot echoes its arguments and returns
+    status, as the entry point would.
+    """
+    import shlex
+    import subprocess
+
+    bash = _bash_or_skip()
+    text = (REPO / "scripts" / "run_phase5.sh").read_text(encoding="utf-8")
+    pattern = "\ntables|figures|acceptance)\n"
+    start = text.index(pattern) + len(pattern)
+    body = text[start:text.index("\n    ;;\n", start)]
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    lines = [
+        "set -euo pipefail",
+        "MODE=figures",
+        "EXTRA=(--level affine)",
+        f"EVIDENCE_DIR={shlex.quote(evidence.as_posix())}",
+        "CONFIG=configs/phase5.yaml",
+        "require_clean_tree() { echo 'the tree is clean'; }",
+        "verify_freeze() { echo 'the frozen blobs verify'; }",
+        "resolved_level() { echo affine; }",
+        "print_identity() { echo 'the identity of the run'; }",
+        f'run_lot() {{ echo "the entry point: $*"; return {status}; }}',
+        *(f"{name}() {{ echo '{name} was reached' >&2; exit 97; }}"
+          for name in LAUNCHER_RECEIPT_CHECKS),
+        f"export SLURM_JOB_ID={allocation}" if allocation else "unset SLURM_JOB_ID",
+        "branch() {", body, "}", "branch",
+    ]
+    script = tmp_path / "branch.sh"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    done = subprocess.run([bash, script.as_posix()], capture_output=True, text=True,
+                          timeout=120)
+    return done, evidence
+
+
+def test_the_launcher_parses():
+    import subprocess
+
+    done = subprocess.run([_bash_or_skip(), "-n", "scripts/run_phase5.sh"], cwd=REPO,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize("extra, want", [
+    ((), None), (("--level", "affine"), "affine"),
+    (("--level", "affine", "--supersede"), "affine"), (("--supersede",), None),
+], ids=["primary", "affine", "affine-supersede", "supersede"])
+def test_the_launcher_resolves_the_level_through_the_real_parser(tmp_path, extra, want):
+    """resolved_level, read as written from the launcher, under set -e, with
+    run_lot running this interpreter. The reporting branch names its log by the
+    level it resolves, so a parser that refused --supersede would exit before a
+    log is written. None means the frozen primary level."""
+    import shlex
+    import subprocess
+    import sys
+
+    from lot.phase5 import load_phase5_config
+
+    text = (REPO / "scripts" / "run_phase5.sh").read_text(encoding="utf-8")
+    start = text.index("\nresolved_level() {\n") + 1
+    function = text[start:text.index("\n}\n", start) + 2]
+    script = tmp_path / "resolve.sh"
+    script.write_text("\n".join([
+        "set -euo pipefail",
+        f"cd {shlex.quote(REPO.as_posix())}",
+        "CONFIG=configs/phase5.yaml",
+        f'run_lot() {{ shift; PYTHONPATH={shlex.quote((REPO / "src").as_posix())} '
+        f'{shlex.quote(Path(sys.executable).as_posix())} "$@"; }}',
+        function,
+        "EXTRA=(" + " ".join(shlex.quote(argument) for argument in extra) + ")",
+        'level="$(resolved_level)"',
+        'echo "resolved $level"',
+    ]) + "\n", encoding="utf-8", newline="\n")
+    done = subprocess.run([_bash_or_skip(), script.as_posix()], capture_output=True,
+                          text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    primary = load_phase5_config(REPO / "configs" / "phase5.yaml").primary_alignment_level
+    assert done.stdout.strip() == f"resolved {want or primary}"
+
+
+def test_the_launcher_refuses_a_reporting_mode_outside_an_allocation(tmp_path):
+    """A clean tree and the frozen blobs first, then the allocation. Outside one
+    the launcher prints the CPU srun command that runs the same mode with the
+    same arguments, and runs nothing."""
+    done, evidence = _run_reporting_branch(tmp_path, allocation=None, status=0)
+    assert done.returncode == 1, done.stderr
+    assert "the tree is clean" in done.stdout and "the frozen blobs verify" in done.stdout
+    for text in ('srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION"',
+                 "--ntasks=1 --cpus-per-task=4 --mem=32G --time=02:00:00",
+                 "--pty ./scripts/run_phase5.sh figures --level affine"):
+        assert text in done.stderr, done.stderr
+    assert "--gres" not in done.stderr
+    assert "the entry point" not in done.stdout and list(evidence.iterdir()) == []
+
+
+@pytest.mark.parametrize("status", [0, 1], ids=["passed", "stopped"])
+def test_the_launcher_runs_a_reporting_mode_in_an_allocation_and_keeps_its_output(
+    tmp_path, status
+):
+    """Inside an allocation no receipt is checked, because the receipts are bound
+    to E. The run's identity is printed, then the entry point runs once, and
+    both are kept in a log under the evidence directory, named by mode, level,
+    and UTC time. The launcher exits with the mode's own status."""
+    done, evidence = _run_reporting_branch(tmp_path, allocation="4242", status=status)
+    assert done.returncode == status, done.stderr
+    assert "was reached" not in done.stderr
+    (log,) = evidence.iterdir()
+    assert re.fullmatch(r"figures_affine_\d{8}T\d{6}Z\.txt", log.name), log.name
+    kept = log.read_text(encoding="utf-8")
+    calls = [line for line in kept.splitlines() if line.startswith("the entry point: ")]
+    assert calls == ["the entry point: python -m lot.phase5 --config configs/phase5.yaml "
+                     "--mode figures --level affine"]
+    assert kept.index("the identity of the run") < kept.index("the entry point: ")
+    assert (log.name in done.stderr) == (status != 0)
+
+
+# ---------------------------------------------------------------------------
+# The chain, licensed by real receipts, then every reporting mode
+# ---------------------------------------------------------------------------
+
+# The commit the licensed chain runs at. Never a commit of this checkout, so
+# nothing written below can pass for a run of the real code.
+CHAIN_COMMIT = "e" * 40
+# The orbit sweep of the reporting world's test scene, in degrees of azimuth.
+ORBIT_AZIMUTHS_DEG = (-6.0, -3.0, 0.0, 3.0, 6.0)
+
+
+@pytest.fixture(scope="module")
+def reporting_world(tmp_path_factory):
+    """The world, with an orbit sweep added to the test scene's camera program.
+
+    The measured outcome is one row per regime, so the tables stop on a run
+    with no orbit pair, and the world's camera program has none. Here the
+    test scene adds an orbit sweep, and its Phase 3 and Phase 4 runs are
+    genuine, as in the world. The training and validation scenes are the
+    world's own.
+    """
+    return _build_world(tmp_path_factory.mktemp("reporting_world"),
+                        orbit_azimuths_deg=ORBIT_AZIMUTHS_DEG)
+
+
+def _same_value(a, b) -> bool:
+    """Equality, with two NaNs equal."""
+    if isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b):
+        return True
+    return a == b
+
+
+def _one_commit_repository(root: Path) -> Path:
+    """A repository of one commit, which never held the chain's commit."""
+    import subprocess
+
+    repo = root / "repository"
+    repo.mkdir(parents=True)
+
+    def git(*args: str) -> None:
+        done = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+
+    git("init", "-q")
+    for key, value in (("user.name", "Phase 5 test"), ("user.email", "phase5@example.invalid"),
+                       ("core.autocrlf", "false"), ("commit.gpgsign", "false"),
+                       ("core.hooksPath", "no-hooks")):
+        git("config", key, value)
+    (repo / "README.md").write_text("A repository that never held commit E.\n",
+                                    encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "R")
+    return repo
+
+
+def _green_suite(repo_root) -> dict:
+    """A green suite in run_suite's layout, with every file a condition reads.
+
+    Running the suite here would recurse into this suite.
+    """
+    from lot.phase5_acceptance import SUITE_FILES
+
+    files = sorted({name for names in SUITE_FILES.values() for name in names})
+    summary = f"{len(files)} passed in 1.00s"
+    return {"command": ["python", "-m", "pytest", "-q"], "returncode": 0, "summary": summary,
+            "counts": {"passed": len(files), "failed": 0, "errors": 0, "skipped": 0},
+            "files": {name: {"passed": 1, "failed": 0, "errors": 0, "skipped": 0}
+                      for name in files},
+            "output_tail": [summary]}
+
+
+def _accepted_phase4(cfg, repo_root) -> dict:
+    """The Phase 4 acceptance check's result. The synthetic Phase 4 run is one scene."""
+    return {"command": ["python", "scripts/phase4_acceptance_check.py"], "returncode": 0,
+            "stdout": ["All 5 acceptance conditions satisfied."], "stderr": []}
+
+
+def _phase4_reference_without_its_run_check(cfg, analysis, level, identity):
+    """lot.phase5_report.phase4_reference_cells, on the world's genuine Phase 4 run.
+
+    The Phase 4 run records name the commit the suite ran at when the world
+    was built. In a working tree with changes that commit is marked dirty,
+    and lot.phase4_report.read_phase4_dir refuses a dirty Phase 4 run, as it
+    must on the cluster. So that reader alone is replaced by a plain read of
+    the same parquets. Everything phase4_reference_cells checks itself still
+    runs: each parquet is the one evaluation reconciled against, and the
+    Phase 4 commit is the one the evaluated run names. The ladder and bin
+    cells are lot.phase4_report's own.
+    """
+    import lot.phase4_report as phase4_report
+    from lot.phase5_report import phase4_reference_cells
+
+    def read(eval_dir, analysis_):
+        return [row for path in sorted(Path(eval_dir).glob("*.parquet"))
+                for row in read_rows(path)]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(phase4_report, "read_phase4_dir", read)
+        return phase4_reference_cells(cfg, analysis, level, identity)
+
+
+def _recount_with(convention):
+    """lot.phase5_acceptance.recount_primary_support, given the convention record.
+
+    The real recount reads the convention from the accepted Phase 4 run's
+    evidence, which the synthetic Phase 4 run does not write. The count is
+    plan_example's support, as it is there.
+    """
+    def recount(cfg, analysis, level, scene, pairs):
+        inputs = build_scene_inputs(cfg, analysis, scene, convention)
+        try:
+            by_pair = {(p.context_frame_id, p.target_frame_id): p
+                       for p in phase5_scene_pairs(cfg, analysis, scene)}
+            counts = {}
+            for key in pairs:
+                plan = plan_example(cfg, analysis, inputs, by_pair[tuple(key)], level)
+                counts[tuple(key)] = 0 if plan is None else int(plan.support.sum())
+            return counts
+        finally:
+            inputs.close()
+    return recount
+
+
+@pytest.fixture(scope="module")
+def reported(world, trained, reporting_world, tmp_path_factory):
+    """The chain on fold 0 through the command line, then tables, figures, and acceptance.
+
+    The chain reads the reporting world, whose test scene holds all three
+    regimes. Its models are the world's: the checkpoints the trained fixture
+    selected for fold 0 are copied under the chain's run directory, their
+    records naming its configuration, commit, and licence.
+
+    Licensed by real receipts. The integration and overfit receipts are
+    stamped for the chain's commit by stamp_receipt. Only the integration
+    receipt's binding to the cluster's inputs is replaced, as
+    tests/test_phase5_receipt.py covers it. The overfit receipt carries the
+    gate's verdict as run_overfit writes it: the gate needs eight training
+    pairs over every regime, more than the world holds. The controls, the
+    lock, and evaluation then run through the command line, each behind its
+    real receipt check. The frozen folds are fold 0 alone, the one the world
+    trained, and the controls read the one validation scene it holds.
+
+    The reporting functions read that run with the test scene and fold 0
+    injected and code ancestry off, since the chain's commit is in no
+    repository. The Phase 4 references are read without Phase 4's own run
+    check, which refuses a run written from a working tree with changes.
+    Acceptance reads a one-commit repository, so each condition that rests on
+    the code at E fails and says why. The suite and the Phase 4 acceptance
+    check are injected, and the recount reads the world's convention record.
+
+    Every patch is undone before the fixture returns. The tests read only
+    what the modes wrote.
+    """
+    import io
+
+    import lot.evaluate as evaluate_module
+    import lot.phase5 as phase5
+    import lot.phase5_acceptance as acceptance
+    import lot.phase5_figures as figures
+    import lot.phase5_folds as phase5_folds
+    import lot.phase5_modes as modes
+    import lot.phase5_receipt as receipt_module
+    import lot.phase5_report as report
+    import lot.train as train_module
+    from lot.phase5_check import utc_timestamp
+    from lot.phase5_modes import OVERFIT_VERDICT_FIELDS
+    from lot.phase5_provenance import require_evaluated_run
+    from lot.phase5_receipt import KIND_INTEGRATION, KIND_OVERFIT, stamp_receipt
+
+    root = tmp_path_factory.mktemp("reported")
+    config = _config_file(reporting_world, root)
+    cfg = phase5.load_phase5_config(config)
+    analysis = reporting_world["analysis"]
+    convention, center = reporting_world["convention"], reporting_world["center"]
+    evidence = Path(cfg.evidence_dir)
+    evidence.mkdir(parents=True)
+    repository = _one_commit_repository(root)
+    real_controls = modes.run_controls
+
+    def controls_on_the_world(*args):
+        return real_controls(*args, val_scenes=[VAL_SCENE])
+
+    injected = {"expected_scenes": [TEST_SCENE], "folds": [FOLD]}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(evaluate_module, "git_commit", lambda: CHAIN_COMMIT)
+        patch.setattr(modes, "git_commit", lambda: CHAIN_COMMIT)
+        patch.setattr(phase5, "frozen_folds", lambda: [FOLD])
+        patch.setattr(phase5_folds, "frozen_folds", lambda: [FOLD])
+        patch.setattr(train_module, "training_config_from", lambda raw: TRAIN)
+        patch.setattr(phase5, "predictor_config_from", lambda c, hw: MODEL)
+        patch.setattr(phase5, "load_convention_record", lambda c: convention)
+        patch.setattr(phase5, "phase5_mean_vector", lambda c: center)
+        patch.setattr(modes, "run_controls", controls_on_the_world)
+        patch.setattr(receipt_module, "_artifact_problems", lambda *args: [])
+
+        gate = evidence / "integration_gate.json"
+        gate.write_text(json.dumps(stamp_receipt(
+            {"passed": True, "steps": [], "failure": None}, config, KIND_INTEGRATION),
+            indent=2, sort_keys=True), encoding="utf-8")
+        overfit = evidence / "tiny_overfit.json"
+        verdict = {field: OVERFIT_RECEIPT[field] for field in OVERFIT_VERDICT_FIELDS}
+        verdict["subset"] = [
+            {"scene": TRAIN_SCENE, "context_frame_id": f"{index:03d}",
+             "target_frame_id": f"{index + 4:03d}", "regime": verdict["regimes"][index % 3],
+             "n_supported": 800}
+            for index in range(verdict["n_pairs"])
+        ]
+        overfit.write_text(json.dumps(stamp_receipt(
+            verdict, config, KIND_OVERFIT, gate_receipt=gate),
+            indent=2, sort_keys=True), encoding="utf-8")
+        gates = _licence_of({"integration_gate": gate, "tiny_overfit": overfit})
+        # Training runs under both receipts, so its records are written after them.
+        checkpoints = _copy_training_run(world, Path(cfg.run_dir), config_digest=cfg.digest(),
+                                         commit=CHAIN_COMMIT, licence=gates,
+                                         written_utc=utc_timestamp())
+
+        def run(*args: str) -> None:
+            phase5.main(["--config", str(config), "--device", "cpu", *args])
+
+        with pytest.raises(SystemExit) as stop:
+            run("--mode", "controls")
+        assert stop.value.code == 0
+        run("--mode", "lock")
+        run("--mode", "evaluate", "--scene-index", str(FOLD.test.index(TEST_SCENE)))
+
+        identity = require_evaluated_run(cfg, analysis, config, LEVEL, check_code=False,
+                                         **injected)
+        tables = report.run_tables(cfg, analysis, config, LEVEL, check_code=False,
+                                   phase4_reference=_phase4_reference_without_its_run_check,
+                                   **injected)
+        drawn = figures.run_figures(cfg, analysis, config, LEVEL, check_code=False, **injected)
+        stream = io.StringIO()
+        status = acceptance.run_acceptance(
+            cfg, analysis, config, LEVEL, stream=stream, repo_root=repository,
+            suite_runner=_green_suite, phase4_check=_accepted_phase4,
+            recount=_recount_with(convention), **injected)
+
+    return SimpleNamespace(
+        cfg=cfg, config=config, run_dir=Path(cfg.run_dir), evidence=evidence,
+        gates=gates, checkpoints=checkpoints, identity=identity, tables=tables,
+        figures=drawn, status=status, report=stream.getvalue(), repository=repository,
+    )
+
+
+def test_the_licensed_chain_evaluates_every_regime_under_its_lock(reported, evaluated):
+    """The orbit sweep adds orbit pairs, and each stratum is sampled by its own
+    identity, so the rotation and translation pairs are the evaluated fixture's
+    pairs. The run record names the chain's commit, and the two gate receipts
+    and the checkpoint lock that licensed it. One attempt is on the ledger."""
+    from lot.evaluate import read_run_metadata
+    from lot.phase5_modes import evaluation_attempts
+
+    def pairs(rows, regimes):
+        return {(row["context_frame_id"], row["target_frame_id"])
+                for row in rows if row["regime"] in regimes}
+
+    path = reported.run_dir / "eval" / LEVEL / f"{TEST_SCENE}.parquet"
+    licensed, fixture = read_rows(path), read_rows(Path(evaluated["path"]))
+    assert {row["regime"] for row in licensed} == {"rotation", "translation", "orbit"}
+    assert {row["regime"] for row in fixture} == {"rotation", "translation"}
+    explicit = ("rotation", "translation")
+    assert pairs(licensed, explicit) == pairs(fixture, explicit)
+    assert pairs(licensed, ("orbit",))
+    for row in licensed:
+        assert (row["scene"], row["level"], row["fold"]) == (TEST_SCENE, LEVEL, FOLD.index)
+    record = read_run_metadata(path)
+    lock = reported.evidence / f"checkpoint_lock_{LEVEL}.json"
+    assert record["commit"] == CHAIN_COMMIT
+    assert record["licence"] == {**reported.gates, lock.stem: sha256_file(lock)}
+    assert record["checkpoints"] == {
+        str(seed): reported.checkpoints[f"fold{FOLD.index}_seed{seed}"] for seed in SEEDS}
+    (attempt,) = evaluation_attempts(reported.evidence / "evaluation_ledger")
+    assert attempt["status"] == "written" and attempt["licence"] == record["licence"]
+    assert attempt["parquet_sha256"] == sha256_file(path)
+
+
+def test_the_evaluated_run_licenses_its_report(reported):
+    """require_evaluated_run, past every stage but code ancestry, names each file
+    the run is read from by its sha256."""
+    identity = reported.identity
+    assert identity.commit == identity.training_commit == CHAIN_COMMIT
+    assert identity.code_checked is False and identity.report_commit is None
+    assert identity.scenes == (TEST_SCENE,) and identity.folds == (FOLD.index,)
+    assert identity.seeds == SEEDS and identity.checkpoints == reported.checkpoints
+    eval_name = f"eval/{LEVEL}/{TEST_SCENE}.parquet"
+    assert identity.inputs[eval_name] == sha256_file(reported.run_dir / eval_name)
+    for stem in ("integration_gate", "tiny_overfit", f"checkpoint_lock_{LEVEL}"):
+        assert identity.inputs[f"evidence/{stem}.json"] == identity.licence[stem]
+    assert identity.inputs[f"evidence/input_use_controls_{LEVEL}.json"] == (
+        identity.controls_sha256)
+
+
+def test_the_tables_mode_publishes_the_licensed_run(reported):
+    from lot.evaluate import read_run_metadata
+    from lot.phase5_report import (
+        ACCOUNTING_FILE, MANIFEST_FILE, NEAR_ZERO_FILE, TABLE_FILES, TABLE_LABELS,
+    )
+
+    final = reported.run_dir / "tables" / LEVEL
+    assert reported.tables["published"] == str(final)
+    assert reported.tables["superseded"] is None
+    names = sorted(p.name for p in final.iterdir())
+    assert names == sorted(set(TABLE_FILES) | {NEAR_ZERO_FILE, ACCOUNTING_FILE, MANIFEST_FILE})
+    assert reported.tables["written"][-1] == MANIFEST_FILE
+    manifest = json.loads((final / MANIFEST_FILE).read_text(encoding="utf-8"))
+    assert manifest["files"] == {
+        name: sha256_file(final / name) for name in names if name != MANIFEST_FILE}
+    record = manifest["run_record"]
+    assert record["kind"] == "phase5_tables_manifest"
+    assert record["evaluation_commit"] == record["training_commit"] == CHAIN_COMMIT
+    assert record["code_checked"] is False and record["report_commit"] is None
+    assert record["scenes"] == [TEST_SCENE] and record["folds"] == [FOLD.index]
+    assert record["seeds"] == list(SEEDS) and record["level"] == LEVEL
+    assert record["licence"] == reported.identity.licence
+    assert reported.identity.inputs.items() <= record["inputs"].items()
+    assert any(name.startswith("phase4/eval/") for name in record["inputs"])
+    for name in TABLE_FILES:
+        table_record = read_run_metadata(final / name)
+        assert table_record["kind"] == "phase5_table" and table_record["table"] == name
+        assert table_record["table_label"] == TABLE_LABELS[name]
+        assert table_record["evaluation_commit"] == CHAIN_COMMIT
+    for name in (NEAR_ZERO_FILE, ACCOUNTING_FILE):
+        document = json.loads((final / name).read_text(encoding="utf-8"))
+        assert document["run_record"]["evaluation_commit"] == CHAIN_COMMIT
+    assert not [p for p in final.parent.iterdir() if ".partial." in p.name]
+
+
+def test_one_evaluated_scene_supports_no_cell_so_no_outcome_is_called(reported):
+    """support_min_scenes is 3 and the world evaluates one test scene, so every
+    cell is below support. Each row is shown with its counts and is not
+    classified, and no qualifier or flag is raised. Outcomes 46 to 49, the
+    qualifiers, and the landing-offset flags are decided on supported cells,
+    which tests/test_phase5_report.py, tests/test_phase5_outcomes.py, and
+    tests/test_phase5_acceptance.py build from synthetic records of three
+    scenes."""
+    final = reported.run_dir / "tables" / LEVEL
+    assert len(reported.identity.scenes) < load_analysis_config().support_min_scenes
+    primary = read_rows(final / "phase5_primary.parquet")
+    assert primary
+    for row in primary:
+        assert row["supported"] is False and row["n_scenes"] <= 1
+        assert row["delta_learn_pp_outcome"] is None and row["delta_learn_sp_outcome"] is None
+        assert row["delta_learn_pp_qualifier"] is None and row["outcome_49"] is None
+        assert row["metric_sensitive"] is None and row["lead_within_read"] is None
+    assert any(row["n_camera_pairs"] > 0 for row in primary)
+    measured = read_rows(final / "phase5_measured_outcome.parquet")
+    assert [(row["metric"], row["scope"]) for row in measured] == [
+        (metric, scope) for metric in ("centered", "raw")
+        for scope in ("rotation", "translation", "orbit", "pooled")]
+    for row in measured:
+        assert row["supported"] is False and row["outcome"] is None
+        assert row["qualifier"] is None and row["outcome_49"] is None
+
+
+def test_the_figures_mode_draws_from_the_published_tables(reported):
+    from lot.phase5_figures import (
+        FIGURE_FILES, FIGURE_TABLES, HEADLINE_FIGURES, check_published_figures,
+    )
+
+    final = reported.run_dir / "figures" / LEVEL
+    tables = reported.run_dir / "tables" / LEVEL
+    assert reported.figures["published"] == str(final)
+    assert reported.figures["superseded"] is None and reported.figures["not_drawn"] == {}
+    assert sorted(p.name for p in final.iterdir()) == sorted(FIGURE_FILES + ("MANIFEST.json",))
+    manifest = check_published_figures(final, tables)
+    tables_manifest = json.loads((tables / "MANIFEST.json").read_text(encoding="utf-8"))
+    for name in FIGURE_FILES:
+        assert (final / name).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert manifest["figures"][name]["tables"] == {
+            table: tables_manifest["files"][table] for table in FIGURE_TABLES[name]}
+    assert {name for name, entry in manifest["figures"].items() if entry["headline"]} == set(
+        HEADLINE_FIGURES)
+    assert manifest["run_record"]["evaluation_commit"] == CHAIN_COMMIT
+    assert manifest["tables_manifest"]["sha256"] == sha256_file(tables / "MANIFEST.json")
+    assert not [p for p in final.parent.iterdir() if ".partial." in p.name]
+
+
+def test_acceptance_writes_a_verdict_of_every_condition(reported):
+    """The verdict names all twenty-one conditions, each with what it read.
+
+    The conditions whose evidence is this run's own rows, records, and
+    published outputs hold on it: every training curve stable (19), and the
+    figures drawn from the current tables (20). So do the parts of three more
+    that read this run alone: the checkpoints validation selected (11), the
+    headline cells recomputed from the parquet (14), and every disclosure
+    reproduced from its persisted terms (16). Those three also read the
+    suite's results for their test files, which count only as the files
+    registered at E. The world is not the cluster, though. Its chain ran at a
+    commit no repository holds, over one fold and one test scene, a small
+    trunk, and an integration receipt with no steps. So acceptance fails, says
+    which conditions and why, and exits 1. A failed verdict withholds the
+    measured outcome. Each condition's own mutations are
+    tests/test_phase5_acceptance.py's.
+    """
+    from lot.phase5_acceptance import CONDITION_TITLES, verdict_path
+    from lot.phase5_modes import LEDGER_FILE
+
+    path = verdict_path(reported.evidence, LEVEL)
+    verdict = json.loads(path.read_text(encoding="utf-8"))
+    assert verdict["kind"] == "phase5_acceptance" and verdict["level"] == LEVEL
+    numbers = list(range(1, 22))
+    assert [c["number"] for c in verdict["conditions"]] == numbers
+    assert [c["title"] for c in verdict["conditions"]] == [CONDITION_TITLES[n] for n in numbers]
+    for condition in verdict["conditions"]:
+        assert isinstance(condition["ok"], bool) and condition["notes"], condition["number"]
+        assert isinstance(condition["evidence"], dict), condition["number"]
+        if not condition["ok"]:
+            assert any(note.startswith("FAIL ") for note in condition["notes"])
+    failed = [c["number"] for c in verdict["conditions"] if not c["ok"]]
+    assert verdict["failed_conditions"] == failed
+    assert {19, 20}.isdisjoint(failed), failed
+    for number in (11, 14, 16):
+        failing = [note for note in verdict["conditions"][number - 1]["notes"]
+                   if note.startswith("FAIL ")]
+        assert failing and all(f"at E {CHAIN_COMMIT}" in note for note in failing), failing
+    second = "\n".join(verdict["conditions"][1]["notes"])
+    assert 2 in failed and f"E {CHAIN_COMMIT} does not exist" in second, second
+    assert verdict["passed"] is False and reported.status == 1
+    assert "PHASE 5 ACCEPTANCE" in reported.report and "NOT SATISFIED" in reported.report
+
+    assert verdict["evaluation_commit"] == CHAIN_COMMIT
+    tables = reported.run_dir / "tables" / LEVEL
+    figures = reported.run_dir / "figures" / LEVEL
+    tables_manifest = json.loads((tables / "MANIFEST.json").read_text(encoding="utf-8"))
+    figures_manifest = json.loads((figures / "MANIFEST.json").read_text(encoding="utf-8"))
+    assert verdict["tables"]["files"] == tables_manifest["files"]
+    assert verdict["tables"]["manifest_sha256"] == sha256_file(tables / "MANIFEST.json")
+    assert verdict["figures"]["files"] == figures_manifest["files"]
+    assert verdict["evaluation_artifacts"] == {
+        TEST_SCENE: sha256_file(reported.run_dir / "eval" / LEVEL / f"{TEST_SCENE}.parquet")}
+    assert {stem: entry["sha256"] for stem, entry in verdict["receipts"].items()} == (
+        reported.identity.licence)
+    assert verdict["checkpoints"] == reported.checkpoints
+    # Any failure is a stop, so the outcome the tables publish is withheld here.
+    for field in ("measured_outcome", "findings"):
+        assert "withheld" in verdict[field] and verdict[field]["failed_conditions"] == failed
+    assert "Measured outcome" not in reported.report and "withheld" in reported.report
+    assert read_rows(tables / "phase5_measured_outcome.parquet")
+    rendered = reported.evidence / LEDGER_FILE
+    assert verdict["evaluation_ledger"]["sha256"] == sha256_file(rendered)
+    assert len(rendered.read_text(encoding="utf-8").splitlines()) == 1

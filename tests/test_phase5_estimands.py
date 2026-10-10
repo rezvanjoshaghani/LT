@@ -1508,3 +1508,428 @@ def test_every_support_carries_a_no_warp_copy_level_under_each_metric():
         for quantity, population in levels.items():
             assert quantity in forms, (quantity, metric)
             assert QUANTITY_POPULATION[quantity] == population, quantity
+
+
+# ---------------------------------------------------------------------------
+# What the Phase 5 tables read, added before commit E: the public interval,
+# the disclosure terms with their replicates, the comparison-weighted
+# diagnostic, the region contrasts, and the L2 companions. Every existing
+# quantity, population, and wording above is unchanged.
+# ---------------------------------------------------------------------------
+
+from lot.phase5_estimands import (  # noqa: E402
+    DISCLOSURE_PAIR,
+    INTERPRETED_EFFECTS,
+    L2_METRICS,
+    L2_QUANTITY_POPULATION,
+    PRIMARY_FIELDS,
+    READ_DEFICIT,
+    REGION_CONTRASTS,
+    SPLAT_FIELDS,
+    comparison_weighted,
+    disclosure_terms,
+    evaluate_contrast,
+    l2_quantity_formulas,
+    pivot_regions,
+    population_count_field,
+    population_fields,
+    quantity_interval,
+    quantity_population,
+)
+
+# Cosine quantities on every population, the disclosure terms among them.
+INTERVAL_QUANTITIES = (
+    "cl_transport", "predict_with_depth", "mean_feature", "cl_margin", "delta_learn_pp",
+    "tl_reference", "delta_formulation", "delta_learn_sp", "sp_no_warp_copy",
+    "x_delta_learn_pp", "x_delta_learn_sp", "path_difference_learn",
+)
+
+
+def _with_camera_pair(records: list[dict]) -> list[dict]:
+    for record in records:
+        record["camera_pair"] = f"{record['scene']}|{record['pair']}"
+    return records
+
+
+def test_quantity_interval_is_the_private_interval_unchanged():
+    from lot.phase5_estimands import _interval_for
+
+    records = make_records(n_scenes=6, pairs_per_scene=5)
+    for metric in ("raw", "centered"):
+        for quantity in INTERVAL_QUANTITIES:
+            if quantity not in quantity_formulas(metric):
+                continue
+            public = quantity_interval(records, quantity, metric, ANALYSIS)
+            private = _interval_for(records, quantity, metric, ANALYSIS, "scene")
+            assert public == private, (quantity, metric)
+
+
+def test_quantity_interval_is_the_interval_each_cell_reports():
+    records = make_records(n_scenes=6, pairs_per_scene=5)
+    for record in records[:5]:
+        record["n_splat"] = 0
+    for metric in ("raw", "centered"):
+        for quantity in INTERVAL_QUANTITIES:
+            if quantity not in quantity_formulas(metric):
+                continue
+            cell = evaluate_quantity(records, quantity, metric, ANALYSIS)
+            interval, counts = quantity_interval(records, quantity, metric, ANALYSIS)
+            assert (interval["estimate"], interval["lo"], interval["hi"],
+                    interval["n_replicates"]) == (cell.estimate, cell.lo, cell.hi,
+                                                  cell.n_replicates), quantity
+            assert (counts.n_scenes, counts.n_camera_pairs, counts.n_feature_comparisons) == (
+                cell.n_scenes, cell.n_camera_pairs, cell.n_feature_comparisons), quantity
+            assert counts.is_supported(ANALYSIS) == cell.supported
+            assert interval["n_units"] == cell.n_scenes
+
+
+def test_the_camera_pair_interval_resamples_camera_pairs():
+    """PROTOCOL 3.4: the scene interval is primary and the camera-pair interval
+    secondary. One estimate, two resampling units."""
+    records = _with_camera_pair(make_records(n_scenes=6, pairs_per_scene=5))
+    scene, _ = quantity_interval(records, "delta_learn_pp", "centered", ANALYSIS)
+    pair, counts = quantity_interval(records, "delta_learn_pp", "centered", ANALYSIS,
+                                     unit="camera_pair")
+    assert pair["estimate"] == pytest.approx(scene["estimate"], abs=1e-12)
+    assert (scene["n_units"], pair["n_units"], counts.n_camera_pairs) == (6, 30, 30)
+    assert pair["n_replicates"] == ANALYSIS.bootstrap_resamples
+    assert (pair["lo"], pair["hi"]) != (scene["lo"], scene["hi"])
+
+
+@pytest.mark.parametrize("quantity", sorted(DISCLOSURE_PAIR))
+def test_disclosure_terms_are_the_cell_disclosure_with_their_replicates(quantity):
+    records = make_records(n_scenes=6, pairs_per_scene=5)
+    for record in records[:4]:
+        record["n_intersect"] = 0
+    for metric in ("raw", "centered"):
+        cell = evaluate_quantity(records, quantity, metric, ANALYSIS)
+        terms = disclosure_terms(records, quantity, metric, ANALYSIS)
+        assert terms["quantity"] == quantity and terms["metric"] == metric
+        for path, name in zip(("per_point", "splat_pool", "path_difference"),
+                              DISCLOSURE_PAIR[quantity]):
+            term = terms[path]
+            assert term["quantity"] == name
+            for key in ("estimate", "lo", "hi"):
+                assert term[key] == cell.disclosure[path][key], (path, key)
+            assert term["n_replicates"] == ANALYSIS.bootstrap_resamples
+            assert term["n_units"] == 6
+        reported = terms["reported"]
+        assert (reported["estimate"], reported["lo"], reported["hi"],
+                reported["n_replicates"]) == (cell.estimate, cell.lo, cell.hi, cell.n_replicates)
+        assert (reported["n_camera_pairs"], reported["supported"]) == (
+            cell.n_camera_pairs, cell.supported)
+        assert terms["cross_path_support"] == {
+            "n_scenes": 6, "n_camera_pairs": 26, "n_feature_comparisons": 26 * 640,
+            "supported": False,
+        }
+
+
+def test_the_cross_path_support_is_supported_when_the_shared_cells_are():
+    records = make_records(n_scenes=6, pairs_per_scene=6)
+    terms = disclosure_terms(records, "delta_learn_pp", "centered", ANALYSIS)
+    assert terms["cross_path_support"]["n_camera_pairs"] == 36
+    assert terms["cross_path_support"]["supported"] is True
+
+
+def test_the_formulation_gap_discloses_its_single_path_only():
+    records = make_records(n_scenes=6, pairs_per_scene=5)
+    cell = evaluate_quantity(records, "delta_formulation", "centered", ANALYSIS)
+    terms = disclosure_terms(records, "delta_formulation", "centered", ANALYSIS)
+    for key in ("estimate", "lo", "hi"):
+        assert terms["per_point"][key] == terms["reported"][key] == cell.disclosure["per_point"][key]
+    assert terms["per_point"]["n_replicates"] == terms["reported"]["n_replicates"]
+    assert terms["splat_pool"] is None
+    assert terms["path_difference"] is None
+    assert terms["cross_path_support"] is None
+
+
+@pytest.mark.parametrize("quantity", [
+    "cl_transport", "mean_feature", "tl_reference", "x_delta_learn_pp",
+    "path_difference_learn", "read_deficit", "sp_no_warp_copy",
+])
+def test_disclosure_terms_exist_for_interpreted_effects_only(quantity):
+    with pytest.raises(ValueError, match="interpreted effect"):
+        disclosure_terms(make_records(), quantity, "raw", ANALYSIS)
+
+
+def test_the_comparison_weighted_value_weights_each_pair_by_its_count():
+    """PROTOCOL 3.4's diagnostic: each field's mean weighted by the pair's own
+    count of feature comparisons on the quantity's population, then the
+    quantity's closed form. A pair outside the population carries no weight."""
+    records = make_records(n_scenes=2, pairs_per_scene=2, noise=0.0, scene_spread=0.0)
+    for record, n, cl, predict in zip(records, (100, 300, 0, 600),
+                                      (0.6, 0.7, 0.9, 0.5), (0.5, 0.5, 0.1, 0.45)):
+        record.update(n_primary=n, cl_centered=cl, predict_centered=predict)
+    expected = (100 * 0.1 + 300 * 0.2 + 600 * 0.05) / 1000
+    assert comparison_weighted(records, "delta_learn_pp", "centered") == pytest.approx(
+        expected, abs=1e-15)
+    unweighted = evaluate_quantity(records, "delta_learn_pp", "centered", ANALYSIS).estimate
+    assert unweighted == pytest.approx((0.1 + 0.2 + 0.05) / 3, abs=1e-15)
+
+
+def test_the_comparison_weighted_value_reads_its_own_populations_count():
+    records = make_records(n_scenes=2, pairs_per_scene=2, noise=0.0, scene_spread=0.0)
+    for record, n_splat, value in zip(records, (1, 3, 0, 4), (0.2, 0.6, 0.9, 0.1)):
+        record.update(n_splat=n_splat, n_primary=9, sp_transport_raw=value)
+    assert comparison_weighted(records, "sp_transport", "raw") == pytest.approx(
+        (0.2 + 1.8 + 0.4) / 8, abs=1e-15)
+
+
+def test_the_comparison_weighted_value_is_omitted_for_the_read_deficit():
+    """The deficit's two terms have different counts, the near-grid bin and the
+    whole support, so no one weight describes it."""
+    with pytest.raises(ValueError, match="read_deficit"):
+        comparison_weighted(make_records(), "read_deficit", "centered")
+
+
+def test_the_population_helpers_are_the_registry_the_intervals_read():
+    from lot.phase5_estimands import (
+        FORMULATION_FIELDS, INTERSECTION_FIELDS, OFFSET_BINS, OFFSET_WHOLE,
+        offset_fields, offset_population,
+    )
+
+    assert population_fields(PER_POINT) == PRIMARY_FIELDS
+    assert population_fields(FORMULATION) == FORMULATION_FIELDS
+    assert population_fields(SPLAT_POOL) == SPLAT_FIELDS
+    assert population_fields(CROSS_PATH) == INTERSECTION_FIELDS
+    assert population_fields(READ_DEFICIT) == (
+        offset_fields(OFFSET_BINS[0]) + offset_fields(OFFSET_WHOLE))
+    assert population_count_field(PER_POINT) == "n_primary"
+    assert population_count_field(FORMULATION) == "n_formulation"
+    assert population_count_field(SPLAT_POOL) == "n_splat"
+    assert population_count_field(CROSS_PATH) == "n_intersect"
+    assert population_count_field(READ_DEFICIT) == "offset_n_b0"
+    assert population_count_field(offset_population("b3")) == "offset_n_b3"
+    assert quantity_population("delta_learn_pp", "centered") == PER_POINT
+    assert quantity_population("l2_predict_minus_cl", "l2_raw") == PER_POINT
+    with pytest.raises(ValueError, match="l2_predict_minus_cl"):
+        quantity_population("l2_predict_minus_cl", "centered")
+    with pytest.raises(ValueError, match="delta_learn_pp"):
+        quantity_population("delta_learn_pp", "l2_centered")
+
+
+# ---------------------------------------------------------------------------
+# The L2 companions: named for their sign, no near-zero wording
+# ---------------------------------------------------------------------------
+
+def _l2_means(metric: str) -> dict[str, float]:
+    return {
+        f"cl_{metric}": 0.40, f"predict_{metric}": 0.55, f"nowarp_{metric}": 0.80,
+        f"tl_form_{metric}": 0.35, f"cl_form_{metric}": 0.42, f"nowarp_form_{metric}": 0.81,
+        f"sp_transport_{metric}": 0.30, f"sp_predict_{metric}": 0.36,
+        f"sp_nowarp_{metric}": 0.70,
+        "meanfeat_l2_raw": 0.9, "meanfeat_form_l2_raw": 0.91, "sp_meanfeat_l2_raw": 0.92,
+    }
+
+
+@pytest.mark.parametrize("metric", L2_METRICS)
+def test_the_l2_differences_are_named_for_their_sign(metric):
+    """Positive means the first-named method is farther from the target, so
+    l2_predict_minus_cl has the sign of delta_learn_pp."""
+    forms = l2_quantity_formulas(metric)
+    means = _l2_means(metric)
+    expected = {
+        "l2_cl_transport": 0.40, "l2_predict_with_depth": 0.55, "l2_no_warp_copy": 0.80,
+        "l2_predict_minus_cl": 0.15, "l2_nowarp_minus_cl": 0.40,
+        "l2_nowarp_minus_predict": 0.25,
+        "l2_tl_reference": 0.35, "l2_cl_on_formulation_support": 0.42,
+        "l2_no_warp_copy_form": 0.81, "l2_cl_form_minus_tl_form": 0.07,
+        "l2_sp_transport": 0.30, "l2_sp_predict": 0.36, "l2_sp_no_warp_copy": 0.70,
+        "l2_sp_predict_minus_transport": 0.06, "l2_sp_nowarp_minus_transport": 0.40,
+        "l2_sp_nowarp_minus_predict": 0.34,
+    }
+    if metric == "l2_raw":
+        expected.update(l2_mean_feature=0.9, l2_mean_feature_form=0.91,
+                        l2_sp_mean_feature=0.92)
+    assert set(forms) == set(expected)
+    for name, value in expected.items():
+        assert forms[name](means) == pytest.approx(value, abs=1e-12), name
+
+
+def test_the_l2_registry_is_apart_from_the_cosine_one():
+    """No L2 quantity is an interpreted effect, none is in the cosine registry,
+    and evaluate_quantity, the only path to near-zero wording, refuses an L2
+    metric. The band is calibrated on cosine."""
+    names = set(l2_quantity_formulas("l2_raw")) | set(l2_quantity_formulas("l2_centered"))
+    assert names == set(L2_QUANTITY_POPULATION)
+    assert all(name.startswith("l2_") for name in names)
+    assert not names & set(QUANTITY_POPULATION)
+    assert not names & INTERPRETED_EFFECTS
+    assert set(L2_QUANTITY_POPULATION.values()) == {PER_POINT, FORMULATION, SPLAT_POOL}
+    for metric in L2_METRICS:
+        with pytest.raises(ValueError, match="metric"):
+            evaluate_quantity(make_records(), "delta_learn_pp", metric, ANALYSIS)
+    with pytest.raises(ValueError, match="l2"):
+        l2_quantity_formulas("raw")
+
+
+def test_an_l2_interval_reads_the_l2_columns_of_its_population():
+    records = make_records(n_scenes=6, pairs_per_scene=5, noise=0.0, scene_spread=0.0)
+    for record in records:
+        record.update(cl_l2_centered=0.40, predict_l2_centered=0.55)
+    for record in records[:5]:
+        record["n_primary"] = 0
+    interval, counts = quantity_interval(records, "l2_predict_minus_cl", "l2_centered",
+                                         ANALYSIS)
+    assert interval["estimate"] == pytest.approx(0.15, abs=1e-12)
+    assert interval["lo"] == pytest.approx(0.15, abs=1e-12)
+    assert counts.n_camera_pairs == 25
+    assert comparison_weighted(records, "l2_predict_minus_cl", "l2_centered") == (
+        pytest.approx(0.15, abs=1e-12))
+
+
+# ---------------------------------------------------------------------------
+# The region contrasts: paired over the pairs present in both regions
+# ---------------------------------------------------------------------------
+
+REGION_SHIFT = {
+    # region: (Context-Lift shift, Predict-with-Depth shift, count)
+    "boundary": (-0.04, -0.01, 40),
+    "interior": (0.01, 0.005, 60),
+    "low_texture": (-0.02, -0.02, 30),
+    "high_texture": (0.01, 0.01, 70),
+}
+
+
+def _region_records(n_scenes: int = 3, pairs_per_scene: int = 4) -> list[dict]:
+    """Per-point region records whose regions differ by a constant shift."""
+    out = []
+    for s in range(n_scenes):
+        for p in range(pairs_per_scene):
+            level = 0.55 + 0.05 * s + 0.003 * p
+            for region, (cl_shift, predict_shift, n) in REGION_SHIFT.items():
+                record = {"scene": f"scene_{s}", "camera_pair": f"scene_{s}|{p}",
+                          "region": region, "n_primary": n}
+                for field in PRIMARY_FIELDS:
+                    record[field] = level
+                for metric in ("raw", "centered"):
+                    record[f"cl_{metric}"] = level + 0.07 + cl_shift
+                    record[f"predict_{metric}"] = level + predict_shift
+                out.append(record)
+    return out
+
+
+def test_region_contrasts_are_the_two_registered_splits():
+    assert REGION_CONTRASTS == {
+        "boundary_minus_interior": ("boundary", "interior"),
+        "low_minus_high_texture": ("low_texture", "high_texture"),
+    }
+
+
+def test_a_pivot_keeps_the_pairs_present_in_both_regions_only():
+    records = _region_records()
+    # One pair has no boundary sample at all, and one has no interior record.
+    for record in records:
+        if record["camera_pair"] == "scene_0|1" and record["region"] == "boundary":
+            record["n_primary"] = 0
+    records = [r for r in records
+               if not (r["camera_pair"] == "scene_2|3" and r["region"] == "interior")]
+    pivot = pivot_regions(records, "boundary_minus_interior", PER_POINT)
+    assert [r["camera_pair"] for r in pivot] == sorted(
+        f"scene_{s}|{p}" for s in range(3) for p in range(4)
+        if (s, p) not in ((0, 1), (2, 3)))
+    first = pivot[0]
+    assert first["scene"] == "scene_0"
+    assert first["n_primary@boundary"] == 40 and first["n_primary@interior"] == 60
+    assert first["n_primary"] == 100
+    assert first["cl_centered@boundary"] == pytest.approx(0.55 + 0.07 - 0.04)
+    assert first["predict_raw@interior"] == pytest.approx(0.55 + 0.005)
+    assert set(first) == {"scene", "camera_pair", "n_primary", "n_primary@boundary",
+                          "n_primary@interior"} | {
+        f"{field}@{region}" for field in PRIMARY_FIELDS for region in ("boundary", "interior")}
+
+
+@pytest.mark.parametrize("contrast, expected", [
+    ("boundary_minus_interior", {
+        "cl_transport": -0.05, "predict_with_depth": -0.015, "delta_learn_pp": -0.035}),
+    ("low_minus_high_texture", {
+        "cl_transport": -0.03, "predict_with_depth": -0.03, "delta_learn_pp": 0.0}),
+])
+def test_a_contrast_is_the_paired_difference_of_its_two_regions(contrast, expected):
+    records = _region_records()
+    pivot = pivot_regions(records, contrast, PER_POINT)
+    for metric in ("raw", "centered"):
+        for quantity, value in expected.items():
+            out = evaluate_contrast(pivot, contrast, quantity, metric, ANALYSIS)
+            # Every pair carries the same shift, so every replicate does too.
+            assert out["estimate"] == pytest.approx(value, abs=1e-12), quantity
+            assert out["lo"] == pytest.approx(value, abs=1e-12)
+            assert out["hi"] == pytest.approx(value, abs=1e-12)
+            assert out["n_replicates"] == ANALYSIS.bootstrap_resamples
+            assert (out["n_scenes"], out["n_camera_pairs"]) == (3, 12)
+            assert out["n_feature_comparisons"] == 12 * 100
+            assert out["supported"] is False
+            assert (out["contrast"], out["quantity"], out["metric"], out["unit"]) == (
+                contrast, quantity, metric, "scene")
+
+
+def test_the_gap_contrast_is_the_difference_of_the_method_contrasts():
+    """Each method's sensitivity to the region, and their difference, are
+    computed on one set of pairs, so they compose exactly."""
+    rng = np.random.default_rng(3)
+    records = _region_records(n_scenes=6, pairs_per_scene=6)
+    for record in records:
+        record["cl_centered"] += rng.normal(0, 0.01)
+        record["predict_centered"] += rng.normal(0, 0.01)
+    pivot = pivot_regions(records, "boundary_minus_interior", PER_POINT)
+
+    def estimate(quantity, unit="scene"):
+        return evaluate_contrast(pivot, "boundary_minus_interior", quantity, "centered",
+                                 ANALYSIS, unit=unit)
+
+    gap = estimate("delta_learn_pp")
+    assert gap["estimate"] == pytest.approx(
+        estimate("cl_transport")["estimate"] - estimate("predict_with_depth")["estimate"],
+        abs=1e-12)
+    assert gap["lo"] < gap["estimate"] < gap["hi"]
+    assert gap["supported"] is True
+    by_pair = estimate("delta_learn_pp", unit="camera_pair")
+    assert by_pair["estimate"] == pytest.approx(gap["estimate"], abs=1e-12)
+    assert by_pair["n_units"] == 36 and gap["n_units"] == 6
+
+
+def test_the_splat_contrast_reads_the_splat_population():
+    records = []
+    for s in range(3):
+        for p in range(2):
+            for region, value, n in (("boundary", 0.5, 7), ("interior", 0.6, 0)):
+                record = {"scene": f"scene_{s}", "camera_pair": f"scene_{s}|{p}",
+                          "region": region, "n_splat": n}
+                record.update({field: value for field in SPLAT_FIELDS})
+                records.append(record)
+    # The interior holds no splat cell, so no pair has both arms.
+    assert pivot_regions(records, "boundary_minus_interior", SPLAT_POOL) == []
+    for record in records:
+        record["n_splat"] = 5
+    pivot = pivot_regions(records, "boundary_minus_interior", SPLAT_POOL)
+    out = evaluate_contrast(pivot, "boundary_minus_interior", "sp_transport", "raw", ANALYSIS)
+    assert out["estimate"] == pytest.approx(-0.1, abs=1e-12)
+    assert out["n_feature_comparisons"] == 6 * 10
+
+
+def test_a_contrast_refuses_what_it_cannot_pair():
+    records = _region_records()
+    with pytest.raises(ValueError, match="twice"):
+        pivot_regions(records + records[:1], "boundary_minus_interior", PER_POINT)
+    with pytest.raises(ValueError, match="contrast"):
+        pivot_regions(records, "left_minus_right", PER_POINT)
+    with pytest.raises(ValueError, match="population"):
+        pivot_regions(records, "boundary_minus_interior", CROSS_PATH)
+    pivot = pivot_regions(records, "boundary_minus_interior", PER_POINT)
+    with pytest.raises(ValueError, match="sp_transport"):
+        evaluate_contrast(pivot, "boundary_minus_interior", "sp_transport", "raw", ANALYSIS)
+    with pytest.raises(ValueError, match="mean_feature"):
+        evaluate_contrast(pivot, "boundary_minus_interior", "mean_feature", "centered",
+                          ANALYSIS)
+    empty = evaluate_contrast([], "boundary_minus_interior", "delta_learn_pp", "raw",
+                              ANALYSIS)
+    assert math.isnan(empty["estimate"]) and empty["n_replicates"] == 0
+    assert empty["n_camera_pairs"] == 0 and empty["supported"] is False
+
+
+def test_the_module_text_uses_no_em_dash_and_no_letter_method_labels():
+    import lot.phase5_estimands as estimands
+
+    source = Path(estimands.__file__).read_text(encoding="utf-8")
+    assert "\u2014" not in source
+    assert not re.search(r"\bmethod [ABC]\b", source)

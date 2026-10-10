@@ -57,6 +57,7 @@ from lot.render_replica import (
     FrameRecord,
     Manifest,
     intrinsics_from_hfov,
+    program_orbit,
     program_rotation,
     program_translation,
     write_frame_stats,
@@ -105,8 +106,15 @@ def surface_features(frame: FrameRecord, depth: np.ndarray) -> np.ndarray:
     return surface_field(world).astype(np.float16)
 
 
-def build_scene(root, est_transform=lambda gt: gt / EST_SCALE, scene=SCENE):
-    """A full synthetic scene with feature and estimated-depth caches."""
+def build_scene(root, est_transform=lambda gt: gt / EST_SCALE, scene=SCENE,
+                orbit_azimuths_deg=()):
+    """A full synthetic scene with feature and estimated-depth caches.
+
+    The camera program is a yaw sweep and a translation sweep. Given
+    orbit_azimuths_deg, an orbit sweep is added: one radius, about the anchor
+    3 m in front of the base camera, at each azimuth. The default adds none,
+    so every existing caller builds the scene it always built.
+    """
     from PIL import Image
 
     scene_root = root / scene
@@ -123,6 +131,10 @@ def build_scene(root, est_transform=lambda gt: gt / EST_SCALE, scene=SCENE):
     posed = program_rotation(base_pose(), [-10.0, -5.0, 0.0, 5.0, 10.0], []) + (
         program_translation(base_pose(), [0.05, 0.1], 3.0)
     )
+    if orbit_azimuths_deg:
+        # The base camera looks along world +z with world -y up.
+        up = torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64)
+        posed += program_orbit(base_pose(), 3.0, [1.0], list(orbit_azimuths_deg), up)
     frames, features, est_depth = [], {}, {}
     counters: dict[str, int] = {}
     for frame in posed:

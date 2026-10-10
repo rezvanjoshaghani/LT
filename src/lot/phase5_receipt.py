@@ -20,7 +20,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # The identity a receipt must carry forward. Each is something that, if it
 # changed, would mean the gate verified a different experiment.
@@ -89,6 +89,20 @@ OVERFIT_RECEIPT_DIGEST = "overfit_receipt_sha256"
 LOCK_RERUN = "the checkpoint lock"
 
 
+def gate_steps(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """The integration gate's step records: the mappings in the list under "steps".
+
+    The overfit receipt uses the same key for its optimizer step count, an
+    int, so the key holds gate steps only when it holds a list. Reading the
+    count as a list raised TypeError, which stopped every mode after the
+    overfit gate at its receipt check.
+    """
+    steps = report.get("steps")
+    if not isinstance(steps, list):
+        return []
+    return [step for step in steps if isinstance(step, dict)]
+
+
 def receipt_identity(report: dict[str, Any]) -> dict[str, Any]:
     """Pull the identity out of a gate report, wherever the writer put it.
 
@@ -99,7 +113,7 @@ def receipt_identity(report: dict[str, Any]) -> dict[str, Any]:
     identity: dict[str, Any] = {
         key: report[key] for key in BOUND_FIELDS if key in report
     }
-    for step in report.get("steps", []):
+    for step in gate_steps(report):
         evidence = step.get("evidence") or {}
         for key in BOUND_FIELDS:
             if key in evidence and key not in identity:
@@ -144,11 +158,79 @@ def verify(
 ) -> list[str]:
     """Return a list of human-readable problems. Empty means the receipt stands.
 
+    Bound to HEAD: the receipt must carry the identity of the state about to
+    run, as current_identity reads it from config_path and the checkout. Every
+    mode of the chain asks this question. verify_against asks it of another
+    identity, which is what the reporting modes need.
+
     kind names the receipt expected here; None reads it from the receipt itself.
     gate_receipt is the integration receipt an overfit or lock receipt must be
     bound to. overfit_receipt is the overfit receipt a lock receipt must be
     bound to. level is the alignment level a lock receipt must lock. The last
     two are read for a lock receipt only.
+    """
+    return _verify_receipt(
+        receipt_path, config_path, label, lambda: current_identity(config_path),
+        "current", kind, gate_receipt, overfit_receipt, level,
+    )
+
+
+def verify_against(
+    receipt_path: Path,
+    config_path: Path,
+    label: str,
+    expected: dict[str, Any],
+    *,
+    kind: str | None = None,
+    gate_receipt: Path | None = None,
+    overfit_receipt: Path | None = None,
+    level: str | None = None,
+    reference: str = "expected",
+) -> list[str]:
+    """verify, bound to a given identity instead of HEAD's.
+
+    reporting_rules.md decision 1. The chain runs at one commit E, and the
+    reporting modes may run later. They pass the identity of the evaluated
+    run, commit E with its config, fold, and measurement digests, so each
+    receipt is checked against the run it licensed and not against the
+    reporting commit. Everything else is verify's: the verdict, the kind, the
+    bindings between receipts by sha256, and the live inputs and files each
+    kind binds by content.
+
+    expected must name every field of BOUND_FIELDS; one left out would leave
+    that field unbound, so it raises ValueError. reference names the expected
+    identity in a problem, where verify says "current".
+    """
+    missing = [field for field in BOUND_FIELDS if field not in expected]
+    if missing:
+        raise ValueError(
+            f"the identity to verify {label} against names no {missing}; every "
+            f"field of {BOUND_FIELDS} must be bound"
+        )
+    identity = {field: expected[field] for field in BOUND_FIELDS}
+    return _verify_receipt(
+        receipt_path, config_path, label, lambda: identity,
+        reference, kind, gate_receipt, overfit_receipt, level,
+    )
+
+
+def _verify_receipt(
+    receipt_path: Path,
+    config_path: Path,
+    label: str,
+    identity: Callable[[], dict[str, Any]],
+    reference: str,
+    kind: str | None,
+    gate_receipt: Path | None,
+    overfit_receipt: Path | None,
+    level: str | None,
+) -> list[str]:
+    """The core of verify and verify_against.
+
+    identity returns the identity the receipt must carry. It is called only
+    after the receipt has been read, so a receipt that cannot be read is
+    reported as such whatever the identity would have required. reference
+    names that identity in a problem.
     """
     problems: list[str] = []
     try:
@@ -165,7 +247,7 @@ def verify(
         problems.append(f"{label}: the recorded verdict is FAIL{detail}")
 
     recorded = receipt_identity(report)
-    current = current_identity(config_path)
+    current = identity()
     for field in BOUND_FIELDS:
         if field not in recorded:
             problems.append(
@@ -177,7 +259,7 @@ def verify(
             problems.append(
                 f"{label}: {field} moved since the receipt was written.\n"
                 f"    receipt: {recorded[field]}\n"
-                f"    current: {current[field]}\n"
+                f"    {reference}: {current[field]}\n"
                 "    The gate verified a different state. Rerun it."
             )
 
@@ -536,7 +618,7 @@ def _scene_identity_problems(report: dict[str, Any], cfg: Any, label: str) -> li
 
 def receipt_artifacts(report: dict[str, Any]) -> dict[str, Any]:
     """The resolved-artifact block a gate receipt records at step 2."""
-    for step in report.get("steps", []):
+    for step in gate_steps(report):
         evidence = step.get("evidence") or {}
         if "artifacts" in evidence:
             return evidence["artifacts"]
@@ -546,7 +628,7 @@ def receipt_artifacts(report: dict[str, Any]) -> dict[str, Any]:
 def receipt_scene_identities(report: dict[str, Any]) -> dict[str, Any]:
     """The per-scene identity block the gate records at step 2 and extends at 4."""
     found: dict[str, Any] = {}
-    for step in report.get("steps", []):
+    for step in gate_steps(report):
         evidence = step.get("evidence") or {}
         block = evidence.get("scene_identities")
         if isinstance(block, dict):

@@ -12,6 +12,11 @@ lives in the modules it calls:
     lot.phase5_estimands    the reported quantities and their paired intervals
     lot.phase5_folds        the frozen scene assignment
 
+The reporting modes, tables, figures, and acceptance, read an evaluated run
+through lot.phase5_report, lot.phase5_figures, and lot.phase5_acceptance. They
+are licensed by the evaluated run itself, through lot.phase5_provenance, never
+by the receipts the chain's modes check. See run_reporting_mode.
+
 Aligned context depth is not recomputed by a second implementation here. This
 module calls Phase 4's own `frame_calibration` and `aligned_depth` through the
 same per-frame sequence Phase 4 runs, so the depth both headline methods consume
@@ -618,6 +623,14 @@ def fold_and_seed_for_task(task_index: int, seeds: Sequence[int]) -> tuple[Fold,
     return folds[task_index // len(seeds)], seeds[task_index % len(seeds)]
 
 
+# The reporting modes, Streams AC and AD. They run after the chain, at its
+# commit or a later one, and are licensed by the evaluated run itself.
+REPORTING_MODES = ("tables", "figures", "acceptance")
+# The reporting modes that publish a directory once, which --supersede moves
+# aside and builds again.
+SUPERSEDABLE_MODES = ("tables", "figures")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The entry point's arguments.
 
@@ -629,7 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         choices=("describe", "check", "overfit", "train", "controls", "lock",
-                 "evaluate"),
+                 "evaluate") + REPORTING_MODES,
         default="describe",
     )
     parser.add_argument("--task-index", type=int, default=0)
@@ -642,11 +655,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--scene-index", type=int, default=None,
         help="evaluate one test scene, by its index in the fixed evaluation order",
     )
+    parser.add_argument(
+        "--supersede", action="store_true",
+        help="tables and figures only: move the level's published output aside, "
+             "deleting nothing, and build it again",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.supersede and args.mode not in SUPERSEDABLE_MODES:
+        raise SystemExit(
+            f"--supersede applies to the tables and figures modes, not to {args.mode!r}. "
+            "Acceptance keeps every earlier verdict without it, and no mode of the "
+            "chain rebuilds an output."
+        )
 
     cfg = load_phase5_config(args.config)
     analysis = load_analysis_config(Path(cfg.analysis_config))
@@ -698,7 +722,135 @@ def main(argv: list[str] | None = None) -> None:
             print(f"previous receipt kept at {outcome['archived_previous']}")
         raise SystemExit(0 if report.passed else 1)
 
+    if args.mode in REPORTING_MODES:
+        # Before run_mode, so require_receipts is never asked: these modes are
+        # licensed by the evaluated run, not by receipts bound to HEAD.
+        raise SystemExit(run_reporting_mode(
+            cfg, analysis, args.config, args.mode, args.level, supersede=args.supersede,
+        ))
+
     run_mode(cfg, analysis, args)
+
+
+def run_reporting_mode(
+    cfg: Phase5Config,
+    analysis: AnalysisConfig,
+    config_path: Path,
+    mode: str,
+    level: str | None = None,
+    *,
+    supersede: bool = False,
+) -> int:
+    """tables, figures, or acceptance, licensed by the evaluated run itself.
+
+    reporting_rules.md decision 1 runs the chain once, at commit E, and its
+    receipts are bound to E. These modes may run later, at a reporting commit
+    R, so they never ask require_receipts, which binds every receipt to HEAD.
+    They ask lot.phase5_provenance.require_evaluated_run instead: was the run
+    evaluated at E licensed, is it complete and coherent, and is the code at R
+    still the code that measured it? tables and figures ask it inside their
+    own functions. acceptance asks it here, as its licence, before any
+    condition is re-derived, so a run that licenses no report gets no verdict.
+    Past the licence, every condition is re-derived, and the verdict lists
+    every failure.
+
+    level defaults to the primary level. An undeclared level is refused with
+    SystemExit, as every mode refuses it. Any other declared level is reported
+    only after the primary level's tables are published and verify, through
+    lot.phase5_report.require_primary_tables, and only when its run shares
+    the primary run's commit E, digests, and gate receipts,
+    lot.phase5_provenance.require_primary_chain, reporting_rules.md decision
+    4. tables and figures bind the chain inside their own functions, and
+    acceptance binds it here. With supersede, an earlier tables or figures
+    output is moved aside, deleting nothing, and built again.
+
+    Returns the exit status: 0 when the mode passed, 1 on a stop or a failed
+    acceptance. A stop is a refusal the reporting code names: a provenance,
+    tables, or figures stop, an outcome anomaly, a headline substitution, an
+    output that exists, or an input that is absent. It is printed with every
+    problem it lists. Any other error propagates with its traceback.
+    """
+    import sys
+
+    from .phase5_acceptance import run_acceptance
+    from .phase5_estimands import HeadlineSubstitutionError
+    from .phase5_figures import FiguresStop, run_figures
+    from .phase5_outcomes import OutcomeAnomaly
+    from .phase5_provenance import (
+        ProvenanceError,
+        require_evaluated_run,
+        require_primary_chain,
+    )
+    from .phase5_report import TABLES_DIR, TablesStop, require_primary_tables, run_tables
+
+    if mode not in REPORTING_MODES:
+        raise ValueError(f"{mode!r} is not a reporting mode: {REPORTING_MODES}")
+    if supersede and mode not in SUPERSEDABLE_MODES:
+        raise ValueError(f"--supersede applies to {SUPERSEDABLE_MODES}, not to {mode!r}")
+    level = level or cfg.primary_alignment_level
+    declared = (
+        cfg.primary_alignment_level,
+        *cfg.sensitivity_alignment_levels,
+        *cfg.diagnostic_alignment_levels,
+    )
+    if level not in declared:
+        raise SystemExit(f"level {level!r} is not declared in the frozen config: {declared}")
+    stops = (ProvenanceError, TablesStop, FiguresStop, OutcomeAnomaly,
+             HeadlineSubstitutionError, FileExistsError, FileNotFoundError)
+
+    def stopped(error: BaseException) -> int:
+        print(f"{mode} stopped: {error}", file=sys.stderr)
+        return 1
+
+    primary = cfg.primary_alignment_level
+    primary_tables = None
+    if level != primary:
+        # A sensitivity or diagnostic level is read beside the primary result,
+        # so the primary tables must exist and verify as they were published.
+        try:
+            primary_tables = require_primary_tables(Path(cfg.run_dir) / TABLES_DIR / primary,
+                                                    primary_level=primary)
+        except (FileNotFoundError, ValueError) as error:
+            return stopped(error)
+
+    try:
+        if mode == "tables":
+            outcome = run_tables(cfg, analysis, config_path, level, supersede=supersede)
+        elif mode == "figures":
+            outcome = run_figures(cfg, analysis, config_path, level, supersede=supersede)
+        else:
+            identity = require_evaluated_run(cfg, analysis, config_path, level)
+            if primary_tables is not None:
+                # Decision 4: the level ran under the primary level's chain.
+                require_primary_chain(primary_tables.run_record, identity)
+            return run_acceptance(cfg, analysis, config_path, level)
+    except stops as error:
+        return stopped(error)
+    print_published(mode, level, outcome)
+    return 0
+
+
+def print_published(mode: str, level: str, outcome: dict[str, Any]) -> None:
+    """Where a tables or figures output was published, and the run it reports.
+
+    The run's commits are read from the output's own MANIFEST.json, so the log
+    names E and R as the output records them.
+    """
+    from .phase5_report import MANIFEST_FILE
+
+    published = Path(outcome["published"])
+    manifest = json.loads((published / MANIFEST_FILE).read_text(encoding="utf-8"))
+    record = manifest.get("run_record") if isinstance(manifest, dict) else None
+    record = record if isinstance(record, dict) else {}
+    print(f"{mode.upper()}, level {level}: published at {published}")
+    print(f"  evaluation commit E  {record.get('evaluation_commit')}")
+    print(f"  reporting commit R   {record.get('report_commit')}")
+    if outcome.get("superseded"):
+        print(f"  the earlier output was moved aside to {outcome['superseded']}")
+    written = list(outcome.get("written") or [])
+    print(f"  {len(written)} files written, {MANIFEST_FILE} last: {', '.join(written)}")
+    for name, reason in sorted((outcome.get("not_drawn") or {}).items()):
+        print(f"  not drawn at level {level}: {name}. {reason}")
 
 
 def scene_image_hw(cfg: Phase5Config, scene: str) -> tuple[int, int]:

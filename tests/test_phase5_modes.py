@@ -869,3 +869,138 @@ def test_an_undeclared_level_is_refused(world, tmp_path):
     with pytest.raises(SystemExit, match="not declared"):
         main(["--config", str(_config_file(world, tmp_path)), "--mode", "train",
               "--level", "scene"])
+
+
+# ---------------------------------------------------------------------------
+# Integration gate step 8, driven on the synthetic world
+# ---------------------------------------------------------------------------
+#
+# The first real run of the gate stopped at step 8 on cell 1369 of a 37 by 37
+# grid. Step 8 mapped every context patch to a target cell, including patches
+# that never landed, and patch_cell_index does not bound-check: a patch just
+# past the right edge wraps into the next row's first cell, and only the last
+# row's overflow leaves the grid. These tests are written from that failure.
+
+def _lift_and_support(world, store, pair):
+    from lot.context_lift import context_lift_map, context_lift_support
+    from lot.phase5 import aligned_context_depth, pair_cameras
+    from lot.phase5_score import primary_support
+
+    cfg, analysis = world["cfg"], world["analysis"]
+    inputs = store.get(TEST_SCENE)
+    cams = pair_cameras(cfg, inputs, pair)
+    dtype = cfg.torch_dtype
+    gt_c = inputs.cache.depth(cams.context.depth_path).to(dtype)
+    gt_t = inputs.cache.depth(cams.target.depth_path).to(dtype)
+    depth = aligned_context_depth(inputs, pair.context_frame_id, LEVEL)
+    lift = context_lift_map(
+        torch.from_numpy(depth).to(dtype), cams.K_context, cams.K_target,
+        cams.T_target_from_context, cams.context_hw, cams.target_hw,
+    )
+    support = primary_support(lift, context_lift_support(
+        lift, gt_c, gt_t, cams.K_context, cams.K_target, cams.T_target_from_context,
+        rel_tol=analysis.covisible_relative_depth_tol,
+    ))
+    return inputs, cams, gt_c, gt_t, lift, support
+
+
+def _overflowing_pair(world, store):
+    """A supported pair whose unlanded edge patches map outside the target grid."""
+    from lot.encoders import patch_cell_index
+
+    for pair in phase5_scene_pairs(world["cfg"], world["analysis"], TEST_SCENE):
+        _, cams, _, _, lift, support = _lift_and_support(world, store, pair)
+        if not support.any():
+            continue
+        n_cells = (cams.target_hw[0] // 14) * (cams.target_hw[1] // 14)
+        every = patch_cell_index(lift.uv_target, cams.target_hw, 14)
+        if ((every < 0) | (every >= n_cells)).any():
+            return pair
+    raise AssertionError("the fixture must hold a supported pair with unlanded overflow")
+
+
+def _step8_arguments(world, store, pair):
+    """Gate step 8's inputs for one pair, assembled as evaluate assembles them."""
+    from lot.phase5_reference import read_phase4_reference, recompute_reference_arms
+
+    cfg, analysis = world["cfg"], world["analysis"]
+    inputs, cams, gt_c, gt_t, lift, support = _lift_and_support(world, store, pair)
+    ctx, tgt = pair.context_frame_id, pair.target_frame_id
+    fc = inputs.cache.features(cfg.feature_encoder, ctx)
+    ft = inputs.cache.features(cfg.feature_encoder, tgt)
+    arms = recompute_reference_arms(
+        gt_c, gt_t, inputs.est_maps[ctx], inputs.est_maps[tgt], inputs.calibrations[ctx],
+        fc, ft, cams.K_context, cams.K_target, cams.T_target_from_context,
+        TEST_SCENE, ctx, tgt, analysis, LEVEL, cfg.torch_dtype,
+    )
+    reference = read_phase4_reference(Path(cfg.phase4_dir) / "eval", TEST_SCENE, LEVEL)
+    return {
+        "lift": lift, "support": support, "arms": arms,
+        "persisted": reference["pairs"].get((ctx, tgt)),
+        "center": world["center"], "features_context": fc,
+        "target_hw": cams.target_hw, "where": f"{TEST_SCENE} {ctx} -> {tgt}",
+    }
+
+
+def test_gate_step_eight_maps_only_the_supported_samples(world, store, evaluated):
+    """The pair overflows the grid with unlanded patches, and step 8 now passes.
+
+    Its report is the formulation evaluate recorded for the same pair, because
+    step 8 runs the same functions on the same inputs.
+    """
+    from lot.phase5_gate import formulation_support_evidence
+
+    pair = _overflowing_pair(world, store)
+    args = _step8_arguments(world, store, pair)
+    evidence = formulation_support_evidence(**args)
+    assert evidence["cl_supported_samples"] == int(args["support"].sum())
+    assert evidence["common_cells"] > 0
+    record = _record(evaluated, (pair.context_frame_id, pair.target_frame_id))
+    assert evidence["common_cells"] == record["n_formulation"]
+    assert evidence["tl_form_centered"] == pytest.approx(record["tl_form_centered"], abs=1e-12)
+    assert evidence["cl_form_centered"] == pytest.approx(record["cl_form_centered"], abs=1e-12)
+
+
+def test_gate_step_eight_stops_when_tl_reference_disagrees_with_phase4(world, store):
+    from lot.phase5_check import IMPLEMENTATION_BUG, GateStop
+    from lot.phase5_gate import formulation_support_evidence
+
+    args = _step8_arguments(world, store, _overflowing_pair(world, store))
+    persisted = args["persisted"]
+    args["persisted"] = dataclasses.replace(persisted, pp_mask=~persisted.pp_mask)
+    with pytest.raises(GateStop) as stop:
+        formulation_support_evidence(**args)
+    assert stop.value.step == "8"
+    assert stop.value.classification == IMPLEMENTATION_BUG
+    assert "Phase 4" in stop.value.message
+
+
+def test_gate_step_eight_stops_when_a_target_cell_is_ambiguous(world, store):
+    """Two TL-Reference samples in one target cell leave the intersection undefined."""
+    from lot.phase5_check import IMPLEMENTATION_BUG, GateStop
+    from lot.phase5_gate import formulation_support_evidence
+
+    args = _step8_arguments(world, store, _overflowing_pair(world, store))
+    arms = args["arms"]
+    cells = np.array(arms.geometry.per_point_cells, copy=True)
+    cells[1] = cells[0]
+    args["arms"] = dataclasses.replace(
+        arms, geometry=dataclasses.replace(arms.geometry, per_point_cells=cells)
+    )
+    with pytest.raises(GateStop) as stop:
+        formulation_support_evidence(**args)
+    assert stop.value.step == "8"
+    assert stop.value.classification == IMPLEMENTATION_BUG
+    assert "uniquely" in stop.value.message
+
+
+def test_gate_step_eight_runs_the_tested_function():
+    """The closure in run_integration_gate must call what these tests drive."""
+    import inspect
+
+    from lot import phase5_gate
+
+    source = inspect.getsource(phase5_gate.run_integration_gate)
+    step8 = source[source.index("def step8"):source.index("def step9")]
+    assert "formulation_support_evidence(" in step8
+    assert "patch_cell_index(lift.uv_target," not in step8

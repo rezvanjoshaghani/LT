@@ -47,6 +47,153 @@ PROBE_SCENES = ("apartment_0", "office_0", "room_0")
 REGIMES = ("rotation", "translation", "orbit")
 
 
+def rotation_gate_evidence(
+    lift: Any,
+    analytic: torch.Tensor,
+    substituted: Any,
+    tol_px: float,
+) -> dict[str, Any]:
+    """Step 10's pure-rotation check on one pair, over the landed samples.
+
+    Under zero translation, context-lift must reproduce the analytic homography
+    for any depth, and replacing the depth map must not move a landing. Both
+    are read on landed samples only. An unlanded ray can sit nearly parallel to
+    the target image plane, where its projection runs to tens of thousands of
+    pixels and float32 rounding alone exceeds a tolerance set at the 518 px
+    frame size. On a 518 px frame with a 90 degree field of view, the residual
+    over every context patch passes 1e-3 px from about 45 degrees of rotation,
+    while landed samples stay near 6e-5 px. No score reads an unlanded landing,
+    so comparing one tests float32 range rather than the mapping.
+
+    lift: context-lift from the aligned depth. analytic: the homography's
+    landing for every context patch. substituted: context-lift with the depth
+    map replaced. A NaN residual fails, because NaN never satisfies the bound.
+    """
+    landed = lift.landed
+    if not bool(landed.any()):
+        raise GateStop(
+            "10", "no sample of the rotation pair landed, so the rotation check "
+            "has nothing to compare", FROZEN_DESIGN_MISMATCH,
+            {"n_context_patches": int(landed.numel())},
+        )
+    residual = float((lift.uv_target[landed] - analytic[landed]).abs().max())
+    depth_free = float(
+        (lift.uv_target[landed] - substituted.uv_target[landed]).abs().max()
+    )
+    evidence = {
+        "n_landed_samples": int(landed.sum()),
+        "n_context_patches": int(landed.numel()),
+        "max_homography_residual_px": residual,
+        "tolerance_px": tol_px,
+        "max_depth_substitution_shift_px": depth_free,
+    }
+    if not residual <= tol_px:
+        raise GateStop(
+            "10", "context-lift disagrees with the analytic rotational homography "
+            "on real data", IMPLEMENTATION_BUG, {"rotation": evidence},
+        )
+    if not depth_free <= tol_px:
+        raise GateStop(
+            "10", "a pure-rotation landing moved when the depth map was replaced, "
+            "so the mapping is not depth free", IMPLEMENTATION_BUG,
+            {"rotation": evidence},
+        )
+    return evidence
+
+
+def formulation_support_evidence(
+    lift: Any,
+    support: torch.Tensor,
+    arms: Any,
+    persisted: Any,
+    center: torch.Tensor,
+    features_context: torch.Tensor,
+    target_hw: tuple[int, int],
+    where: str,
+) -> dict[str, Any]:
+    """Step 8 on one pair: V_form on the target patch cell, built as evaluate builds it.
+
+    Only supported samples are mapped to cells. A sample that did not land has
+    a projected coordinate outside the target grid, and patch_cell_index does
+    not bound-check it: a patch just past the right edge wraps into the next
+    row's first cell and looks valid, and only the last row's overflow leaves
+    the grid. The first version of this step mapped every context patch, so the
+    first real run stopped on cell 1369 of a 37 by 37 grid. No score was
+    affected, because every scoring path masks to the support before it reads a
+    cell.
+
+    arms is TL-Reference recomputed through Phase 4's code by the caller, and
+    persisted is the accepted Phase 4 row for the pair. They are reconciled
+    here, then the two cell sets are intersected by formulation_cells and
+    scored by score_formulation, the functions evaluate runs.
+    score_formulation refuses a target cell holding more than one TL-Reference
+    sample, which is the ambiguity this step's specification rules out.
+    """
+    from .encoders import PATCH_SIZE, patch_cell_index
+    from .phase5_reference import ReferenceMismatch, reconcile_reference
+    from .phase5_score import formulation_cells, score_formulation
+
+    n_cells = (target_hw[0] // PATCH_SIZE) * (target_hw[1] // PATCH_SIZE)
+    cells = patch_cell_index(lift.uv_target[support], target_hw, PATCH_SIZE)
+    outside = sorted({int(c) for c in cells if not 0 <= int(c) < n_cells})
+    if outside:
+        raise GateStop(
+            "8", f"supported samples map outside the target grid: {outside[:10]}",
+            IMPLEMENTATION_BUG, {"pair": where, "n_cells": n_cells},
+        )
+    if arms is None:
+        raise GateStop(
+            "8", "TL-Reference has no arm at the primary level on a pair "
+            "Context-Lift supports", IMPLEMENTATION_BUG, {"pair": where},
+        )
+    center = center.to(torch.float32)
+    try:
+        residual = reconcile_reference(arms, persisted, center, where)
+    except ReferenceMismatch as error:
+        raise GateStop(
+            "8", "TL-Reference recomputed on a real pair disagrees with the accepted "
+            f"Phase 4 row: {error}", IMPLEMENTATION_BUG, {"pair": where},
+        ) from error
+    common, cl_mask = formulation_cells(lift, support, arms.pp_scored, target_hw)
+    try:
+        scores = score_formulation(
+            lift, support, features_context, center, arms.pp_scored,
+            arms.geometry.per_point_cells, arms.tl_reads, arms.reads_target, target_hw,
+        )
+    except ValueError as error:
+        raise GateStop(
+            "8", f"the formulation intersection is not uniquely defined: {error}",
+            IMPLEMENTATION_BUG, {"pair": where},
+        ) from error
+    tl_cells = int(np.asarray(arms.pp_scored).sum())
+    unique, counts = np.unique(cells, return_counts=True)
+    if common.size == 0:
+        raise GateStop(
+            "8", "the formulation support is empty on a real translation pair",
+            FROZEN_DESIGN_MISMATCH,
+            {"pair": where, "cl_cells": int(unique.size), "tl_cells": tl_cells},
+        )
+    return {
+        "pair": where,
+        "cl_supported_samples": int(support.sum()),
+        "cl_distinct_target_cells": int(unique.size),
+        "max_cl_samples_per_cell": int(counts.max()),
+        "tl_scored_cells": tl_cells,
+        "common_cells": int(common.size),
+        "cl_samples_in_common_cells": int(cl_mask.sum()),
+        "tl_samples_per_common_cell": 1,
+        "reconciliation_worst_residual": residual,
+        "tl_form_centered": scores.tl_form_centered,
+        "cl_form_centered": scores.cl_form_centered,
+        "target_grid_cells": n_cells,
+        "note": (
+            "many context patches may land in one target cell; that is expected "
+            "and is not ambiguity. Each TL-Reference sample owns one cell, and "
+            "every supported sample maps to a cell inside the grid."
+        ),
+    }
+
+
 def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
     from .analysis_config import AnalysisConfig  # noqa: F401  (typing clarity)
     from .context_lift import context_lift_map, context_lift_support, rotation_homography_landing
@@ -412,32 +559,32 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         }
 
     def step8() -> dict[str, Any]:
+        # TL-Reference for the translation pair, recomputed exactly as evaluate
+        # recomputes it, so its reconciliation with Phase 4 and the cell
+        # intersection are proven on real data before anything trains.
+        from .phase5_reference import read_phase4_reference, recompute_reference_arms
+
+        inputs = state["probe_inputs"]
         example = state["examples"]["translation"]
-        lift, _, target, _ = lift_for(example)
-        target_hw = (target.height, target.width)
-        cells = patch_cell_index(lift.uv_target, target_hw, PATCH_SIZE)
-        n_cells = (target.height // PATCH_SIZE) * (target.width // PATCH_SIZE)
-        out_of_range = [int(c) for c in np.unique(cells) if not 0 <= int(c) < n_cells]
-        if out_of_range:
-            raise GateStop(
-                "8", f"landing cells fall outside the target grid: "
-                f"{out_of_range[:10]}",
-                IMPLEMENTATION_BUG, {"n_cells": n_cells},
-            )
-        support = state["primary_support"]
-        supported_cells = cells[support.cpu().numpy()]
-        unique, counts = np.unique(supported_cells, return_counts=True)
-        return {
-            "n_supported_samples": int(supported_cells.size),
-            "n_distinct_target_cells": int(unique.size),
-            "max_samples_per_cell": int(counts.max()) if counts.size else 0,
-            "target_grid_cells": n_cells,
-            "note": (
-                "many context patches may land in one target cell; that is "
-                "expected and is not ambiguity. What must be unique, and is, is "
-                "the cell identity each sample maps to."
-            ),
-        }
+        lift, context, target, T = lift_for(example)
+        dtype = cfg.torch_dtype
+        level = cfg.primary_alignment_level
+        ctx, tgt = example.context_frame_id, example.target_frame_id
+        fc = inputs.cache.features(cfg.feature_encoder, ctx)
+        ft = inputs.cache.features(cfg.feature_encoder, tgt)
+        arms = recompute_reference_arms(
+            inputs.cache.depth(context.depth_path).to(dtype),
+            inputs.cache.depth(target.depth_path).to(dtype),
+            inputs.est_maps[ctx], inputs.est_maps[tgt], inputs.calibrations[ctx],
+            fc, ft, context.K.to(dtype), target.K.to(dtype), T,
+            inputs.scene, ctx, tgt, analysis, level, dtype,
+        )
+        reference = read_phase4_reference(Path(cfg.phase4_dir) / "eval", inputs.scene, level)
+        return formulation_support_evidence(
+            lift, state["primary_support"], arms, reference["pairs"].get((ctx, tgt)),
+            state["center"], fc, (target.height, target.width),
+            f"{inputs.scene} {ctx} -> {tgt} level {level}",
+        )
 
     def step9() -> dict[str, Any]:
         return splat_symmetry_evidence()
@@ -452,29 +599,14 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         analytic = rotation_homography_landing(
             context.K.to(dtype), target.K.to(dtype), T, hw_c, dtype=dtype
         )
-        residual = float((lift.uv_target - analytic).abs().max())
         substituted = context_lift_map(
             torch.full_like(rot.depth_context_aligned, 7.0),
             context.K.to(dtype), target.K.to(dtype), T,
             hw_c, (target.height, target.width),
         )
-        depth_free = float((lift.uv_target - substituted.uv_target).abs().max())
-        evidence["rotation"] = {
-            "max_homography_residual_px": residual,
-            "tolerance_px": analysis.rotation_gate_coord_tol_px,
-            "max_depth_substitution_shift_px": depth_free,
-        }
-        if residual > analysis.rotation_gate_coord_tol_px:
-            raise GateStop(
-                "10", "context-lift disagrees with the analytic rotational "
-                "homography on real data", IMPLEMENTATION_BUG, evidence,
-            )
-        if depth_free > analysis.rotation_gate_coord_tol_px:
-            raise GateStop(
-                "10", "a pure-rotation landing moved when the depth map was "
-                "replaced, so the mapping is not depth free",
-                IMPLEMENTATION_BUG, evidence,
-            )
+        evidence["rotation"] = rotation_gate_evidence(
+            lift, analytic, substituted, analysis.rotation_gate_coord_tol_px
+        )
 
         tr = state["examples"]["translation"]
         lift, context, target, T = lift_for(tr)

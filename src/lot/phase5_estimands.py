@@ -16,11 +16,14 @@ Three populations, kept separate on purpose and never silently merged.
                with the accepted Phase 4 target-lift set, on the target patch
                cell both estimators share. Only TL-Reference and CL-Transport
                are compared here, and this population never redefines the
-               headline one.
+               headline one. No-Warp-Copy and Mean-Feature sit beside them as
+               levels, with no margin built on either.
 
     V_sp       the accepted Phase 4 context-image-scale splat-pool scored-cell
                support, used unchanged for the secondary operational
                comparison after its context-side symmetry was verified.
+               No-Warp-Copy and Mean-Feature sit beside the two arms as
+               levels.
 
 The headline estimand is
 
@@ -74,6 +77,11 @@ PRIMARY_FIELDS = (
 FORMULATION_FIELDS = (
     "tl_form_raw", "tl_form_centered", "tl_form_l2_raw", "tl_form_l2_centered",
     "cl_form_raw", "cl_form_centered", "cl_form_l2_raw", "cl_form_l2_centered",
+    # The two floors on V_form, appended by reporting_rules.md section 6.
+    # No-Warp-Copy carries all four columns, Mean-Feature its two raw ones.
+    "nowarp_form_raw", "nowarp_form_centered",
+    "nowarp_form_l2_raw", "nowarp_form_l2_centered",
+    "meanfeat_form_raw", "meanfeat_form_l2_raw",
 )
 SPLAT_FIELDS = (
     "sp_transport_raw", "sp_transport_centered",
@@ -200,10 +208,17 @@ def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], flo
         "delta_formulation": lambda v: v[f"tl_form_{m}"] - v[f"cl_form_{m}"],
         "tl_reference": lambda v: v[f"tl_form_{m}"],
         "cl_on_formulation_support": lambda v: v[f"cl_form_{m}"],
+        # No-Warp-Copy on the formulation support, reporting_rules.md section
+        # 6. A level beside the two arms. No margin is built on it.
+        "no_warp_copy_form": lambda v: v[f"nowarp_form_{m}"],
         # Stream W step 23: the secondary operational gap on the splat path.
         "delta_learn_sp": lambda v: v[f"sp_transport_{m}"] - v[f"sp_predict_{m}"],
         "sp_transport": lambda v: v[f"sp_transport_{m}"],
         "sp_predict": lambda v: v[f"sp_predict_{m}"],
+        # No-Warp-Copy on the splat-pool support, reporting_rules.md section 6
+        # and specification step 38. A level beside the two arms. The two
+        # margins below subtract the same column.
+        "sp_no_warp_copy": lambda v: v[f"sp_nowarp_{m}"],
         "sp_transport_margin": lambda v: v[f"sp_transport_{m}"] - v[f"sp_nowarp_{m}"],
         "sp_predict_margin": lambda v: v[f"sp_predict_{m}"] - v[f"sp_nowarp_{m}"],
         # PROTOCOL 3.9's disclosure terms, every one recomputed on the
@@ -242,6 +257,7 @@ def quantity_formulas(metric: str) -> dict[str, Callable[[dict[str, float]], flo
     # near-zero rule does not apply to it.
     if m == "raw":
         forms["mean_feature"] = lambda v: v["meanfeat_raw"]
+        forms["mean_feature_form"] = lambda v: v["meanfeat_form_raw"]
         forms["sp_mean_feature"] = lambda v: v["sp_meanfeat_raw"]
         forms["x_mean_feature"] = lambda v: v["x_meanfeat_raw"]
         forms["x_sp_mean_feature"] = lambda v: v["x_sp_meanfeat_raw"]
@@ -280,9 +296,12 @@ QUANTITY_POPULATION = {
     "delta_formulation": FORMULATION,
     "tl_reference": FORMULATION,
     "cl_on_formulation_support": FORMULATION,
+    "no_warp_copy_form": FORMULATION,
+    "mean_feature_form": FORMULATION,
     "delta_learn_sp": SPLAT_POOL,
     "sp_transport": SPLAT_POOL,
     "sp_predict": SPLAT_POOL,
+    "sp_no_warp_copy": SPLAT_POOL,
     "sp_transport_margin": SPLAT_POOL,
     "sp_predict_margin": SPLAT_POOL,
     "sp_mean_feature": SPLAT_POOL,
@@ -453,6 +472,42 @@ SINGLE_PATH_BY_CONSTRUCTION = frozenset({"delta_formulation"})
 SCORE_SPACE_QUANTITIES = INTERPRETED_EFFECTS
 
 
+# Decision 2 of reporting_rules.md quotes six sentences, copied here verbatim.
+# They are the only sentences printed with near_zero True.
+# WORDING_VETO, WORDING_SMALL_SIGN_CONSISTENT, WORDING_PATH_SENSITIVE and
+# WORDING_OUTSIDE_ON_COMMON_CELLS are its wordings 1 to 4.
+# WORDING_ONLY_PATH_CLEAR and WORDING_ONLY_PATH_INCLUDES_ZERO are its two
+# single-path sentences.
+# Two labels are not decision 2 wording. They are carried over from the code
+# at cc20e3e and are printed only with near_zero False. WORDING_OUTSIDE_BAND
+# marks a cell that is not engaged. WORDING_NOT_ESTIMABLE marks a reported
+# effect that is not finite.
+# Equivalence is never among these sentences, under any branch, because no
+# equivalence region was ever frozen.
+WORDING_NOT_ESTIMABLE = "not estimable on this cell"
+WORDING_OUTSIDE_BAND = "effect outside the operator band"
+WORDING_VETO = (
+    "no claim of advantage; the effect is at the scale of evaluation-path choice"
+)
+WORDING_SMALL_SIGN_CONSISTENT = "small, sign-consistent effect"
+WORDING_PATH_SENSITIVE = (
+    "effect licensed but its size is path-sensitive; the two evaluation paths "
+    "do not agree about whether it sits inside the operator band"
+)
+WORDING_OUTSIDE_ON_COMMON_CELLS = (
+    "effect licensed; inside the operator band on its own support but outside "
+    "it on both paths' common cells"
+)
+WORDING_ONLY_PATH_CLEAR = (
+    "within the operator band on its only path; its size is not certified by a "
+    "second path"
+)
+WORDING_ONLY_PATH_INCLUDES_ZERO = (
+    "no measurable difference at the reported scale; this quantity has no "
+    "second evaluation path by construction"
+)
+
+
 def near_zero_disclosure(
     quantity: str,
     per_point: PathEstimate,
@@ -461,39 +516,66 @@ def near_zero_disclosure(
     difference: PathEstimate | None = None,
     reported: PathEstimate | None = None,
 ) -> dict[str, Any]:
-    """The frozen 0.003 rule, carried forward verbatim from PROTOCOL 3.9.
+    """PROTOCOL 3.9's near-zero rule, as reporting_rules.md decision 2 states it.
 
-    The rule is explicitly two-path. Its exact words: both estimates within the
-    band with one sign and both intervals clear of zero licenses a claim of a
-    small, sign-consistent effect; exactly one within the band licenses the
-    effect but not a claim about its size, which is reported as path-sensitive;
-    a difference in sign, or an interval that includes zero, licenses no claim
-    of advantage and the effect is reported as being at the scale of
-    evaluation-path choice.
+    The trigger. PROTOCOL 3.9 scopes its discipline to "an interpreted effect
+    no larger than this tolerance". Decision 2 reads that scope literally. The
+    wording is engaged when, and only when, the reported effect is finite and
+    its estimate has magnitude at most path_agreement_tolerance, 0.003. The
+    reported effect is the one the cell's table shows. `reported` defaults to
+    `per_point` for callers that have only one number. The path terms never
+    engage the wording.
 
-    An earlier version of this function saw one path and could therefore issue
-    the strongest of those three wordings while the other path disagreed or
-    reversed sign. That is precisely the over-licensing 3.9 exists to prevent,
-    so the second path is now a required argument. Passing None is permitted
-    only for a quantity that has no second path, and it can never reach the
-    sign-consistent wording.
+    The terms. Once engaged, the wording is decided by the two cross-path
+    estimates, per_point and splat_pool. Both are recomputed on the cells the
+    two paths share, with paired intervals. They and their paired difference
+    are returned beside the wording, engaged or not.
 
-    Two different numbers are in play and they are not interchangeable. The
-    *trigger* is the interpreted effect the cell reports, because 3.9 scopes the
-    discipline to "an interpreted effect no larger than this tolerance", and the
-    effect a reader sees is the one in the table. The *terms* whose band
-    membership, sign, and intervals decide the wording are the two path
-    estimates, recomputed on the cross-path common-valid set. An earlier version
-    used the path terms for both, so a headline gap of 0.0015 sitting squarely
-    inside the band could print with no disclosure at all whenever its
-    intersection terms happened to fall outside it.
+    The two-path wordings, when engaged, in order:
 
-    `reported` defaults to `per_point` for callers that have only one number,
-    which is the case when the quantity has no disclosure pair.
+    1. The terms differ in sign, or either interval includes zero: no claim of
+       advantage. This is 3.9's veto. Its clause is stated unconditionally,
+       so it is tested before the band questions, never after them.
+    2. Both terms inside the band: a small, sign-consistent effect.
+    3. Exactly one term inside the band: licensed, but path-sensitive.
+    4. Neither term inside the band: licensed, inside the band on its own
+       support but outside it on both paths' common cells.
 
-    Applied only to the interpreted effects. Counts, fractions, absolute levels,
-    and the cross-path disclosure terms are not claims of advantage, and none of
-    the three licensed sentences would be true of them.
+    A quantity with no second path by construction passes splat_pool=None.
+    Its wording follows the reported interval. Clear of zero, it is within the
+    band on its only path and its size is not certified. Including zero, it
+    is no measurable difference at the reported scale.
+
+    A quantity that has a second path, but whose cross-path terms are not
+    finite, gets neither single-path sentence. "By construction" would be
+    false of it. When the reported effect is in the band, the cell is
+    engaged and gets 3.9's veto. PROTOCOL 3.9 restricts the interpretation
+    of such an effect to content the two paths share, and here they share
+    none. The veto is the only decision 2 sentence that is true of this
+    cell. Sign agreement and clearance are returned as None, because they
+    are undefined rather than failed. A reported effect that is not finite
+    is not estimable on this cell and is never engaged.
+
+    What the previous code did, and why it changed. It engaged when the
+    reported effect or either path term fell in the band. A clearly nonzero
+    headline gap whose splat term sat near zero then printed "no claim of
+    advantage". That made the specification's outcome 49 unreachable, and
+    3.9's scope sentence does not reach such an effect. It printed wording 3
+    when neither term was in the band, which said the paths disagree when
+    they agree. Its single-path sentence claimed no measurable difference for
+    an interval that excludes zero. It returned "not estimable" whenever the
+    per-point term was undefined, even with the reported effect in the band.
+    Decision 2 names the first three and replaces them. The fourth follows
+    from its trigger, which engages on the reported effect alone, and the
+    veto now covers that cell.
+
+    An earlier version still saw only one path. It could issue the strongest
+    wording while the other path reversed sign. The second path has been a
+    required argument since, and None is reserved for a quantity without one.
+
+    Applied only to the interpreted effects. Counts, fractions, absolute
+    levels, and the cross-path disclosure terms are not claims of advantage,
+    and none of the licensed sentences would be true of them.
     """
     if quantity not in SCORE_SPACE_QUANTITIES:
         return {"near_zero": False, "applicable": False}
@@ -501,11 +583,29 @@ def near_zero_disclosure(
     band = analysis.path_agreement_tolerance
     if reported is None:
         reported = per_point
-    if not per_point.finite:
-        # An undefined term still reports both sides, so a reader can see that
-        # the cell was empty rather than that the effect was large.
+
+    if splat_pool is None:
+        path_difference = None
+    elif difference is not None:
+        # The difference carries its own paired interval, from the same scene
+        # draw, rather than being a bare subtraction of two point estimates.
+        path_difference = dataclasses.asdict(difference)
+    else:
+        path_difference = {
+            "estimate": per_point.estimate - splat_pool.estimate,
+            "lo": float("nan"), "hi": float("nan"),
+        }
+
+    def disclosure(
+        near_zero: bool,
+        wording: str,
+        paths_agree_in_sign: bool | None = None,
+        both_intervals_exclude_zero: bool | None = None,
+    ) -> dict[str, Any]:
+        # Every applicable branch returns the same keys, so a reader can always
+        # see both terms and their difference beside the wording.
         return {
-            "near_zero": False,
+            "near_zero": bool(near_zero),
             "applicable": True,
             "band": band,
             "reported": dataclasses.asdict(reported),
@@ -513,88 +613,59 @@ def near_zero_disclosure(
             "splat_pool": (
                 dataclasses.asdict(splat_pool) if splat_pool is not None else None
             ),
-            "paths_agree_in_sign": None,
-            "both_intervals_exclude_zero": None,
-            "wording": "not estimable on this cell",
+            "path_difference": path_difference,
+            "paths_agree_in_sign": paths_agree_in_sign,
+            "both_intervals_exclude_zero": both_intervals_exclude_zero,
+            "wording": wording,
         }
+
+    if not reported.finite:
+        # An undefined effect still reports both terms, so a reader can see
+        # that the cell was empty rather than that the effect was large.
+        return disclosure(False, WORDING_NOT_ESTIMABLE)
+
+    # Decision 2's trigger: the reported effect, and nothing else.
+    engaged = reported.within(band)
+
+    if splat_pool is None:
+        # No second path by construction. 3.9's licence for a sign-consistent
+        # effect is conditional on both paths, and one path cannot supply it.
+        if not engaged:
+            wording = WORDING_OUTSIDE_BAND
+        elif reported.excludes_zero:
+            wording = WORDING_ONLY_PATH_CLEAR
+        else:
+            wording = WORDING_ONLY_PATH_INCLUDES_ZERO
+        return disclosure(engaged, wording)
+
+    if not (per_point.finite and splat_pool.finite):
+        # A second path exists, but the cells both paths share gave no finite
+        # term. PROTOCOL 3.9 restricts the effect's interpretation to content
+        # the two paths share, and here they share none. The veto is the only
+        # decision 2 sentence that is true of this cell. The branch stays
+        # explicit so that sign agreement and clearance are None, because they
+        # are undefined rather than failed.
+        return disclosure(engaged, WORDING_VETO if engaged else WORDING_OUTSIDE_BAND)
 
     pp_in = per_point.within(band)
-    # The cell is a near-zero cell when the effect it reports is inside the band,
-    # or when either path term is; disclosing on any of the three never
-    # under-discloses, which is the direction 3.9's caution points.
-    reported_in = reported.within(band)
-    if splat_pool is None or not splat_pool.finite:
-        # No comparable second path. The band still flags the cell, but the only
-        # claim available is the weakest one: 3.9's licence for a sign-consistent
-        # effect is conditional on both paths, and one path cannot supply it.
-        flagged = bool(pp_in or reported_in)
-        return {
-            "near_zero": flagged,
-            "applicable": True,
-            "band": band,
-            "reported": dataclasses.asdict(reported),
-            "per_point": dataclasses.asdict(per_point),
-            "splat_pool": None,
-            "paths_agree_in_sign": None,
-            "both_intervals_exclude_zero": None,
-            "wording": (
-                "no measurable difference at the reported scale; this quantity "
-                "has no second evaluation path by construction"
-                if flagged else "effect outside the operator band"
-            ),
-        }
-
     sp_in = splat_pool.within(band)
     same_sign = per_point.sign == splat_pool.sign and per_point.sign != 0
     both_clear = per_point.excludes_zero and splat_pool.excludes_zero
 
-    # PROTOCOL 3.9's clauses are not three alternatives to be tried in the order
-    # the sentence lists them. Its third clause, "a difference in sign, or an
-    # interval that includes zero, licenses no claim of advantage", is stated
-    # unconditionally, so it is a veto over the other two rather than a fallback
-    # after them. Testing the exactly-one-in-band branch first, as an earlier
-    # version did, let a cell whose two paths reverse sign be reported as merely
-    # path-sensitive, which is a claim the protocol withholds.
-    #
-    # The band question is asked first only to decide whether the near-zero
-    # discipline is engaged at all: 3.9 scopes it to an effect "no larger than
-    # this tolerance", so a cell outside the band on both paths is not a
-    # near-zero cell and the veto has nothing to act on.
-    if not (pp_in or sp_in or reported_in):
-        wording = "effect outside the operator band"
+    if not engaged:
+        wording = WORDING_OUTSIDE_BAND
     elif not same_sign or not both_clear:
-        wording = (
-            "no claim of advantage; the effect is at the scale of "
-            "evaluation-path choice"
-        )
+        # 3.9's veto, tested first. Testing an in-band branch first, as an
+        # earlier version did, let a cell whose two paths reverse sign be
+        # reported as merely path-sensitive.
+        wording = WORDING_VETO
     elif pp_in and sp_in:
-        wording = "small, sign-consistent effect"
+        wording = WORDING_SMALL_SIGN_CONSISTENT
+    elif pp_in or sp_in:
+        wording = WORDING_PATH_SENSITIVE
     else:
-        wording = (
-            "effect licensed but its size is path-sensitive; the two evaluation "
-            "paths do not agree about whether it sits inside the operator band"
-        )
-
-    return {
-        "near_zero": bool(pp_in or sp_in or reported_in),
-        "applicable": True,
-        "band": band,
-        "reported": dataclasses.asdict(reported),
-        "per_point": dataclasses.asdict(per_point),
-        "splat_pool": dataclasses.asdict(splat_pool),
-        # The difference carries its own paired interval, from the same scene
-        # draw, rather than being a bare subtraction of two point estimates.
-        "path_difference": (
-            dataclasses.asdict(difference) if difference is not None
-            else {"estimate": per_point.estimate - splat_pool.estimate,
-                  "lo": float("nan"), "hi": float("nan")}
-        ),
-        "paths_agree_in_sign": bool(same_sign),
-        "both_intervals_exclude_zero": bool(both_clear),
-        # Equivalence is never among the licensed wordings, under any branch,
-        # because no equivalence region was ever frozen.
-        "wording": wording,
-    }
+        wording = WORDING_OUTSIDE_ON_COMMON_CELLS
+    return disclosure(engaged, wording, bool(same_sign), bool(both_clear))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -764,24 +835,62 @@ def seed_sensitivity(per_seed: dict[int, float]) -> dict[str, float]:
 
 
 def three_rung_decomposition(
-    phase3_oracle: float,
-    phase4_transport_only: float,
-    cl_transport: float,
-    predict_with_depth: float,
-) -> dict[str, float]:
+    phase3_reference_ceiling: float,
+    phase4_depth_tax: PathEstimate,
+    delta_learn_pp: CellResult,
+) -> dict[str, dict[str, Any]]:
     """Stream X step 27, with each rung labelled by the estimator that defines it.
 
-    The rungs are not collapsed into one end-to-end residual, and the Phase 5
-    rung is defined only through the information-symmetric comparison. The
-    Phase 4 rung keeps its own accepted estimator, because the Phase 5 redesign
-    does not retroactively alter Phase 4.
+    reporting_rules.md section 6. The Phase 3 Oracle-Transport ceiling, the
+    Phase 4 estimated-geometry result under its own estimator, and
+    delta_learn_pp are reported separately and never folded into one
+    residual.
+
+    Each rung is taken as its own phase estimated it, and nothing is computed
+    across rungs. No rung is a difference across phases. Phase 4's own
+    estimator is its depth tax, the matched ceiling minus the estimated
+    score on Phase 4's matched population. The Phase 3 ceiling is measured on
+    another population, so subtracting a Phase 4 score from it would mix a
+    selection difference into rung 1. The Phase 5 redesign does not
+    retroactively alter Phase 4, so Phase 4's rung keeps its own estimator.
+
+    phase3_reference_ceiling is the Phase 3 Oracle-Transport ceiling of the
+    cell, as Phase 4's tables carry it in reference_ceiling_phase3.
+    phase4_depth_tax is Phase 4's depth tax for the same cell with its
+    interval, passed through unchanged. delta_learn_pp is the Phase 5 cell
+    from evaluate_quantity. The Phase 5 rung is defined only through the
+    information-symmetric comparison, so any other quantity in its place
+    raises HeadlineSubstitutionError.
     """
+    if delta_learn_pp.quantity != "delta_learn_pp":
+        raise HeadlineSubstitutionError(
+            f"the Phase 5 rung is delta_learn_pp, Context-Lift Transport-Only minus "
+            f"Predict-with-Depth on its own support; {delta_learn_pp.quantity!r} "
+            "cannot stand in for it"
+        )
     return {
         # Rung 0, Phase 3: how far exact geometry falls short of the target's
-        # own features. Reported as the oracle level, not as a difference.
-        "representation_limitation_oracle": phase3_oracle,
+        # own features. Reported as the ceiling level, not as a difference.
+        "representation_limitation_oracle": {
+            "phase": 3,
+            "estimator": "reference_ceiling_phase3",
+            "estimate": phase3_reference_ceiling,
+        },
         # Rung 1, Phase 4, under the accepted Phase 4 estimator.
-        "estimated_geometry_limitation": phase3_oracle - phase4_transport_only,
+        "estimated_geometry_limitation": {
+            "phase": 4,
+            "estimator": "depth_tax",
+            **dataclasses.asdict(phase4_depth_tax),
+        },
         # Rung 2, Phase 5, information symmetric by construction.
-        "learned_vs_explicit_limitation": cl_transport - predict_with_depth,
+        "learned_vs_explicit_limitation": {
+            "phase": 5,
+            "estimator": "delta_learn_pp",
+            "population": delta_learn_pp.population,
+            "estimate": delta_learn_pp.estimate,
+            "lo": delta_learn_pp.lo,
+            "hi": delta_learn_pp.hi,
+            "n_replicates": delta_learn_pp.n_replicates,
+            "supported": delta_learn_pp.supported,
+        },
     }

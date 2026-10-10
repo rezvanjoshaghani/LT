@@ -65,12 +65,28 @@ BOUND_SCENE_FIELDS = (
 # naming the wrong gate. The overfit receipt is instead bound to the identity
 # and to the digest of the integration receipt that licensed it, so it cannot be
 # carried across to a run the gate never examined.
+#
+# The checkpoint lock of reporting_rules.md section 7 is the third kind. It is
+# written after the controls and before evaluation, once per alignment level.
+# Like the overfit receipt, it is bound to the identity and to the digest of the
+# integration receipt. It is also bound to the digest of the overfit receipt.
+# It carries one block of its own: the sha256 of every file evaluation reads
+# before it touches a test scene. Those are each (fold, seed)'s checkpoint and
+# training record, and the level's controls file. verify() hashes each of them
+# again, at the path the current run would read it from.
 KIND_INTEGRATION = "integration"
 KIND_OVERFIT = "overfit"
-RECEIPT_KINDS = (KIND_INTEGRATION, KIND_OVERFIT)
+KIND_LOCK = "lock"
+RECEIPT_KINDS = (KIND_INTEGRATION, KIND_OVERFIT, KIND_LOCK)
 
-# The key an overfit receipt records the licensing gate receipt under.
+# The keys under which a receipt names the receipts that licensed it, by
+# sha256. An overfit or lock receipt names the integration receipt. A lock
+# receipt also names the overfit receipt.
 GATE_RECEIPT_DIGEST = "gate_receipt_sha256"
+OVERFIT_RECEIPT_DIGEST = "overfit_receipt_sha256"
+
+# What to rerun when a lock no longer verifies.
+LOCK_RERUN = "the checkpoint lock"
 
 
 def receipt_identity(report: dict[str, Any]) -> dict[str, Any]:
@@ -123,11 +139,16 @@ def verify(
     label: str,
     kind: str | None = None,
     gate_receipt: Path | None = None,
+    overfit_receipt: Path | None = None,
+    level: str | None = None,
 ) -> list[str]:
     """Return a list of human-readable problems. Empty means the receipt stands.
 
     kind names the receipt expected here; None reads it from the receipt itself.
-    gate_receipt is the integration receipt an overfit receipt must be bound to.
+    gate_receipt is the integration receipt an overfit or lock receipt must be
+    bound to. overfit_receipt is the overfit receipt a lock receipt must be
+    bound to. level is the alignment level a lock receipt must lock. The last
+    two are read for a lock receipt only.
     """
     problems: list[str] = []
     try:
@@ -170,13 +191,22 @@ def verify(
 
     if found_kind == KIND_INTEGRATION:
         problems.extend(_artifact_problems(report, config_path, label))
-    else:
+    elif found_kind == KIND_OVERFIT:
         problems.extend(_gate_binding_problems(report, label, gate_receipt))
+    else:
+        problems.extend(
+            _gate_binding_problems(report, label, gate_receipt, rerun=LOCK_RERUN)
+        )
+        problems.extend(_overfit_binding_problems(report, label, overfit_receipt))
+        problems.extend(_lock_file_problems(report, config_path, label, level))
     return problems
 
 
 def _gate_binding_problems(
-    report: dict[str, Any], label: str, gate_receipt: Path | None
+    report: dict[str, Any],
+    label: str,
+    gate_receipt: Path | None,
+    rerun: str = "the overfit gate",
 ) -> list[str]:
     """An overfit receipt is bound to the integration receipt that licensed it.
 
@@ -185,33 +215,154 @@ def _gate_binding_problems(
     specific integration gate. Recording that gate receipt's digest does exactly
     that: if the gate is rerun, its receipt changes and this binding fails, which
     is the intended behaviour.
+
+    A lock receipt is bound the same way. rerun names what must run again when
+    the binding fails.
+    """
+    return _digest_binding_problems(
+        report, label, GATE_RECEIPT_DIGEST, gate_receipt,
+        source="integration", source_gate="gate", rerun=rerun,
+    )
+
+
+def _overfit_binding_problems(
+    report: dict[str, Any], label: str, overfit_receipt: Path | None
+) -> list[str]:
+    """A lock receipt is also bound to the overfit receipt that licensed it.
+
+    Training ran under that overfit receipt, and the lock binds training's
+    checkpoints. The lock mode enforces this when it writes the lock: every
+    training record and the controls file must name the integration and
+    overfit receipts it binds as their licence. If the overfit gate is rerun,
+    its receipt changes and this binding fails.
+    """
+    return _digest_binding_problems(
+        report, label, OVERFIT_RECEIPT_DIGEST, overfit_receipt,
+        source="overfit", source_gate="overfit gate", rerun=LOCK_RERUN,
+    )
+
+
+def _digest_binding_problems(
+    report: dict[str, Any],
+    label: str,
+    field: str,
+    source_receipt: Path | None,
+    source: str,
+    source_gate: str,
+    rerun: str,
+) -> list[str]:
+    """One binding by digest: the receipt names, under field, the sha256 of the
+    source receipt that licensed it, and that file must still hash to it.
+
+    source names the source receipt's kind, and source_gate the step that
+    writes it. rerun names what must run again when the binding fails.
     """
     from .phase5_check import sha256_file
 
-    recorded = report.get(GATE_RECEIPT_DIGEST)
+    recorded = report.get(field)
     if not recorded:
         return [
-            f"{label}: receipt does not record the integration receipt it ran "
-            f"under ({GATE_RECEIPT_DIGEST}); rerun the overfit gate"
+            f"{label}: receipt does not record the {source} receipt it ran "
+            f"under ({field}); rerun {rerun}"
         ]
-    if gate_receipt is None:
+    if source_receipt is None:
         return [
-            f"{label}: no integration receipt was supplied to bind against; this "
+            f"{label}: no {source} receipt was supplied to bind against; this "
             "is a caller error, not a receipt defect"
         ]
-    if not Path(gate_receipt).exists():
+    if not Path(source_receipt).exists():
         return [
-            f"{label}: the integration receipt at {gate_receipt} is absent, so "
-            "this receipt's binding cannot be checked; rerun the gate"
+            f"{label}: the {source} receipt at {source_receipt} is absent, so "
+            f"this receipt's binding cannot be checked; rerun the {source_gate}"
         ]
-    live = sha256_file(Path(gate_receipt))
+    live = sha256_file(Path(source_receipt))
     if recorded != live:
         return [
-            f"{label}: ran under a different integration gate than the one "
+            f"{label}: ran under a different {source} gate than the one "
             f"present.\n    receipt: {recorded}\n    current: {live}\n"
-            "    Rerun the overfit gate under the current gate."
+            f"    Rerun {rerun} under the current {source_gate}."
         ]
     return []
+
+
+# How the lock's two keyed groups are named in a problem: by one file each.
+LOCK_FILE_GROUPS = {"checkpoints": "checkpoint", "training_records": "training record"}
+
+
+def _lock_file_problems(
+    report: dict[str, Any], config_path: Path, label: str, level: str | None
+) -> list[str]:
+    """Re-hash every file a lock receipt binds, at the path this run reads it from.
+
+    The files are located from the current configuration, the frozen folds,
+    and the configured seeds, never from the paths the lock recorded. So the
+    lock covers exactly the files evaluation will load, and a lock written for
+    another level or another run directory binds nothing here. Each file must
+    be present and still have the sha256 the lock recorded. A file this run
+    reads and the lock does not name is refused, and so is an entry the lock
+    names and this run does not read.
+
+    The bytes are the binding, not the path, so a run directory moved whole
+    still verifies. The recorded paths are kept as evidence for a reader.
+    """
+    from .phase5 import load_phase5_config
+    from .phase5_check import sha256_file
+    from .phase5_folds import frozen_folds
+    from .phase5_modes import checkpoint_lock_files
+    from .train import training_config_from
+
+    if level is None:
+        return [
+            f"{label}: no alignment level was supplied to check the lock against; "
+            "this is a caller error, not a receipt defect"
+        ]
+    if report.get("level") != level:
+        return [
+            f"{label}: the lock is for level {report.get('level')!r}, but this run "
+            f"is at level {level!r}. A lock licenses only the level it locked."
+        ]
+    cfg = load_phase5_config(config_path)
+    files = checkpoint_lock_files(
+        cfg, level, frozen_folds(), training_config_from(cfg.training).seeds
+    )
+
+    problems: list[str] = []
+    expected: list[tuple[str, Path, Any]] = []
+    for group, name in LOCK_FILE_GROUPS.items():
+        recorded = report.get(group)
+        recorded = recorded if isinstance(recorded, dict) else {}
+        unread = sorted(set(recorded) - set(files[group]))
+        if unread:
+            problems.append(
+                f"{label}: the lock names {name}s this run does not read: {unread}"
+            )
+        expected += [
+            (f"{name} {key}", path, recorded.get(key))
+            for key, path in files[group].items()
+        ]
+    expected.append(("controls file", files["controls"], report.get("controls")))
+
+    for name, path, entry in expected:
+        if not isinstance(entry, dict) or not entry.get("sha256"):
+            problems.append(
+                f"{label}: the lock does not record the {name}, so it does not "
+                f"bind a file evaluation reads; rerun {LOCK_RERUN}"
+            )
+        elif not Path(path).exists():
+            problems.append(
+                f"{label}: the locked {name} is absent at {path}; the lock "
+                "describes a file this run cannot read"
+            )
+        else:
+            live = sha256_file(Path(path))
+            if live != entry["sha256"]:
+                problems.append(
+                    f"{label}: the {name} changed since the lock was written.\n"
+                    f"    lock sha256:    {entry['sha256']}\n"
+                    f"    current sha256: {live}\n"
+                    "    Evaluation would read a file the lock never bound."
+                )
+    return problems
 
 
 def stamp_receipt(
@@ -219,24 +370,43 @@ def stamp_receipt(
     config_path: Path,
     kind: str,
     gate_receipt: Path | None = None,
+    overfit_receipt: Path | None = None,
 ) -> dict[str, Any]:
     """Add the identity a receipt must carry, so writers cannot forget it.
 
     One function stamps every receipt, so the shape verify() expects and the
     shape the writers produce cannot drift apart.
+
+    The stamp also records when it was made, in UTC, as stamped_utc. That time
+    is evidence for a reader and binds nothing. verify() does not read it, so a
+    receipt written before the field existed still verifies.
+
+    An overfit receipt records the sha256 of gate_receipt. A lock receipt
+    records it too, and the sha256 of overfit_receipt. A receipt it must record
+    and cannot read is refused.
     """
-    from .phase5_check import sha256_file
+    from .phase5_check import sha256_file, utc_timestamp
 
     if kind not in RECEIPT_KINDS:
         raise ValueError(f"unknown receipt kind {kind!r}; use one of {RECEIPT_KINDS}")
-    stamped = {**report, "kind": kind, **current_identity(config_path)}
-    if kind == KIND_OVERFIT:
+    stamped = {
+        **report, "kind": kind, **current_identity(config_path),
+        "stamped_utc": utc_timestamp(),
+    }
+    if kind in (KIND_OVERFIT, KIND_LOCK):
         if gate_receipt is None or not Path(gate_receipt).exists():
             raise ValueError(
-                "an overfit receipt must be bound to the integration receipt "
+                f"the {kind} receipt must be bound to the integration receipt "
                 "that licensed it, and that receipt is absent"
             )
         stamped[GATE_RECEIPT_DIGEST] = sha256_file(Path(gate_receipt))
+    if kind == KIND_LOCK:
+        if overfit_receipt is None or not Path(overfit_receipt).exists():
+            raise ValueError(
+                "the lock receipt must be bound to the overfit receipt that "
+                "licensed it, and that receipt is absent"
+            )
+        stamped[OVERFIT_RECEIPT_DIGEST] = sha256_file(Path(overfit_receipt))
     return stamped
 
 
@@ -393,13 +563,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--kind", choices=RECEIPT_KINDS, default=None)
     parser.add_argument(
         "--gate-receipt", type=Path, default=None,
-        help="the integration receipt an overfit receipt must be bound to",
+        help="the integration receipt an overfit or lock receipt must be bound to",
+    )
+    parser.add_argument(
+        "--overfit-receipt", type=Path, default=None,
+        help="the overfit receipt a lock receipt must be bound to",
+    )
+    parser.add_argument(
+        "--level", default=None,
+        help="the alignment level a lock receipt must lock",
     )
     args = parser.parse_args(argv)
 
     problems = verify(
         args.receipt, args.config, args.label,
         kind=args.kind, gate_receipt=args.gate_receipt,
+        overfit_receipt=args.overfit_receipt, level=args.level,
     )
     if problems:
         for problem in problems:

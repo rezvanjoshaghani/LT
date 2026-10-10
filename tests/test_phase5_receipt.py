@@ -9,6 +9,7 @@ carries has to match the run asking to proceed.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -359,3 +360,319 @@ def test_stamp_receipt_supplies_the_identity_every_receipt_must_carry(tmp_path):
     assert stamped["kind"] == KIND_INTEGRATION
     for field in BOUND_FIELDS:
         assert stamped[field] == current_identity(CONFIG)[field]
+
+
+# ---------------------------------------------------------------------------
+# Every receipt records when it was stamped, reporting_rules.md section 7
+# ---------------------------------------------------------------------------
+
+# ISO 8601 in UTC, always to the microsecond, with the offset written out.
+UTC_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00$")
+
+
+def test_stamp_receipt_records_when_it_was_stamped_in_utc(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from lot.phase5_receipt import KIND_INTEGRATION, KIND_OVERFIT, stamp_receipt
+
+    gate = _gate_file(tmp_path)
+    before = datetime.now(timezone.utc)
+    stamps = [
+        stamp_receipt({"passed": True}, CONFIG, KIND_INTEGRATION)["stamped_utc"],
+        stamp_receipt({"passed": True}, CONFIG, KIND_OVERFIT,
+                      gate_receipt=gate)["stamped_utc"],
+    ]
+    after = datetime.now(timezone.utc)
+    for stamp in stamps:
+        assert UTC_STAMP.match(stamp), stamp
+        moment = datetime.fromisoformat(stamp)
+        assert moment.utcoffset() == timedelta(0)
+        assert before <= moment <= after
+
+
+def test_a_stamp_time_already_in_a_report_is_replaced(tmp_path):
+    """The stamp says when this receipt was written, not what the report claimed."""
+    from lot.phase5_receipt import KIND_INTEGRATION, stamp_receipt
+
+    stamped = stamp_receipt(
+        {"passed": True, "stamped_utc": "1999-01-01T00:00:00.000000+00:00"},
+        CONFIG, KIND_INTEGRATION,
+    )
+    assert not stamped["stamped_utc"].startswith("1999")
+
+
+@pytest.mark.parametrize("stamped", [True, False])
+def test_verify_accepts_an_overfit_receipt_with_or_without_its_stamp_time(
+    tmp_path, stamped
+):
+    """The time is recorded and never bound, so an older receipt still verifies."""
+    from lot.phase5_receipt import KIND_OVERFIT
+
+    gate = _gate_file(tmp_path)
+    receipt = _overfit_receipt(tmp_path, gate)
+    report = json.loads(receipt.read_text(encoding="utf-8"))
+    assert UTC_STAMP.match(report["stamped_utc"])
+    if not stamped:
+        del report["stamped_utc"]
+        receipt.write_text(json.dumps(report), encoding="utf-8")
+    assert verify(receipt, CONFIG, "overfit", kind=KIND_OVERFIT, gate_receipt=gate) == []
+
+
+@pytest.mark.parametrize("stamped", [True, False])
+def test_verify_accepts_an_integration_receipt_with_or_without_its_stamp_time(
+    tmp_path, stamped
+):
+    from lot.phase5_receipt import KIND_INTEGRATION, stamp_receipt
+
+    report = stamp_receipt({"passed": True}, CONFIG, KIND_INTEGRATION)
+    assert UTC_STAMP.match(report["stamped_utc"])
+    if not stamped:
+        del report["stamped_utc"]
+    path = tmp_path / "integration_gate.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    assert _identity_problems(verify(path, CONFIG, "gate", kind=KIND_INTEGRATION)) == []
+
+
+# ---------------------------------------------------------------------------
+# The checkpoint lock, reporting_rules.md section 7
+# ---------------------------------------------------------------------------
+#
+# The lock receipt is bound by sha256 to the integration receipt and to the
+# overfit receipt. It also names every file evaluation reads before it touches
+# a test scene: each (fold, seed)'s checkpoint and training record, and the
+# controls file of the level. The verifier only hashes those files, so here
+# they hold arbitrary bytes. tests/test_phase5_modes.py locks real checkpoints.
+
+LOCK_LEVEL = "image"
+
+
+def config_with_outputs_at(tmp_path: Path) -> Path:
+    """The shipped configuration, with its outputs under tmp_path.
+
+    output_root is outside the config digest, so the identity is the shipped
+    configuration's own.
+    """
+    import yaml
+
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["output_root"] = str(tmp_path / "outputs")
+    path = tmp_path / "phase5.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return path
+
+
+def write_locked_files(config_path: Path, level: str = LOCK_LEVEL) -> dict:
+    """Stand-ins for every file a lock binds, where a run under config_path reads them.
+
+    Returns the lock's file block: each checkpoint and training record under
+    its (fold, seed) key, and the controls file, each with its path and sha256.
+    """
+    from lot.phase5 import load_phase5_config
+    from lot.phase5_check import sha256_file
+    from lot.phase5_folds import frozen_folds
+    from lot.phase5_modes import checkpoint_lock_files
+    from lot.train import training_config_from
+
+    cfg = load_phase5_config(config_path)
+    files = checkpoint_lock_files(
+        cfg, level, frozen_folds(), training_config_from(cfg.training).seeds
+    )
+
+    def entry(path: Path, body: str) -> dict:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return {"path": str(path), "sha256": sha256_file(path)}
+
+    return {
+        "checkpoints": {key: entry(path, f"checkpoint {key}")
+                        for key, path in files["checkpoints"].items()},
+        "training_records": {key: entry(path, f"record {key}")
+                             for key, path in files["training_records"].items()},
+        "controls": entry(files["controls"], "controls"),
+    }
+
+
+def _lock(tmp_path: Path, level: str = LOCK_LEVEL) -> dict:
+    """A stamped lock receipt over stand-in files, and the receipts it is bound to."""
+    from lot.phase5_receipt import KIND_LOCK, stamp_receipt
+
+    config = config_with_outputs_at(tmp_path)
+    gate = _gate_file(tmp_path)
+    overfit = _overfit_receipt(tmp_path, gate)
+    report = stamp_receipt(
+        {"passed": True, "level": level, **write_locked_files(config, level)},
+        config, KIND_LOCK, gate_receipt=gate, overfit_receipt=overfit,
+    )
+    path = tmp_path / f"checkpoint_lock_{level}.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return {"lock": path, "config": config, "gate": gate, "overfit": overfit,
+            "report": report}
+
+
+def _verify_lock(lock: dict, level: str | None = LOCK_LEVEL, **overrides) -> list[str]:
+    from lot.phase5_receipt import KIND_LOCK
+
+    arguments = {"kind": KIND_LOCK, "gate_receipt": lock["gate"],
+                 "overfit_receipt": lock["overfit"], "level": level, **overrides}
+    return verify(lock["lock"], lock["config"], "lock", **arguments)
+
+
+def _rewrite(lock: dict, report: dict) -> None:
+    lock["lock"].write_text(json.dumps(report), encoding="utf-8")
+
+
+def test_a_lock_receipt_verifies(tmp_path):
+    """Bound to both receipts by sha256. It names a checkpoint and a training
+    record for each of the frozen folds by the frozen seeds, nine of each, and
+    the controls file."""
+    from lot.phase5_check import sha256_file
+    from lot.phase5_receipt import (
+        GATE_RECEIPT_DIGEST,
+        KIND_LOCK,
+        OVERFIT_RECEIPT_DIGEST,
+        RECEIPT_KINDS,
+    )
+
+    assert KIND_LOCK in RECEIPT_KINDS
+    lock = _lock(tmp_path)
+    report = lock["report"]
+    assert report["kind"] == KIND_LOCK
+    assert report[GATE_RECEIPT_DIGEST] == sha256_file(lock["gate"])
+    assert report[OVERFIT_RECEIPT_DIGEST] == sha256_file(lock["overfit"])
+    assert UTC_STAMP.match(report["stamped_utc"])
+    for field in BOUND_FIELDS:
+        assert report[field] == current_identity(lock["config"])[field]
+    assert len(report["checkpoints"]) == len(report["training_records"]) == 9
+    assert _verify_lock(lock) == []
+
+
+@pytest.mark.parametrize("group,key,name", [
+    ("checkpoints", "fold1_seed2", "checkpoint fold1_seed2"),
+    ("training_records", "fold2_seed0", "training record fold2_seed0"),
+    ("controls", None, "controls file"),
+])
+def test_a_file_changed_after_locking_fails_verify(tmp_path, group, key, name):
+    """Evaluation refuses a lock that no longer matches the live files, and
+    the one file that changed is the one named."""
+    lock = _lock(tmp_path)
+    entry = lock["report"][group] if key is None else lock["report"][group][key]
+    path = Path(entry["path"])
+    path.write_bytes(path.read_bytes() + b"x")
+    problems = _verify_lock(lock)
+    assert len(problems) == 1, problems
+    assert name in problems[0] and "changed since the lock was written" in problems[0]
+
+
+def test_a_locked_file_that_is_gone_fails_verify(tmp_path):
+    lock = _lock(tmp_path)
+    Path(lock["report"]["checkpoints"]["fold0_seed1"]["path"]).unlink()
+    problems = _verify_lock(lock)
+    assert len(problems) == 1, problems
+    assert "checkpoint fold0_seed1" in problems[0] and "absent" in problems[0]
+
+
+def test_a_lock_bound_to_a_superseded_gate_receipt_fails(tmp_path):
+    """Rerunning check moves the old gate receipt aside and writes a new one,
+    through write_once. The lock still names the old receipt's sha256."""
+    from lot.phase5_check import write_once
+
+    lock = _lock(tmp_path)
+    outcome = write_once(lock["gate"], json.dumps({"passed": True, "body": "rerun"}))
+    assert outcome["archived_previous"]
+    problems = _verify_lock(lock)
+    assert any("ran under a different integration gate" in p for p in problems), problems
+
+
+def test_a_lock_bound_to_a_superseded_overfit_receipt_fails(tmp_path):
+    from lot.phase5_check import write_once
+
+    lock = _lock(tmp_path)
+    write_once(lock["overfit"], json.dumps({"passed": True, "body": "rerun"}))
+    problems = _verify_lock(lock)
+    assert any("ran under a different overfit gate" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("field", ["gate_receipt_sha256", "overfit_receipt_sha256"])
+def test_a_lock_without_one_of_its_bindings_is_refused(tmp_path, field):
+    lock = _lock(tmp_path)
+    report = dict(lock["report"])
+    del report[field]
+    _rewrite(lock, report)
+    problems = _verify_lock(lock)
+    assert any(f"({field})" in p and "does not record" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("field", BOUND_FIELDS)
+def test_a_lock_receipt_is_bound_to_the_run_identity(tmp_path, field):
+    lock = _lock(tmp_path)
+    _rewrite(lock, {**lock["report"], field: "something-else"})
+    problems = _verify_lock(lock)
+    assert any(field in p and "moved since the receipt was written" in p
+               for p in problems), problems
+
+
+def test_a_lock_for_another_level_licenses_nothing_at_this_one(tmp_path):
+    lock = _lock(tmp_path)
+    problems = _verify_lock(lock, level="affine")
+    assert len(problems) == 1, problems
+    assert "'image'" in problems[0] and "'affine'" in problems[0]
+
+
+def test_a_lock_must_name_exactly_the_files_this_run_reads(tmp_path):
+    """The files are located from the configuration, the frozen folds, and the
+    configured seeds. A lock that omits one does not bind it, and a lock that
+    names another binds nothing this run reads."""
+    lock = _lock(tmp_path)
+    report = json.loads(lock["lock"].read_text(encoding="utf-8"))
+    report["checkpoints"]["fold3_seed0"] = report["checkpoints"].pop("fold2_seed2")
+    _rewrite(lock, report)
+    problems = _verify_lock(lock)
+    assert any("does not record the checkpoint fold2_seed2" in p for p in problems), problems
+    assert any("fold3_seed0" in p and "does not read" in p for p in problems), problems
+    assert len(problems) == 2, problems
+
+
+def test_verifying_a_lock_needs_both_receipts_and_the_level(tmp_path):
+    """A missing argument is the caller's error, and it is reported, not skipped."""
+    lock = _lock(tmp_path)
+    assert any("no integration receipt was supplied" in p
+               for p in _verify_lock(lock, gate_receipt=None))
+    assert any("no overfit receipt was supplied" in p
+               for p in _verify_lock(lock, overfit_receipt=None))
+    assert any("no alignment level was supplied" in p
+               for p in _verify_lock(lock, level=None))
+
+
+def test_stamp_receipt_refuses_a_lock_without_both_receipts(tmp_path):
+    from lot.phase5_receipt import KIND_LOCK, stamp_receipt
+
+    gate = _gate_file(tmp_path)
+    overfit = _overfit_receipt(tmp_path, gate)
+    with pytest.raises(ValueError, match="must be bound to the integration receipt"):
+        stamp_receipt({"passed": True}, CONFIG, KIND_LOCK, overfit_receipt=overfit)
+    with pytest.raises(ValueError, match="must be bound to the overfit receipt"):
+        stamp_receipt({"passed": True}, CONFIG, KIND_LOCK, gate_receipt=gate)
+    with pytest.raises(ValueError, match="must be bound to the overfit receipt"):
+        stamp_receipt({"passed": True}, CONFIG, KIND_LOCK, gate_receipt=gate,
+                      overfit_receipt=tmp_path / "absent.json")
+
+
+def test_the_command_line_verifier_checks_a_lock(tmp_path, capsys):
+    """The launcher's early check goes through this entry point."""
+    from lot.phase5_receipt import main
+
+    lock = _lock(tmp_path)
+    arguments = [
+        "--receipt", str(lock["lock"]), "--config", str(lock["config"]),
+        "--label", "the checkpoint lock", "--kind", "lock",
+        "--gate-receipt", str(lock["gate"]),
+        "--overfit-receipt", str(lock["overfit"]), "--level", LOCK_LEVEL,
+    ]
+    main(arguments)
+    assert "PASS" in capsys.readouterr().out
+    checkpoint = Path(lock["report"]["checkpoints"]["fold0_seed0"]["path"])
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"x")
+    with pytest.raises(SystemExit) as stop:
+        main(arguments)
+    assert stop.value.code == 1
+    assert "checkpoint fold0_seed0 changed" in capsys.readouterr().err

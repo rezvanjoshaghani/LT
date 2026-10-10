@@ -618,12 +618,18 @@ def fold_and_seed_for_task(task_index: int, seeds: Sequence[int]) -> tuple[Fold,
     return folds[task_index // len(seeds)], seeds[task_index % len(seeds)]
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The entry point's arguments.
+
+    The launcher reads --level through this same parser, so the level whose
+    lock it checks before evaluation is the level the entry point will run.
+    """
     parser = argparse.ArgumentParser(description="Phase 5, rung 2")
     parser.add_argument("--config", type=Path, default=Path("configs/phase5.yaml"))
     parser.add_argument(
         "--mode",
-        choices=("describe", "check", "overfit", "train", "controls", "evaluate"),
+        choices=("describe", "check", "overfit", "train", "controls", "lock",
+                 "evaluate"),
         default="describe",
     )
     parser.add_argument("--task-index", type=int, default=0)
@@ -636,7 +642,11 @@ def main(argv: list[str] | None = None) -> None:
         "--scene-index", type=int, default=None,
         help="evaluate one test scene, by its index in the fixed evaluation order",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
 
     cfg = load_phase5_config(args.config)
     analysis = load_analysis_config(Path(cfg.analysis_config))
@@ -700,23 +710,35 @@ def scene_image_hw(cfg: Phase5Config, scene: str) -> tuple[int, int]:
     return next(iter(sizes))
 
 
-def require_receipts(cfg: Phase5Config, config_path: Path, mode: str) -> None:
+def require_receipts(cfg: Phase5Config, config_path: Path, mode: str, level: str) -> None:
     """The authoritative gate check. Every launcher and worker passes through here.
 
     The shell launcher and the SLURM template also check, for an early and
     friendly refusal, but this is the boundary that cannot be bypassed: any way
     of running a mode is a way of calling this entry point. overfit needs the
     integration gate; everything after it needs both gates.
+
+    evaluate also needs the checkpoint lock of its level, reporting_rules.md
+    section 7. The lock must still match the live files: every checkpoint,
+    training record, and controls file it names is hashed again here.
     """
-    from .phase5_receipt import KIND_INTEGRATION, KIND_OVERFIT, verify
+    from .phase5_modes import checkpoint_lock_path
+    from .phase5_receipt import KIND_INTEGRATION, KIND_LOCK, KIND_OVERFIT, verify
 
     gate = cfg.evidence_dir / "integration_gate.json"
+    overfit = cfg.evidence_dir / "tiny_overfit.json"
     problems = verify(gate, config_path, "the Borah integration gate",
                       kind=KIND_INTEGRATION)
     if mode != "overfit":
         problems += verify(
-            cfg.evidence_dir / "tiny_overfit.json", config_path,
+            overfit, config_path,
             "the tiny-subset overfit gate", kind=KIND_OVERFIT, gate_receipt=gate,
+        )
+    if mode == "evaluate":
+        problems += verify(
+            checkpoint_lock_path(cfg.evidence_dir, level), config_path,
+            f"the checkpoint lock for level {level}", kind=KIND_LOCK,
+            gate_receipt=gate, overfit_receipt=overfit, level=level,
         )
     if problems:
         import sys
@@ -730,20 +752,36 @@ def require_receipts(cfg: Phase5Config, config_path: Path, mode: str) -> None:
 
 
 def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
-    """overfit, train, controls, and evaluate, each behind its gates."""
-    from .phase5_check import write_once
+    """overfit, train, controls, lock, and evaluate, each behind its gates."""
+    from .phase5_check import sha256_file, write_once
     from .phase5_modes import (
+        CheckpointLockError,
         SceneStore,
+        checkpoint_lock_path,
+        checkpoint_lock_payload,
+        checkpoint_path,
+        controls_path,
+        controls_payload,
         evaluation_scenes,
+        fold_seed_key,
         load_checkpoint,
         primary_evaluation_complete,
+        receipt_licence,
         resolve_device,
         run_controls,
         run_evaluate_scene,
         run_overfit,
         run_train_task,
+        stop_on_termination,
     )
-    from .phase5_receipt import KIND_OVERFIT, current_identity, stamp_receipt
+    from .phase5_receipt import (
+        GATE_RECEIPT_DIGEST,
+        KIND_LOCK,
+        KIND_OVERFIT,
+        OVERFIT_RECEIPT_DIGEST,
+        current_identity,
+        stamp_receipt,
+    )
     from .train import training_config_from
 
     mode = args.mode
@@ -756,7 +794,24 @@ def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
     if level not in declared:
         raise SystemExit(f"level {level!r} is not declared in the frozen config: {declared}")
 
-    require_receipts(cfg, args.config, mode)
+    require_receipts(cfg, args.config, mode, level)
+
+    # The receipts just verified, by sha256, for every artifact this job writes,
+    # reporting_rules.md section 7. They are hashed here, where they were
+    # checked, so a receipt replaced while the job runs is never credited with
+    # licensing it. The overfit gate is licensed by the integration receipt
+    # alone, and its own receipt records that receipt's digest. Evaluation is
+    # also licensed by the checkpoint lock of its level, verified with the
+    # others, so the lock is required in its licence.
+    gate_receipt = cfg.evidence_dir / "integration_gate.json"
+    overfit_receipt = cfg.evidence_dir / "tiny_overfit.json"
+    lock_receipt = checkpoint_lock_path(cfg.evidence_dir, level)
+    licensing: tuple[Path, ...] = ()
+    if mode != "overfit":
+        licensing = (gate_receipt, overfit_receipt)
+    if mode == "evaluate":
+        licensing += (lock_receipt,)
+    licence = receipt_licence(licensing)
 
     folds = frozen_folds()
     if level != cfg.primary_alignment_level:
@@ -776,11 +831,50 @@ def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
             )
 
     train_cfg = training_config_from(cfg.training)
-    convention = load_convention_record(cfg)
-    center = phase5_mean_vector(cfg)
     device = resolve_device(args.device)
     model_cfg = predictor_config_from(cfg, scene_image_hw(cfg, folds[0].train[0]))
-    gate_receipt = cfg.evidence_dir / "integration_gate.json"
+
+    if mode == "lock":
+        # After the controls and before evaluation, reporting_rules.md section
+        # 7. It loads and hashes the checkpoints and reads no scene, so it needs
+        # no convention record, no centering vector, and no scene store. Every
+        # training record and the controls file must name, as their licence,
+        # the receipts this job verified, which are the ones the lock binds.
+        try:
+            payload = checkpoint_lock_payload(
+                cfg, level, folds, train_cfg.seeds, model_cfg, train_cfg, device,
+                current_identity(args.config), licence=licence,
+            )
+        except CheckpointLockError as error:
+            raise SystemExit(str(error)) from error
+        stamped = stamp_receipt(payload, args.config, KIND_LOCK,
+                                gate_receipt=gate_receipt,
+                                overfit_receipt=overfit_receipt)
+        # The lock binds the receipts this job verified, or it is not written.
+        # A receipt replaced since the check above is never bound.
+        bound = {gate_receipt.stem: stamped[GATE_RECEIPT_DIGEST],
+                 overfit_receipt.stem: stamped[OVERFIT_RECEIPT_DIGEST]}
+        if bound != licence:
+            raise SystemExit(
+                "a receipt changed while the checkpoint lock was being built, so "
+                "the lock was not written; rerun it"
+            )
+        outcome = write_once(
+            lock_receipt, json.dumps(stamped, indent=2, sort_keys=True, default=str)
+        )
+        print(f"CHECKPOINT LOCK, level {level}: {len(payload['checkpoints'])} "
+              "checkpoints, their training records, and the controls file")
+        for key in sorted(payload["checkpoints"]):
+            print(f"  {key}  checkpoint {payload['checkpoints'][key]['sha256']}  "
+                  f"record {payload['training_records'][key]['sha256']}")
+        print(f"  controls file {payload['controls']['sha256']}")
+        print(f"lock written to {outcome['written']}")
+        if outcome["archived_previous"]:
+            print(f"previous lock kept at {outcome['archived_previous']}")
+        return
+
+    convention = load_convention_record(cfg)
+    center = phase5_mean_vector(cfg)
 
     with SceneStore(cfg, analysis, convention) as store:
         if mode == "overfit":
@@ -815,7 +909,7 @@ def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
             fold, seed = fold_and_seed_for_task(args.task_index, train_cfg.seeds)
             payload = run_train_task(
                 cfg, analysis, store, fold, seed, model_cfg, train_cfg, center,
-                device, level, cfg.run_dir,
+                device, level, cfg.run_dir, licence=licence,
             )
             print(f"fold {fold.index} seed {seed} level {level}: best validation "
                   f"centered cosine {payload['best_validation_centered_cosine']:.4f} "
@@ -832,27 +926,34 @@ def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
                         "run together and the config may not disable one"
                     )
             results: dict[str, Any] = {}
+            checkpoints: dict[str, str] = {}
             missing: list[str] = []
             for fold in folds:
                 for seed in train_cfg.seeds:
+                    key = fold_seed_key(fold.index, seed)
                     try:
                         model = load_checkpoint(cfg.run_dir, level, fold, seed,
-                                                model_cfg, train_cfg, device)
+                                                model_cfg, train_cfg, device,
+                                                config_digest=cfg.digest())
                     except FileNotFoundError as error:
                         missing.append(str(error))
                         continue
-                    results[f"fold{fold.index}_seed{seed}"] = run_controls(
+                    # load_checkpoint has just matched these bytes to the record.
+                    checkpoints[key] = sha256_file(
+                        checkpoint_path(cfg.run_dir, level, fold.index, seed)
+                    )
+                    results[key] = run_controls(
                         cfg, analysis, store, fold, model, model_cfg, center, level,
                         train_cfg.batch_pairs, int(controls["seed"]),
                     )
                 # A fold's validation scenes are not read again by later folds.
                 store.close()
-            payload = {
-                "level": level, "results": results, "missing": missing,
-                **current_identity(args.config),
-            }
+            payload = controls_payload(
+                level, results, missing, current_identity(args.config), licence,
+                checkpoints,
+            )
             outcome = write_once(
-                cfg.evidence_dir / f"input_use_controls_{level}.json",
+                controls_path(cfg.evidence_dir, level),
                 json.dumps(payload, indent=2, sort_keys=True, default=str),
             )
             for name, result in results.items():
@@ -874,15 +975,20 @@ def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
                         f"scene index {args.scene_index} outside 0..{len(scenes) - 1}"
                     )
                 scenes = [scenes[args.scene_index]]
-            for scene in scenes:
-                result = run_evaluate_scene(
-                    cfg, analysis, store, scene, fold_of_test_scene(scene, folds),
-                    train_cfg.seeds, model_cfg, train_cfg, center, level, device,
-                    cfg.run_dir,
-                )
-                # One test scene resident at a time.
-                store.close()
-                print(f"{scene}: {result['status']} {result['path']}")
+            # SLURM ends a task with SIGTERM. Within this block it raises
+            # SystemExit, so the attempt it interrupts writes its close.
+            with stop_on_termination():
+                for scene in scenes:
+                    # Every attempt writes a start and a close to the ledger.
+                    result = run_evaluate_scene(
+                        cfg, analysis, store, scene, fold_of_test_scene(scene, folds),
+                        train_cfg.seeds, model_cfg, train_cfg, center, level, device,
+                        cfg.run_dir, licence=licence,
+                        ledger_dir=cfg.evidence_dir / "evaluation_ledger",
+                    )
+                    # One test scene resident at a time.
+                    store.close()
+                    print(f"{scene}: {result['status']} {result['path']}")
             return
 
     raise SystemExit(f"unknown mode {mode!r}")

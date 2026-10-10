@@ -231,3 +231,39 @@ before any outcome exists. Acceptance re-derives each of the specification's
 18 conditions from the shipped artifacts. It adds three: the stable
 validation curve of decision 5, the headline figures present and built from
 the current tables, and the full suite green at the reporting commit.
+
+## 9. Implementation notes, recorded 2026-10-10 before any run
+
+These record how the build reads the sections above. Each was settled while
+implementing, before any Phase 5 model trained at scale and before any test
+result existed.
+
+- **The ledger's mechanism.** Every attempt is recorded, as section 7
+  requires, but not by appending to one shared file. Evaluation runs as an
+  array on several nodes over a network file system, where concurrent appends
+  are not safe. Each attempt writes a start record before any work and a close
+  record when it ends, as its own files under
+  `evidence/evaluation_ledger/`. Acceptance renders them into
+  `evaluation_ledger.jsonl`, one line per attempt, and requires one evaluation
+  per scene and level. An attempt killed outright keeps its start and is
+  reported as unfinished. SIGTERM, which SLURM sends at a time limit and on
+  `scancel`, is turned into a recorded error.
+- **A second path with no finite cross-path terms.** When a quantity has a
+  second path but the cells both paths share give no finite term, and the
+  reported effect is in the band, the cell is engaged and gets decision 2's
+  veto. PROTOCOL 3.9 restricts such an effect's interpretation to content the
+  two paths share, and here they share none. Sign agreement and clearance are
+  reported as undefined.
+- **Gate step order.** The pure-rotation step keeps id 17 and runs after step
+  14 and before step 15, so the cluster pin is written only after it passes.
+  Step 16 stays last. No existing step id changed.
+- **Outcome calling details.** An unsupported cell carries no outcome and no
+  qualifier. delta_learn_sp is called by the same rule, to decide outcome 49,
+  and carries no outcome wording of its own. The outcome 49 flag is undefined
+  when either cell cannot be called. A supported cell with an undefined
+  interval, or an estimate outside its own interval, stops the tables rather
+  than being called.
+- **Resuming an evaluation.** An existing parquet is resumed only when its run
+  record matches the scene, level, fold, seeds, and config digest, and its
+  checkpoints and training records by hash. Anything else is refused and left
+  untouched.

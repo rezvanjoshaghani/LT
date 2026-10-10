@@ -7,6 +7,7 @@
 #   ./scripts/run_phase5.sh overfit     # tiny-subset adequacy gate, a stop condition
 #   ./scripts/run_phase5.sh train       # nine (fold, seed) tasks, one array
 #   ./scripts/run_phase5.sh controls    # pose and depth shuffle, validation only
+#   ./scripts/run_phase5.sh lock        # bind checkpoints, records, controls by sha256
 #   ./scripts/run_phase5.sh evaluate    # test scenes, one array task per scene
 #   ./scripts/run_phase5.sh tables      # Stream AC tables
 #   ./scripts/run_phase5.sh figures     # Stream AC figures
@@ -31,10 +32,16 @@
 # every mode's gate receipts again inside the job, so a job cannot run past a
 # gate that stopped standing while it waited in the queue.
 #
+# lock runs here. It loads and hashes the nine checkpoints, their training
+# records, and the controls file, and reads no scene. Its receipt,
+# checkpoint_lock_{level}.json, binds them all by sha256, and evaluate refuses
+# to start without a lock that still matches the live files.
+#
 # Arguments after the mode are passed to the entry point. The one in use is
 # --level, for a sensitivity or diagnostic alignment level, which the entry
 # point refuses until the primary evaluation is complete:
 #
+#   ./scripts/run_phase5.sh lock --level affine
 #   ./scripts/run_phase5.sh evaluate --level affine
 #
 # Environment:
@@ -122,7 +129,9 @@ require_receipt() {
     # kind selects which bindings apply. The integration receipt is bound to the
     # resolved inputs it hashed; the overfit receipt carries no such block and is
     # bound instead to the digest of the integration receipt that licensed it.
+    # Any further arguments go to the verifier.
     local receipt="$1" label="$2" advice="$3" kind="$4"
+    shift 4
     if [ ! -f "$receipt" ]; then
         echo "$label has not been run; $receipt is absent." >&2
         echo "$advice" >&2
@@ -130,7 +139,7 @@ require_receipt() {
     fi
     run_lot python -m lot.phase5_receipt \
         --receipt "$receipt" --config "$CONFIG" --label "$label" \
-        --kind "$kind" --gate-receipt "$GATE_RECEIPT" || exit 1
+        --kind "$kind" --gate-receipt "$GATE_RECEIPT" "$@" || exit 1
 }
 
 require_gate_passed() {
@@ -141,6 +150,29 @@ require_gate_passed() {
 require_overfit_passed() {
     require_receipt "$OVERFIT_RECEIPT" "the tiny-subset overfit gate" \
         "run './scripts/run_phase5.sh overfit' first." overfit
+}
+
+# The alignment level the entry point will run at, read through the entry
+# point's own argument parser: --level when it is passed after the mode, the
+# frozen primary level otherwise. A malformed argument fails here, as it would
+# in the entry point.
+resolved_level() {
+    run_lot python -c '
+import sys
+from lot.phase5 import build_parser, load_phase5_config
+args = build_parser().parse_args(sys.argv[1:])
+print(args.level or load_phase5_config(args.config).primary_alignment_level)
+' --config "$CONFIG" --mode describe ${EXTRA[@]+"${EXTRA[@]}"}
+}
+
+# The checkpoint lock is bound to both gate receipts and to every file it
+# names, so the verifier hashes all of them again before anything is submitted.
+require_lock_written() {
+    local level="$1"
+    require_receipt "$EVIDENCE_DIR/checkpoint_lock_${level}.json" \
+        "the checkpoint lock for level $level" \
+        "run './scripts/run_phase5.sh lock --level $level' first." lock \
+        --overfit-receipt "$OVERFIT_RECEIPT" --level "$level"
 }
 
 require_slurm() {
@@ -212,7 +244,7 @@ train)
     ;;
 
 controls)
-    # Validation scenes only, through every locked checkpoint. Run after all
+    # Validation scenes only, through every trained checkpoint. Run after all
     # nine training tasks have finished; a missing checkpoint is reported and
     # the job exits nonzero rather than writing a partial result as complete.
     require_clean_tree
@@ -223,14 +255,43 @@ controls)
         ${EXTRA[@]+"${EXTRA[@]}"}
     ;;
 
+lock)
+    # After the controls, before evaluate. reporting_rules.md section 7. It
+    # refuses, listing every problem, unless each checkpoint loads through its
+    # training record, each record names this run, and the controls file is
+    # complete and ran on these checkpoints. Light enough to run here. Each run
+    # keeps its own output file under the evidence directory.
+    require_clean_tree
+    require_gate_passed
+    require_overfit_passed
+    level="$(resolved_level)"
+    log="$EVIDENCE_DIR/checkpoint_lock_${level}_$(date -u +%Y%m%dT%H%M%SZ).txt"
+    echo "=== checkpoint lock, level $level ==="
+    set +e
+    run_lot python -m lot.phase5 --config "$CONFIG" --mode lock \
+        ${EXTRA[@]+"${EXTRA[@]}"} 2>&1 | tee "$log"
+    # The status is read from PIPESTATUS, as in check.
+    status="${PIPESTATUS[0]}"
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo
+        echo "checkpoint lock refused; evaluate may not run. Output kept in $log" >&2
+        exit "$status"
+    fi
+    echo "output kept in $log"
+    ;;
+
 evaluate)
-    # The only mode that touches test scenes, and it runs after checkpoints are
-    # locked. Nothing it prints may be fed back into training or selection.
+    # The only mode that touches test scenes, and it runs only once the
+    # checkpoints are locked: the lock of its level must still match the live
+    # files. Nothing it prints may be fed back into training or selection.
     # One array task per test scene. The range is read from the frozen folds,
     # so it cannot disagree with the order the entry point indexes.
     require_clean_tree
     require_gate_passed
     require_overfit_passed
+    level="$(resolved_level)"
+    require_lock_written "$level"
     require_slurm
     last="$(run_lot python -c 'from lot.phase5_folds import frozen_folds
 from lot.phase5_modes import evaluation_scenes
@@ -244,15 +305,16 @@ tables|figures|acceptance)
     require_clean_tree
     require_gate_passed
     echo "mode '$MODE' is not implemented yet." >&2
-    echo "Streams AC and AD are the remaining work; they are deliberately not" >&2
-    echo "built before the real-data integration gate passes, because their" >&2
-    echo "inputs are the evaluation records the gate exists to make trustworthy." >&2
+    echo "It is part of Streams AC and AD. reporting_rules.md decision 1 requires" >&2
+    echo "the reporting code, with the outcome and wording code in" >&2
+    echo "src/lot/phase5_report.py, to be committed before the chain runs once at" >&2
+    echo "one commit E. The chain, from check through evaluate, waits for it." >&2
     exit 2
     ;;
 
 *)
     echo "unknown mode '$MODE'" >&2
-    echo "use: check, overfit, train, controls, evaluate, tables, figures, acceptance" >&2
+    echo "use: check, overfit, train, controls, lock, evaluate, tables, figures, acceptance" >&2
     exit 1
     ;;
 esac

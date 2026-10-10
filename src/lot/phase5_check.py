@@ -31,6 +31,7 @@ import json
 import platform
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -161,6 +162,22 @@ def environment_identity() -> dict[str, Any]:
         identity["gpu"] = torch.cuda.get_device_name(0)
         identity["gpu_capability"] = list(torch.cuda.get_device_capability(0))
     return identity
+
+
+def utc_timestamp(moment: datetime | None = None) -> str:
+    """An instant in UTC, as ISO 8601 to the microsecond. Now, by default.
+
+    Every Phase 5 artifact that records when it was written uses this one
+    format. The precision is fixed, so two stamps compare as strings in time
+    order. The offset is written out, so every machine reads the same instant.
+    A naive datetime is refused. Its instant depends on the machine that reads
+    it.
+    """
+    if moment is None:
+        moment = datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        raise ValueError("a naive datetime names no instant; give it a time zone")
+    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 # ---------------------------------------------------------------------------

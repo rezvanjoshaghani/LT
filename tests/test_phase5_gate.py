@@ -532,3 +532,97 @@ def test_step_six_compares_the_example_against_an_independent_expectation():
     assert "context_lift_support(" in step6, "step 6 does not rebuild evaluability"
     # The tautology was a self-comparison of the landing coordinates.
     assert '"supervision_read_uv"' not in step6
+
+
+# ---------------------------------------------------------------------------
+# Step 10: the pure-rotation check reads landed samples only
+# ---------------------------------------------------------------------------
+#
+# Measured before the first real run reached step 10. On a 518 px frame with a
+# 90 degree field of view, the residual between context-lift and the analytic
+# homography over every context patch passes the 1e-3 px tolerance from about
+# 45 degrees of rotation: 0.047 px at 45, 1.07 px at 75. Landed samples stay
+# near 6e-5 px. The excess is float32 rounding on unlanded rays that project
+# tens of thousands of pixels out, where no score ever reads.
+
+ROTATION_TOL_PX = 1.0e-3
+SIDE = 518
+
+
+def _rotation(degrees: float) -> torch.Tensor:
+    import math
+
+    a = math.radians(degrees)
+    T = torch.eye(4, dtype=torch.float32)
+    T[:3, :3] = torch.tensor([[math.cos(a), 0.0, math.sin(a)],
+                              [0.0, 1.0, 0.0],
+                              [-math.sin(a), 0.0, math.cos(a)]], dtype=torch.float32)
+    return T
+
+
+def _rotation_case(T: torch.Tensor, substitute_T: torch.Tensor | None = None):
+    from lot.context_lift import context_lift_map, rotation_homography_landing
+    from lot.render_replica import intrinsics_from_hfov
+
+    K = intrinsics_from_hfov(SIDE, SIDE, 90.0).to(torch.float32)
+    hw = (SIDE, SIDE)
+    depth = torch.full(hw, 2.5) + torch.linspace(0.0, 1.0, SIDE)[None, :]
+    lift = context_lift_map(depth, K, K, T, hw, hw)
+    analytic = rotation_homography_landing(K, K, T, hw, dtype=torch.float32)
+    substituted = context_lift_map(
+        torch.full_like(depth, 7.0), K, K, T if substitute_T is None else substitute_T, hw, hw
+    )
+    return lift, analytic, substituted
+
+
+def test_step_ten_reads_only_landed_samples_at_large_rotation():
+    from lot.phase5_gate import rotation_gate_evidence
+
+    lift, analytic, substituted = _rotation_case(_rotation(60.0))
+    # What the first version compared, and would have stopped on.
+    assert float((lift.uv_target - analytic).abs().max()) > ROTATION_TOL_PX
+    evidence = rotation_gate_evidence(lift, analytic, substituted, ROTATION_TOL_PX)
+    assert evidence["n_landed_samples"] == int(lift.landed.sum())
+    assert 0 < evidence["n_landed_samples"] < evidence["n_context_patches"]
+    assert evidence["max_homography_residual_px"] <= ROTATION_TOL_PX
+
+
+def test_step_ten_still_stops_a_wrong_rotation():
+    """Comparing against the inverse rotation must fail on the landed samples."""
+    from lot.context_lift import rotation_homography_landing
+    from lot.phase5_gate import rotation_gate_evidence
+    from lot.render_replica import intrinsics_from_hfov
+
+    T = _rotation(20.0)
+    lift, _, substituted = _rotation_case(T)
+    K = intrinsics_from_hfov(SIDE, SIDE, 90.0).to(torch.float32)
+    wrong = rotation_homography_landing(K, K, _rotation(-20.0), (SIDE, SIDE), dtype=torch.float32)
+    with pytest.raises(GateStop) as stop:
+        rotation_gate_evidence(lift, wrong, substituted, ROTATION_TOL_PX)
+    assert stop.value.step == "10"
+    assert stop.value.classification == IMPLEMENTATION_BUG
+
+
+def test_step_ten_still_stops_a_depth_dependent_landing():
+    """A substituted depth that moves a landing means the map is not depth free."""
+    from lot.phase5_gate import rotation_gate_evidence
+
+    T = _rotation(20.0)
+    translated = T.clone()
+    translated[0, 3] = 0.2
+    lift, analytic, moved = _rotation_case(T, substitute_T=translated)
+    with pytest.raises(GateStop) as stop:
+        rotation_gate_evidence(lift, analytic, moved, ROTATION_TOL_PX)
+    assert stop.value.step == "10"
+    assert "depth" in stop.value.message
+
+
+def test_step_ten_runs_the_tested_function():
+    import inspect
+
+    from lot import phase5_gate
+
+    source = inspect.getsource(phase5_gate.run_integration_gate)
+    step10 = source[source.index("def step10"):source.index("def step11")]
+    assert "rotation_gate_evidence(" in step10
+    assert "(lift.uv_target - analytic)" not in step10

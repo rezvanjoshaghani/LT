@@ -626,3 +626,346 @@ def test_step_ten_runs_the_tested_function():
     step10 = source[source.index("def step10"):source.index("def step11")]
     assert "rotation_gate_evidence(" in step10
     assert "(lift.uv_target - analytic)" not in step10
+
+
+# ---------------------------------------------------------------------------
+# Step 17: the pure-rotation gate across the whole rotation regime
+# ---------------------------------------------------------------------------
+#
+# reporting_rules.md section 7. Every rotation pair of all 18 scenes, at the
+# primary level. Context-Lift is compared with the analytic homography, and
+# with itself under a substituted depth map. TL-Reference's context read
+# locations are compared with the inverse homography at the Phase 3 target
+# samples. Each comparison runs on its own estimator's landed samples. The
+# per-sample limit is the frozen tolerance plus focal length times the pair's
+# translation over the sample's depth in the receiving camera.
+
+POSITION_BOUND_M = 1.0e-6
+COMPARISONS = ("context_lift", "depth_substitution", "tl_reference")
+WHERE = "room_0 ctx -> tgt level image"
+
+
+def _translated(T: torch.Tensor, x_m: float) -> torch.Tensor:
+    moved = T.clone()
+    moved[0, 3] = x_m
+    return moved
+
+
+def _target_samples(count: int = 600) -> torch.Tensor:
+    """Phase 3 style target sample coordinates: continuous, inside the frame."""
+    generator = torch.Generator().manual_seed(5)
+    return torch.rand((count, 2), generator=generator, dtype=torch.float32) * (SIDE - 1)
+
+
+def _tl_reads(depth_target: torch.Tensor, K: torch.Tensor, T: torch.Tensor,
+              uv_target: torch.Tensor):
+    """TL-Reference's read locations, through the primitives Phase 4 calls."""
+    from lot.correspondence import _in_box, _sampling_box
+    from lot.encoders import PATCH_SIZE, sample_map_bilinear
+    from lot.geometry import invert_se3, project, transform_points, unproject
+
+    read = sample_map_bilinear(depth_target, uv_target)
+    valid = torch.isfinite(read) & (read > 0)
+    safe = torch.where(valid, read, torch.ones_like(read))
+    points = transform_points(invert_se3(T), unproject(uv_target, safe, K))
+    uv, z = project(points, K)
+    landed = valid & (z > 0) & _in_box(uv, _sampling_box((SIDE, SIDE), PATCH_SIZE))
+    return uv, z, landed.numpy()
+
+
+def _rotation_pair(T: torch.Tensor, *, lift_T: torch.Tensor | None = None,
+                   substitute_T: torch.Tensor | None = None,
+                   tl_T: torch.Tensor | None = None, near_m: float | None = None):
+    """Keyword arguments for rotation_pair_evidence on one analytic 518 px pair.
+
+    T is the pair's recorded relative transform. Each estimator can be built
+    with a different transform, which is how a wrong mapping is injected.
+    near_m puts both depth maps at about that depth.
+    """
+    from lot.context_lift import context_lift_map
+    from lot.render_replica import intrinsics_from_hfov
+
+    K = intrinsics_from_hfov(SIDE, SIDE, 90.0).to(torch.float32)
+    hw = (SIDE, SIDE)
+    ramp = torch.linspace(0.0, 1.0, SIDE)
+    if near_m is None:
+        depth_context = torch.full(hw, 2.5) + ramp[None, :]
+        depth_target = torch.full(hw, 3.0) + 0.5 * ramp[:, None]
+    else:
+        depth_context = torch.full(hw, near_m) + 0.01 * ramp[None, :]
+        depth_target = torch.full(hw, near_m) + 0.01 * ramp[:, None]
+    lift = context_lift_map(depth_context, K, K, T if lift_T is None else lift_T, hw, hw)
+    substituted = context_lift_map(
+        torch.full_like(depth_context, 7.0), K, K,
+        T if substitute_T is None else substitute_T, hw, hw,
+    )
+    uv_target = _target_samples()
+    tl_uv, tl_z, tl_landed = _tl_reads(
+        depth_target, K, T if tl_T is None else tl_T, uv_target
+    )
+    return {
+        "lift": lift, "substituted": substituted,
+        "tl_read_uv_context": tl_uv, "tl_read_depth_context": tl_z,
+        "tl_landed": tl_landed, "uv_target_samples": uv_target,
+        "K_context": K, "K_target": K, "T_target_from_context": T,
+        "context_hw": hw, "tol_px": ROTATION_TOL_PX,
+        "position_bound_m": POSITION_BOUND_M, "where": WHERE,
+    }
+
+
+@pytest.mark.parametrize("degrees", [5.0, 20.0, 45.0, 60.0])
+def test_step_seventeen_passes_a_pure_rotation_on_each_estimators_landed_samples(degrees):
+    from lot.phase5_gate import rotation_pair_evidence
+
+    args = _rotation_pair(_rotation(degrees))
+    evidence = rotation_pair_evidence(**args)
+    assert evidence["pair"] == WHERE
+    assert evidence["checked"] is True
+    assert evidence["translation_norm_m"] == 0.0
+    n_cl = int(args["lift"].landed.sum())
+    n_tl = int(args["tl_landed"].sum())
+    assert evidence["n_context_patches"] == args["lift"].landed.numel()
+    assert evidence["n_tl_samples"] == args["uv_target_samples"].shape[0]
+    assert evidence["context_lift"]["n_compared"] == n_cl > 0
+    assert evidence["depth_substitution"]["n_compared"] == n_cl
+    assert evidence["tl_reference"]["n_compared"] == n_tl > 0
+    for name in COMPARISONS:
+        assert evidence[name]["max_residual_px"] <= ROTATION_TOL_PX
+        assert evidence[name]["max_translation_allowance_px"] == 0.0
+        assert evidence[name]["min_headroom_px"] > 0.0
+
+
+def test_step_seventeen_ignores_unlanded_samples_at_large_rotation():
+    """The unlanded residual exceeds the tolerance at 60 degrees and is not read."""
+    from lot.context_lift import rotation_homography_landing
+    from lot.phase5_gate import rotation_pair_evidence
+
+    args = _rotation_pair(_rotation(60.0))
+    analytic = rotation_homography_landing(
+        args["K_context"], args["K_target"], args["T_target_from_context"],
+        args["context_hw"], dtype=torch.float32,
+    )
+    assert float((args["lift"].uv_target - analytic).abs().max()) > ROTATION_TOL_PX
+    assert 0 < int(args["lift"].landed.sum()) < args["lift"].landed.numel()
+    evidence = rotation_pair_evidence(**args)
+    assert evidence["context_lift"]["max_residual_px"] <= ROTATION_TOL_PX
+
+
+def test_step_seventeen_stops_a_translation_above_the_bound():
+    from lot.phase5_gate import rotation_pair_evidence
+
+    T = _translated(_rotation(20.0), 2.0e-6)
+    with pytest.raises(GateStop) as stop:
+        rotation_pair_evidence(**_rotation_pair(T))
+    assert stop.value.step == "17"
+    assert stop.value.classification == FROZEN_DESIGN_MISMATCH
+    assert WHERE in stop.value.message
+    assert stop.value.evidence["pair"] == WHERE
+    assert stop.value.evidence["translation_norm_m"] == pytest.approx(2.0e-6, rel=1e-6)
+
+
+def test_step_seventeen_stops_a_context_lift_with_the_wrong_rotation():
+    from lot.phase5_gate import rotation_pair_evidence
+
+    T = _rotation(20.0)
+    with pytest.raises(GateStop) as stop:
+        rotation_pair_evidence(**_rotation_pair(T, lift_T=_rotation(-20.0)))
+    assert stop.value.step == "17"
+    assert stop.value.classification == IMPLEMENTATION_BUG
+    assert "Context-Lift" in stop.value.message
+    assert WHERE in stop.value.message
+    assert stop.value.evidence["comparison"] == "context_lift"
+    worst = stop.value.evidence["worst_sample"]
+    assert worst["residual_px"] > worst["limit_px"]
+    assert f"sample {worst['index']}" in stop.value.message
+
+
+def test_step_seventeen_stops_a_tl_reference_with_the_wrong_rotation():
+    from lot.phase5_gate import rotation_pair_evidence
+
+    T = _rotation(20.0)
+    with pytest.raises(GateStop) as stop:
+        rotation_pair_evidence(**_rotation_pair(T, tl_T=_rotation(-20.0)))
+    assert stop.value.step == "17"
+    assert stop.value.classification == IMPLEMENTATION_BUG
+    assert "TL-Reference" in stop.value.message
+    assert WHERE in stop.value.message
+    assert stop.value.evidence["comparison"] == "tl_reference"
+
+
+def test_step_seventeen_stops_a_depth_dependent_landing():
+    from lot.phase5_gate import rotation_pair_evidence
+
+    T = _rotation(20.0)
+    with pytest.raises(GateStop) as stop:
+        rotation_pair_evidence(**_rotation_pair(T, substitute_T=_translated(T, 0.2)))
+    assert stop.value.step == "17"
+    assert stop.value.classification == IMPLEMENTATION_BUG
+    assert "depth" in stop.value.message
+    assert stop.value.evidence["comparison"] == "depth_substitution"
+
+
+def test_a_tiny_translation_within_the_bound_passes_thanks_to_the_allowance():
+    """At 0.12 m, 0.9e-6 m of translation moves a landing by about 2e-3 px.
+
+    That exceeds the bare 1e-3 px tolerance on every comparison, so without
+    the allowance this genuine pure-rotation pair would stop the gate.
+    """
+    from lot.phase5_gate import rotation_pair_evidence
+
+    T = _translated(_rotation(10.0), 0.9e-6)
+    evidence = rotation_pair_evidence(**_rotation_pair(T, near_m=0.12))
+    assert evidence["translation_norm_m"] == pytest.approx(0.9e-6, rel=1e-6)
+    for name in COMPARISONS:
+        assert evidence[name]["n_compared"] > 0
+        assert evidence[name]["max_residual_px"] > ROTATION_TOL_PX, name
+        assert evidence[name]["max_translation_allowance_px"] > 0.0
+        assert evidence[name]["min_headroom_px"] > 0.0
+
+
+def test_the_allowance_is_not_a_blanket_pass():
+    """A hundred times the translation, injected into Context-Lift, still stops."""
+    from lot.phase5_gate import rotation_pair_evidence
+
+    T = _translated(_rotation(10.0), 0.9e-6)
+    with pytest.raises(GateStop) as stop:
+        rotation_pair_evidence(
+            **_rotation_pair(T, lift_T=_translated(T, 0.9e-4), near_m=0.12)
+        )
+    assert stop.value.classification == IMPLEMENTATION_BUG
+    assert stop.value.evidence["comparison"] == "context_lift"
+
+
+def test_a_pair_where_nothing_lands_is_recorded_and_not_checked():
+    from lot.phase5_gate import rotation_pair_evidence
+
+    evidence = rotation_pair_evidence(**_rotation_pair(_rotation(150.0)))
+    assert evidence["checked"] is False
+    for name in COMPARISONS:
+        assert evidence[name]["n_compared"] == 0
+        assert evidence[name]["max_residual_px"] is None
+
+
+def test_a_scene_with_rotation_pairs_but_none_checkable_stops():
+    from lot.phase5_gate import rotation_pair_evidence, rotation_scene_summary
+
+    blind = rotation_pair_evidence(**_rotation_pair(_rotation(150.0)))
+    with pytest.raises(GateStop) as stop:
+        rotation_scene_summary("room_0", [blind], [])
+    assert stop.value.step == "17"
+    assert stop.value.classification == FROZEN_DESIGN_MISMATCH
+    assert "room_0" in stop.value.message
+    with pytest.raises(GateStop) as stop:
+        rotation_scene_summary("room_0", [], [WHERE])
+    assert stop.value.classification == FROZEN_DESIGN_MISMATCH
+
+
+def test_a_scene_without_rotation_pairs_is_recorded_not_stopped():
+    from lot.phase5_gate import rotation_scene_summary
+
+    summary = rotation_scene_summary("room_0", [], [])
+    assert summary["n_rotation_pairs"] == 0
+    assert summary["n_pairs_checked"] == 0
+
+
+def test_the_regime_summary_stops_on_zero_rotation_pairs_overall():
+    from lot.phase5_gate import rotation_regime_summary, rotation_scene_summary
+
+    empty = rotation_scene_summary("room_0", [], [])
+    with pytest.raises(GateStop) as stop:
+        rotation_regime_summary({"room_0": empty, "room_1": empty},
+                                ROTATION_TOL_PX, POSITION_BOUND_M)
+    assert stop.value.step == "17"
+    assert stop.value.classification == FROZEN_DESIGN_MISMATCH
+    with pytest.raises(GateStop):
+        rotation_regime_summary({}, ROTATION_TOL_PX, POSITION_BOUND_M)
+
+
+def test_the_regime_summary_names_the_worst_pair_and_the_largest_translation():
+    from lot.phase5_gate import (
+        rotation_pair_evidence,
+        rotation_regime_summary,
+        rotation_scene_summary,
+    )
+
+    def pair(degrees, where, x_m=0.0, near_m=None):
+        args = _rotation_pair(_translated(_rotation(degrees), x_m), near_m=near_m)
+        args["where"] = where
+        return rotation_pair_evidence(**args)
+
+    quiet = pair(5.0, "room_0 a -> b level image")
+    loud = pair(10.0, "room_1 c -> d level image", x_m=0.9e-6, near_m=0.12)
+    blind = pair(150.0, "room_1 e -> f level image")
+    per_scene = {
+        "room_0": rotation_scene_summary("room_0", [quiet], []),
+        "room_1": rotation_scene_summary("room_1", [loud, blind], []),
+        "room_2": rotation_scene_summary("room_2", [], []),
+    }
+    assert per_scene["room_1"]["n_rotation_pairs"] == 2
+    assert per_scene["room_1"]["n_pairs_checked"] == 1
+    assert per_scene["room_1"]["n_pairs_nothing_landed"] == 1
+    summary = rotation_regime_summary(per_scene, ROTATION_TOL_PX, POSITION_BOUND_M)
+    assert summary["n_rotation_pairs"] == 3
+    assert summary["n_pairs_checked"] == 2
+    assert summary["max_translation_norm_m"] == pytest.approx(0.9e-6, rel=1e-6)
+    assert summary["max_translation_pair"] == "room_1 c -> d level image"
+    for name in COMPARISONS:
+        worst = summary["worst"][name]
+        assert worst["pair"] == "room_1 c -> d level image"
+        assert worst["max_residual_px"] == loud[name]["max_residual_px"]
+        assert worst["min_headroom_px"] > 0.0
+        assert summary["scenes"]["room_0"]["worst"][name]["pair"] == "room_0 a -> b level image"
+    assert summary["tolerance_px"] == ROTATION_TOL_PX
+    assert summary["rotation_position_bound_m"] == POSITION_BOUND_M
+    json.dumps(summary)
+
+
+def _gate_step_ids() -> list[str]:
+    import ast
+    import inspect
+    import textwrap
+
+    from lot import phase5_gate
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(phase5_gate.run_integration_gate)))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "run_steps"
+    ]
+    assert len(calls) == 1
+    return [entry.elts[0].value for entry in calls[0].args[0].elts]
+
+
+def test_step_seventeen_runs_before_the_pin_and_step_sixteen_stays_last():
+    """Step 15 writes pin_cluster.json, moving any earlier pin aside. Running
+    step 17 first means the pin is written only after every substantive check
+    has passed, so a gate that stops at step 17 leaves the earlier pin in
+    place. Step 16, the verdict, stays last."""
+    assert _gate_step_ids() == [str(i) for i in range(1, 15)] + ["17", "15", "16"]
+
+
+def test_step_seventeen_runs_the_tested_functions():
+    """The closure must drive what these tests drive, over every scene."""
+    import inspect
+
+    from lot import phase5_gate
+
+    source = inspect.getsource(phase5_gate.run_integration_gate)
+    step17 = source[source.index("def step17"):source.index("return run_steps(")]
+    assert "for scene in REPLICA_SCENES" in step17
+    assert "build_scene_inputs(" in step17
+    assert ".close()" in step17
+    assert "rotation_scene_evidence(" in step17
+    assert "rotation_regime_summary(" in step17
+    assert '("17", "pure-rotation gate across the regime", step17)' in source
+
+    scene = inspect.getsource(phase5_gate.rotation_scene_evidence)
+    assert "phase5_scene_pairs(" in scene
+    assert 'regime == "rotation"' in scene
+    assert "cfg.primary_alignment_level" in scene
+    assert "recompute_reference_arms(" in scene
+    assert "rotation_pair_evidence(" in scene
+    assert "rotation_scene_summary(" in scene
+
+    pair = inspect.getsource(phase5_gate.rotation_pair_evidence)
+    assert "rotation_homography_landing(" in pair

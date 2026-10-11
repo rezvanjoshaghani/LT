@@ -355,6 +355,14 @@ class FormulationScores:
 
     The common cells and the per-cell sample counts travel with the record so
     the support an aggregate rests on can be reconstructed.
+
+    The two floors sit beside the two arms, as CLAUDE.md requires of every
+    metric. reporting_rules.md section 6 adds them on this support. No-Warp-Copy
+    is the context map read at the cell's Phase 3 sample coordinate, the read
+    PROTOCOL 3.6 defines and Phase 4's per-point path makes. Mean-Feature is
+    the frozen mean vector. Both are scored against the same cell target as
+    the two arms, one weight per cell. Mean-Feature carries its two raw columns
+    only. Both are levels, not margins.
     """
 
     n_formulation: int
@@ -366,6 +374,12 @@ class FormulationScores:
     cl_form_centered: float
     cl_form_l2_raw: float
     cl_form_l2_centered: float
+    nowarp_form_raw: float
+    nowarp_form_centered: float
+    nowarp_form_l2_raw: float
+    nowarp_form_l2_centered: float
+    meanfeat_form_raw: float
+    meanfeat_form_l2_raw: float
     common_cells: np.ndarray
     samples_per_cell: np.ndarray
 
@@ -409,23 +423,45 @@ def score_formulation(
     per_point_cells: np.ndarray,
     tl_reads: Tensor,
     reads_target: Tensor,
+    sample_uv_target: Tensor,
     target_hw: tuple[int, int],
     patch_size: int = PATCH_SIZE,
 ) -> FormulationScores:
-    """Score both explicit formulations on the common cells, one weight each.
+    """Score both explicit formulations and both floors on the common cells, one weight each.
 
     pp_scored, per_point_cells, tl_reads, reads_target: Phase 4's per-point
         quantities at the reference level, from lot.phase5_reference, which
         reconciles them against the accepted Phase 4 rows before they get here.
         tl_reads[k] and reads_target[k] are TL-Reference's prediction and the
         target for the Phase 3 sample at cell per_point_cells[k].
+    sample_uv_target: [N_pp, 2] that sample's pixel coordinates in the target
+        image, OpenCV convention, row k for cell per_point_cells[k]. The caller
+        passes the Phase 3 samples' uv_target from lot.evaluate.PairGeometry.
+        No-Warp-Copy reads the context map there, the same image coordinate,
+        without transport.
+
+    The coordinates must lie in the cells per_point_cells names, or a floor
+    would be read for one cell at another cell's location. A mismatch raises
+    whenever a floor is read. It is checked after the one-sample-per-cell rule,
+    so a duplicated cell is reported as that.
     """
+    cells_of_samples = np.asarray(per_point_cells, dtype=np.int64)
+    if sample_uv_target.dim() != 2 or tuple(sample_uv_target.shape) != (
+        cells_of_samples.size, 2
+    ):
+        raise ValueError(
+            f"sample_uv_target {tuple(sample_uv_target.shape)} must hold one coordinate "
+            f"per Phase 3 sample, [{cells_of_samples.size}, 2]"
+        )
+
     common, cl_mask = formulation_cells(lift, primary, pp_scored, target_hw, patch_size)
     if common.size == 0:
         return FormulationScores(
             n_formulation=0,
             **_prefixed(_EMPTY_METRICS, "tl_form"),
             **_prefixed(_EMPTY_METRICS, "cl_form"),
+            **_prefixed(_EMPTY_METRICS, "nowarp_form"),
+            **_raw_prefixed(_EMPTY_METRICS, "meanfeat_form"),
             common_cells=common,
             samples_per_cell=np.zeros(0, dtype=np.int64),
         )
@@ -433,13 +469,20 @@ def score_formulation(
     # One Phase 3 sample per cell: the lookup is a bijection on its domain, and a
     # duplicate would mean the universe is not what this diagnostic assumes.
     sample_of_cell: dict[int, int] = {}
-    for k, cell in enumerate(np.asarray(per_point_cells, dtype=np.int64)):
+    for k, cell in enumerate(cells_of_samples):
         if int(cell) in sample_of_cell:
             raise ValueError(
                 f"cell {int(cell)} holds more than one Phase 3 per-point sample; "
                 "the formulation diagnostic assumes one sample per cell"
             )
         sample_of_cell[int(cell)] = k
+    located = patch_cell_index(sample_uv_target, target_hw, patch_size)
+    if not np.array_equal(located, cells_of_samples):
+        k = int(np.flatnonzero(located != cells_of_samples)[0])
+        raise ValueError(
+            f"Phase 3 sample {k} does not lie in cell {int(cells_of_samples[k])}; "
+            f"its coordinate is in cell {int(located[k])}"
+        )
     index = torch.as_tensor([sample_of_cell[int(c)] for c in common], dtype=torch.long)
     target_cells = reads_target[index]
     tl_cells = tl_reads[index]
@@ -449,10 +492,19 @@ def score_formulation(
     cl_samples = sample_features_bilinear(features_context, lift.uv_context[chosen], patch_size)
     cl_cells, samples_per_cell = pool_per_point_to_cells(cl_samples, landed, common)
 
+    # No-Warp-Copy: the context map at the cell's Phase 3 sample coordinate. One
+    # read per cell, however many Context-Lift samples landed in it.
+    nowarp_cells = sample_features_bilinear(
+        features_context, sample_uv_target[index.to(sample_uv_target.device)], patch_size
+    )
+
     return FormulationScores(
         n_formulation=int(common.size),
         **_prefixed(score_all_metrics(tl_cells, target_cells, center), "tl_form"),
         **_prefixed(score_all_metrics(cl_cells, target_cells, center), "cl_form"),
+        **_prefixed(score_all_metrics(nowarp_cells, target_cells, center), "nowarp_form"),
+        # Mean-Feature reads no location. It meets the same cell targets.
+        **_mean_feature(target_cells, center, "meanfeat_form"),
         common_cells=common,
         samples_per_cell=samples_per_cell,
     )

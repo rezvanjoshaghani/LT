@@ -10,12 +10,14 @@ import torch
 
 from lot.context_lift import ContextLiftMap, context_lift_map, context_lift_support
 from lot.encoders import PATCH_SIZE, patch_cell_index, sample_features_bilinear
+from lot.phase5_estimands import FORMULATION_FIELDS
 from lot.phase5_score import (
     MODEL_FAILURE_COSINE,
     formulation_support,
     primary_support,
     region_masks,
     score_cross_path,
+    score_formulation,
     score_predictions,
     score_primary,
     score_splat_pool,
@@ -512,6 +514,174 @@ def test_each_record_writes_exactly_the_columns_the_estimand_layer_reads():
             set(INTERSECTION_FIELDS) | {"n_intersect"},
         ),
     }
+    form = _formulation_scene()
+    records["formulation"] = (
+        score_formulation(**form).as_fields(),
+        set(FORMULATION_FIELDS) | {"n_formulation"},
+    )
     for name, (fields, registered) in records.items():
         assert set(fields) == registered, name
         assert not [k for k in fields if "meanfeat" in k and "centered" in k], name
+
+
+# ---------------------------------------------------------------------------
+# The two floors on the formulation support V_form, reporting_rules.md section 6
+# ---------------------------------------------------------------------------
+#
+# A hand-built pair on the 2 by 2 grid. Context-Lift lands two samples in cell
+# 0, one in cell 2, and one in cell 3. TL-Reference scored cells 0, 1, and 2.
+# The common cells are therefore 0 and 2.
+#
+# Phase 3 put one sample in each cell. Its arrays list the cells in the order
+# 2, 0, 1, 3, so a lookup by row number reads the wrong cell. Cell 0's sample
+# sits a quarter patch right of the cell center.
+#
+# The context map holds (4/3) E0 + M in cell 0, M in cell 1, and sqrt(3) E1 + M
+# in cell 2. No-Warp-Copy at cell 0's sample coordinate is therefore
+# 0.75 ((4/3) E0 + M) + 0.25 M = E0 + M. At the cell center, or at either
+# Context-Lift landing in cell 0, it would read (4/3) E0 + M instead.
+#
+# The cell targets are E0 + M in cell 0 and sqrt(3) E2 + M in cell 2.
+#
+#   cell 0: No-Warp-Copy E0 + M against E0 + M. Raw cosine 1, raw L2 0,
+#           centered E0 against E0, cosine 1, L2 0. Mean-Feature M against
+#           E0 + M, cosine 1/sqrt(2), L2 sqrt(2 - sqrt(2)).
+#   cell 2: No-Warp-Copy sqrt(3) E1 + M against sqrt(3) E2 + M. Both have norm
+#           2 and dot product 1, so raw cosine 1/4 and raw L2 sqrt(3/2).
+#           Centered sqrt(3) E1 against sqrt(3) E2, cosine 0, L2 sqrt(2).
+#           Mean-Feature M against sqrt(3) E2 + M, cosine 1/2, L2 1.
+#
+# Each cell carries one weight, although cell 0 received two landings.
+
+E2 = torch.tensor([0.0, 0.0, 1.0, 0.0], dtype=torch.float64)
+SQRT3 = math.sqrt(3.0)
+FORM_TARGET_CELL0 = E0 + MEAN
+FORM_TARGET_CELL2 = SQRT3 * E2 + MEAN
+FORM_FLOORS = {
+    "nowarp_form_raw": (1.0 + 0.25) / 2,
+    "nowarp_form_l2_raw": (0.0 + math.sqrt(1.5)) / 2,
+    "nowarp_form_centered": (1.0 + 0.0) / 2,
+    "nowarp_form_l2_centered": (0.0 + SQRT2) / 2,
+    "meanfeat_form_raw": (1.0 / SQRT2 + 0.5) / 2,
+    "meanfeat_form_l2_raw": (math.sqrt(2.0 - SQRT2) + 1.0) / 2,
+}
+# Pre-existing columns of the formulation record, before the floors existed.
+FORM_BASE_COLUMNS = (
+    "n_formulation",
+    "tl_form_raw", "tl_form_centered", "tl_form_l2_raw", "tl_form_l2_centered",
+    "cl_form_raw", "cl_form_centered", "cl_form_l2_raw", "cl_form_l2_centered",
+)
+
+
+def _formulation_scene() -> dict:
+    """score_formulation's arguments for the hand-built pair described above."""
+    fc = torch.zeros(4, 2, 2, dtype=torch.float64)
+    fc[:, 0, 0] = (4.0 / 3.0) * E0 + MEAN
+    fc[:, 0, 1] = MEAN
+    fc[:, 1, 0] = SQRT3 * E1 + MEAN
+    fc[:, 1, 1] = E2
+    lift = ContextLiftMap(
+        uv_context=torch.tensor(
+            [_pixel(0, 0), _pixel(1, 0), _pixel(0, 1), _pixel(1, 1)], dtype=torch.float64
+        ),
+        # Two landings in cell 0, neither at the Phase 3 sample coordinate.
+        uv_target=torch.tensor(
+            [_pixel(0, 0), _pixel(-0.25, 0.25), _pixel(0, 1), _pixel(1, 1)],
+            dtype=torch.float64,
+        ),
+        z_target=torch.ones(4, dtype=torch.float64),
+        depth_context=torch.ones(4, dtype=torch.float64),
+        depth_valid=torch.ones(4, dtype=torch.bool),
+        landed=torch.ones(4, dtype=torch.bool),
+    )
+    # Phase 3's rows, listing cells 2, 0, 1, 3.
+    reads_target = torch.stack((FORM_TARGET_CELL2, FORM_TARGET_CELL0, E1, -MEAN))
+    return {
+        "lift": lift,
+        "primary": torch.ones(4, dtype=torch.bool),
+        "features_context": fc,
+        "center": MEAN,
+        "pp_scored": np.array([True, True, True, False]),
+        "per_point_cells": np.array([2, 0, 1, 3], dtype=np.int64),
+        # TL-Reference predicts each cell's target exactly.
+        "tl_reads": reads_target.clone(),
+        "reads_target": reads_target,
+        "sample_uv_target": torch.tensor(
+            [_pixel(0, 1), _pixel(0.25, 0), _pixel(1, 0), _pixel(1, 1)],
+            dtype=torch.float64,
+        ),
+        "target_hw": FLOOR_HW,
+    }
+
+
+def test_the_formulation_floors_on_the_common_cells():
+    scores = score_formulation(**_formulation_scene())
+    assert scores.n_formulation == 2
+    assert np.array_equal(scores.common_cells, [0, 2])
+    assert np.array_equal(scores.samples_per_cell, [2, 1])
+    for name, expected in FORM_FLOORS.items():
+        assert getattr(scores, name) == pytest.approx(expected, abs=1e-6), name
+    # The floors meet the targets TL-Reference meets, which it predicts exactly.
+    assert scores.tl_form_raw == pytest.approx(1.0, abs=1e-6)
+    assert scores.tl_form_centered == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_formulation_no_warp_floor_reads_the_phase3_sample_coordinate():
+    """Moving cell 0's sample to the cell center moves only the No-Warp-Copy columns.
+
+    At the center the context map holds (4/3) E0 + M, whose raw cosine with
+    E0 + M is 7 / (5 sqrt(2)). Its centered direction is still E0. Every
+    pre-existing column, and Mean-Feature, which reads no location, stay
+    bitwise identical, so the new argument cannot reach them.
+    """
+    args = _formulation_scene()
+    shifted = dict(args)
+    shifted["sample_uv_target"] = args["sample_uv_target"].clone()
+    shifted["sample_uv_target"][1] = torch.tensor(_pixel(0, 0), dtype=torch.float64)
+    at_sample = score_formulation(**args)
+    at_center = score_formulation(**shifted)
+    assert at_center.nowarp_form_raw == pytest.approx(
+        (7.0 / (5.0 * SQRT2) + 0.25) / 2, abs=1e-6
+    )
+    assert at_center.nowarp_form_raw != pytest.approx(at_sample.nowarp_form_raw, abs=1e-3)
+    assert at_center.nowarp_form_centered == pytest.approx(0.5, abs=1e-6)
+    for name in FORM_BASE_COLUMNS + ("meanfeat_form_raw", "meanfeat_form_l2_raw"):
+        assert getattr(at_center, name) == getattr(at_sample, name), name
+
+
+def test_the_formulation_floors_weigh_each_common_cell_once():
+    """A third landing in cell 0 changes the Context-Lift pool, not the floors."""
+    args = _formulation_scene()
+    lift = args["lift"]
+    crowded = ContextLiftMap(
+        uv_context=torch.cat((lift.uv_context, lift.uv_context[:1])),
+        uv_target=torch.cat((lift.uv_target, lift.uv_target[:1])),
+        z_target=torch.ones(5, dtype=torch.float64),
+        depth_context=torch.ones(5, dtype=torch.float64),
+        depth_valid=torch.ones(5, dtype=torch.bool),
+        landed=torch.ones(5, dtype=torch.bool),
+    )
+    scores = score_formulation(
+        **{**args, "lift": crowded, "primary": torch.ones(5, dtype=torch.bool)}
+    )
+    assert np.array_equal(scores.samples_per_cell, [3, 1])
+    for name, expected in FORM_FLOORS.items():
+        assert getattr(scores, name) == pytest.approx(expected, abs=1e-6), name
+
+
+def test_an_empty_formulation_support_gives_no_floor_score():
+    args = _formulation_scene()
+    scores = score_formulation(**{**args, "pp_scored": np.zeros(4, dtype=bool)})
+    assert scores.n_formulation == 0
+    for name in FORMULATION_FIELDS:
+        assert math.isnan(getattr(scores, name)), name
+
+
+def test_a_phase3_coordinate_outside_its_cell_is_refused():
+    """The coordinate is read for the cell per_point_cells names, so the two must agree."""
+    args = _formulation_scene()
+    swapped = args["sample_uv_target"][[1, 0, 2, 3]]
+    with pytest.raises(ValueError, match="does not lie in"):
+        score_formulation(**{**args, "sample_uv_target": swapped})
+    with pytest.raises(ValueError, match="one coordinate per Phase 3 sample"):
+        score_formulation(**{**args, "sample_uv_target": args["sample_uv_target"][:3]})

@@ -162,6 +162,10 @@ class ReferenceArms:
     transported_est: Tensor           # [C, cells] splat est arm
     flat_context: Tensor              # [C, cells] float32
     flat_target: Tensor               # [C, cells] float32
+    # Where TL-Reference reads, for gate step 17. These are the tensors the
+    # transcription already computes, exposed as they are; no value changes.
+    tl_read_uv_context: Tensor        # [N_pp, 2] context pixels where tl_reads samples
+    tl_read_depth_context: Tensor     # [N_pp] warped point's planar depth, context camera
 
 
 def recompute_reference_arms(
@@ -246,6 +250,8 @@ def recompute_reference_arms(
         ),
         flat_context=features_context.to(torch.float32).reshape(channels, -1),
         flat_target=features_target.to(torch.float32).reshape(channels, -1),
+        tl_read_uv_context=uv_warp_est,
+        tl_read_depth_context=z_est,
     )
 
 

@@ -1,16 +1,23 @@
-"""The sixteen-step Phase 5 Borah integration gate, assembled and driven.
+"""The seventeen-step Phase 5 Borah integration gate, assembled and driven.
 
 Separated from lot.phase5_check, which holds the reusable checks, so the order
 of the gate reads as one list in one place. Nothing here trains. Step 12 runs a
 single forward pass, the frozen loss, and a single backward pass on a real batch
 to prove the pipeline is finite end to end, then discards the gradients; step 16
 asserts no checkpoint appeared.
+
+Step ids are stable, so the order of the list is not numeric. Step 17, the
+pure-rotation gate across the whole regime, was added after the gate first
+passed. It runs after step 14 and before step 15. The pin is written only
+after every substantive check has passed, so a gate that stops at step 17
+leaves the earlier pin in place. The verdict step stays last.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +165,8 @@ def formulation_support_evidence(
     try:
         scores = score_formulation(
             lift, support, features_context, center, arms.pp_scored,
-            arms.geometry.per_point_cells, arms.tl_reads, arms.reads_target, target_hw,
+            arms.geometry.per_point_cells, arms.tl_reads, arms.reads_target,
+            arms.geometry.samples.uv_target, target_hw,
         )
     except ValueError as error:
         raise GateStop(
@@ -192,6 +200,457 @@ def formulation_support_evidence(
             "every supported sample maps to a cell inside the grid."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Step 17: the pure-rotation gate across the whole rotation regime
+# ---------------------------------------------------------------------------
+#
+# reporting_rules.md section 7, first bullet, which carries specification
+# step 6 from step 10's single probe pair to every rotation pair of every
+# scene, with TL-Reference added. "Common-valid" is read as the rules read it:
+# each estimator is compared with the homography on its own landed samples.
+# The two estimators index different samples, so they agree with each other
+# exactly when both agree with the homography.
+
+# The constant depth that replaces the aligned map. Any positive value serves.
+# Step 10 substitutes the same value.
+ROTATION_SUBSTITUTE_DEPTH_M = 7.0
+ROTATION_COMPARISONS = ("context_lift", "depth_substitution", "tl_reference")
+ROTATION_READING = (
+    "each estimator is compared with the analytic rotational homography on its "
+    "own landed samples; per-sample limit is the frozen coordinate tolerance "
+    "plus focal length times the pair's translation over the sample's depth in "
+    "the receiving camera"
+)
+
+
+def rotation_translation_norm(
+    T_target_from_context: torch.Tensor, position_bound_m: float, where: str
+) -> float:
+    """The pair's recorded camera translation in meters, or a stop above the bound.
+
+    The frozen rotation-position bound allows a rotation pair this much
+    translation. A pair above it is not a pure rotation under the frozen
+    design, so the stop is a design mismatch, not a bug. A NaN norm stops too.
+    """
+    from .geometry import baseline_m
+
+    norm = float(baseline_m(T_target_from_context.to(torch.float64)))
+    if not norm <= position_bound_m:
+        raise GateStop(
+            "17", f"{where}: the recorded camera translation {norm:.3e} m exceeds "
+            f"the frozen rotation-position bound {position_bound_m:g} m, so the "
+            "pair is not a pure rotation under the frozen design",
+            FROZEN_DESIGN_MISMATCH,
+            {"pair": where, "translation_norm_m": norm,
+             "rotation_position_bound_m": position_bound_m},
+        )
+    return norm
+
+
+def _focal_px(K: torch.Tensor) -> float:
+    """The receiving camera's focal length in pixels.
+
+    The larger of the two, so the allowance never shrinks on a camera whose
+    focal lengths differ. Replica renders have square pixels.
+    """
+    return float(torch.maximum(K[0, 0], K[1, 1]))
+
+
+def _translation_allowance_px(
+    K_receiving: torch.Tensor, translation_m: float, depth_receiving: torch.Tensor
+) -> torch.Tensor:
+    """Per sample, focal length times translation over depth in the receiving camera.
+
+    This is the first-order displacement a translation adds to a landing on
+    the optical axis. Off the axis the exact shift can exceed it, by up to the
+    secant of the ray's angle, so by up to 1.41 at the edge of a 90 degree
+    frame. The frozen tolerance absorbs that excess while the allowance stays
+    below about 2.4e-3 px. At the frozen position bound on a 518 px frame, that
+    holds for depths above about 0.11 m. A nearer landed sample on a pair at
+    the bound could exceed its limit. That stop is reported, not widened.
+    """
+    depth = depth_receiving.detach().to(torch.float64).cpu()
+    return _focal_px(K_receiving) * translation_m / depth
+
+
+def _rotation_comparison(
+    name: str,
+    label: str,
+    estimate: torch.Tensor,
+    reference: torch.Tensor,
+    allowance: torch.Tensor,
+    compared: torch.Tensor,
+    tol_px: float,
+    translation_norm_m: float,
+    where: str,
+) -> dict[str, Any]:
+    """One estimator against its homography reference, on its compared samples.
+
+    estimate, reference: [N, 2] pixel coordinates in the receiving image.
+    allowance: [N] translation allowance in pixels, beyond tol_px.
+    compared: [N] bool, the estimator's own landed samples.
+    The residual of a sample is its larger coordinate difference. Any residual
+    above its limit stops with the worst sample, ranked by how far it is over.
+    A NaN residual or limit never satisfies the bound and ranks worst.
+    """
+    index = torch.nonzero(compared.detach().cpu(), as_tuple=False).reshape(-1)
+    if index.numel() == 0:
+        return {"n_compared": 0, "max_residual_px": None,
+                "max_translation_allowance_px": None, "min_headroom_px": None}
+    est = estimate.detach().cpu().to(torch.float64)[index]
+    ref = reference.detach().cpu().to(torch.float64)[index]
+    residual = (est - ref).abs().amax(dim=-1)
+    extra = allowance[index]
+    limit = tol_px + extra
+    headroom = limit - residual
+    ranked = torch.nan_to_num(headroom, nan=-math.inf)
+    worst = int(torch.argmin(ranked))
+    within = residual <= limit
+    if not bool(within.all()):
+        sample = int(index[worst])
+        raise GateStop(
+            "17", f"{where}: {label}, beyond its allowance; worst sample {sample}: "
+            f"residual {float(residual[worst]):.3e} px, limit "
+            f"{float(limit[worst]):.3e} px",
+            IMPLEMENTATION_BUG,
+            {
+                "pair": where,
+                "comparison": name,
+                "translation_norm_m": translation_norm_m,
+                "tolerance_px": tol_px,
+                "n_compared": int(index.numel()),
+                "n_over_limit": int((~within).sum()),
+                "worst_sample": {
+                    "index": sample,
+                    "residual_px": float(residual[worst]),
+                    "limit_px": float(limit[worst]),
+                    "translation_allowance_px": float(extra[worst]),
+                    "estimate_uv": [float(v) for v in est[worst]],
+                    "reference_uv": [float(v) for v in ref[worst]],
+                },
+            },
+        )
+    return {
+        "n_compared": int(index.numel()),
+        "max_residual_px": float(residual.max()),
+        "max_translation_allowance_px": float(extra.max()),
+        "min_headroom_px": float(headroom.min()),
+    }
+
+
+def rotation_pair_evidence(
+    lift: Any,
+    substituted: Any,
+    tl_read_uv_context: torch.Tensor,
+    tl_read_depth_context: torch.Tensor,
+    tl_landed: Any,
+    uv_target_samples: torch.Tensor,
+    K_context: torch.Tensor,
+    K_target: torch.Tensor,
+    T_target_from_context: torch.Tensor,
+    context_hw: tuple[int, int],
+    tol_px: float,
+    position_bound_m: float,
+    where: str,
+) -> dict[str, Any]:
+    """Step 17 on one rotation pair: three comparisons, each on its own landed samples.
+
+    lift: Context-Lift from the aligned context depth. substituted: Context-Lift
+    with that depth map replaced by a constant. Both carry target pixel
+    landings for every context patch center.
+    tl_read_uv_context, tl_read_depth_context, tl_landed: where TL-Reference
+    reads in the context image, the warped point's depth in the context camera,
+    and its landed flag, per Phase 3 target sample.
+    uv_target_samples: the Phase 3 target sample coordinates, target pixels.
+    K_context, K_target, T_target_from_context: the pair's cameras, OpenCV.
+
+    The comparisons, in order:
+    Context-Lift landings against rotation_homography_landing, on its landed
+    samples, receiving camera target;
+    Context-Lift landings against the substituted ones, on the same samples,
+    with the allowance for both depths summed;
+    TL-Reference read locations against the inverse homography applied to the
+    Phase 3 target samples, on its landed samples, receiving camera context.
+
+    The references are computed in float64 from the same cameras, so a residual
+    measures the estimator alone. The translation bound is checked first.
+    Returns counts and worst residuals. A pair where an estimator landed
+    nothing records zero compared samples for it, and is checked only when
+    both estimators compared at least one sample.
+    """
+    from .context_lift import rotation_homography_landing
+    from .geometry import apply_homography, rotation_homography
+
+    translation = rotation_translation_norm(T_target_from_context, position_bound_m, where)
+
+    cl_landed = torch.as_tensor(lift.landed).detach().cpu().to(torch.bool)
+    tl_mask = torch.as_tensor(np.asarray(tl_landed, dtype=bool))
+    n_tl = int(tl_mask.numel())
+    shapes_agree = (
+        tuple(substituted.uv_target.shape) == tuple(lift.uv_target.shape)
+        and tuple(tl_read_uv_context.shape) == (n_tl, 2)
+        and tuple(tl_read_depth_context.shape) == (n_tl,)
+        and tuple(uv_target_samples.shape) == (n_tl, 2)
+    )
+    if not shapes_agree:
+        raise GateStop(
+            "17", f"{where}: the rotation check's inputs disagree on sample count",
+            IMPLEMENTATION_BUG,
+            {"pair": where, "lift": list(lift.uv_target.shape),
+             "substituted": list(substituted.uv_target.shape),
+             "tl_read_uv_context": list(tl_read_uv_context.shape),
+             "tl_read_depth_context": list(tl_read_depth_context.shape),
+             "tl_landed": n_tl, "uv_target_samples": list(uv_target_samples.shape)},
+        )
+
+    T64 = T_target_from_context.detach().cpu().to(torch.float64)
+    K_c64 = K_context.detach().cpu().to(torch.float64)
+    K_t64 = K_target.detach().cpu().to(torch.float64)
+    analytic = rotation_homography_landing(
+        K_c64, K_t64, T64, context_hw, dtype=torch.float64
+    )
+    if tuple(analytic.shape) != tuple(lift.uv_target.shape):
+        raise GateStop(
+            "17", f"{where}: the homography's context grid does not match "
+            "Context-Lift's", IMPLEMENTATION_BUG,
+            {"pair": where, "homography": list(analytic.shape),
+             "lift": list(lift.uv_target.shape)},
+        )
+    # Target pixels to context pixels: the homography of the inverse rotation.
+    backward = rotation_homography(K_t64, K_c64, T64[:3, :3].T)
+    tl_analytic = apply_homography(
+        backward, uv_target_samples.detach().cpu().to(torch.float64)
+    )
+
+    cl_allowance = _translation_allowance_px(K_target, translation, lift.z_target)
+    substitution_allowance = cl_allowance + _translation_allowance_px(
+        K_target, translation, substituted.z_target
+    )
+    tl_allowance = _translation_allowance_px(
+        K_context, translation, tl_read_depth_context
+    )
+
+    evidence: dict[str, Any] = {
+        "pair": where,
+        "translation_norm_m": translation,
+        "n_context_patches": int(cl_landed.numel()),
+        "n_tl_samples": n_tl,
+    }
+    evidence["context_lift"] = _rotation_comparison(
+        "context_lift",
+        "Context-Lift disagrees with the analytic rotational homography",
+        lift.uv_target, analytic, cl_allowance, cl_landed,
+        tol_px, translation, where,
+    )
+    evidence["depth_substitution"] = _rotation_comparison(
+        "depth_substitution",
+        "a Context-Lift landing moved when the depth map was replaced, so the "
+        "mapping is not depth free",
+        lift.uv_target, substituted.uv_target, substitution_allowance, cl_landed,
+        tol_px, translation, where,
+    )
+    evidence["tl_reference"] = _rotation_comparison(
+        "tl_reference",
+        "a TL-Reference read location disagrees with the inverse rotational "
+        "homography at its Phase 3 target sample",
+        tl_read_uv_context, tl_analytic, tl_allowance, tl_mask,
+        tol_px, translation, where,
+    )
+    evidence["checked"] = (
+        evidence["context_lift"]["n_compared"] > 0
+        and evidence["tl_reference"]["n_compared"] > 0
+    )
+    return evidence
+
+
+def _worst_entry(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge worst-residual entries: the largest residual, the smallest headroom."""
+    measured = [e for e in entries if e["max_residual_px"] is not None]
+    if not measured:
+        return {"pair": None, "max_residual_px": None,
+                "min_headroom_px": None, "min_headroom_pair": None}
+    loudest = max(measured, key=lambda e: e["max_residual_px"])
+    tightest = min(measured, key=lambda e: e["min_headroom_px"])
+    return {
+        "pair": loudest["pair"],
+        "max_residual_px": loudest["max_residual_px"],
+        "min_headroom_px": tightest["min_headroom_px"],
+        "min_headroom_pair": tightest["min_headroom_pair"],
+    }
+
+
+def _largest_translation(entries: list[tuple[float | None, str | None]]) -> tuple[Any, Any]:
+    measured = [e for e in entries if e[0] is not None]
+    if not measured:
+        return None, None
+    return max(measured, key=lambda e: e[0])
+
+
+def rotation_scene_summary(
+    scene: str, pairs: list[dict[str, Any]], no_arm: list[str]
+) -> dict[str, Any]:
+    """Step 17's account of one scene. Every rotation pair is counted once.
+
+    pairs: rotation_pair_evidence for each rotation pair with an arm at the
+    primary level. no_arm: the named pairs without one.
+    A scene with rotation pairs of which none could be checked stops, because
+    the regime-wide check would then say nothing about that scene.
+    """
+    def lands(evidence: dict[str, Any], name: str) -> bool:
+        return evidence[name]["n_compared"] > 0
+
+    n_rotation = len(pairs) + len(no_arm)
+    counts = {
+        "n_rotation_pairs": n_rotation,
+        "n_pairs_checked": sum(1 for e in pairs if e["checked"]),
+        "n_pairs_context_lift_only": sum(
+            1 for e in pairs if lands(e, "context_lift") and not lands(e, "tl_reference")
+        ),
+        "n_pairs_tl_reference_only": sum(
+            1 for e in pairs if lands(e, "tl_reference") and not lands(e, "context_lift")
+        ),
+        "n_pairs_nothing_landed": sum(
+            1 for e in pairs
+            if not lands(e, "context_lift") and not lands(e, "tl_reference")
+        ),
+        "n_pairs_no_arm": len(no_arm),
+    }
+    if n_rotation and counts["n_pairs_checked"] == 0:
+        raise GateStop(
+            "17", f"{scene} has {n_rotation} rotation pairs and none could be "
+            "checked: no pair had landed samples for both Context-Lift and "
+            "TL-Reference at the primary level",
+            FROZEN_DESIGN_MISMATCH,
+            {"scene": scene, **counts, "no_arm_pairs": list(no_arm)},
+        )
+    worst = {
+        name: _worst_entry([
+            {"pair": e["pair"],
+             "max_residual_px": e[name]["max_residual_px"],
+             "min_headroom_px": e[name]["min_headroom_px"],
+             "min_headroom_pair": e["pair"]}
+            for e in pairs
+        ])
+        for name in ROTATION_COMPARISONS
+    }
+    norm, at = _largest_translation([(e["translation_norm_m"], e["pair"]) for e in pairs])
+    return {
+        **counts,
+        "worst": worst,
+        "max_translation_norm_m": norm,
+        "max_translation_pair": at,
+        "no_arm_pairs": list(no_arm),
+    }
+
+
+def rotation_regime_summary(
+    per_scene: dict[str, dict[str, Any]], tol_px: float, position_bound_m: float
+) -> dict[str, Any]:
+    """Step 17's verdict over every scene: the overall worst and the largest translation.
+
+    A regime with no rotation pair at all stops, because the check the
+    specification asks for would then have run on nothing.
+    """
+    total = sum(s["n_rotation_pairs"] for s in per_scene.values())
+    if total == 0:
+        raise GateStop(
+            "17", "no scene has a rotation-regime pair at the primary level, so "
+            "the pure-rotation gate across the regime has nothing to check",
+            FROZEN_DESIGN_MISMATCH, {"scenes": sorted(per_scene)},
+        )
+    count_keys = (
+        "n_pairs_checked", "n_pairs_context_lift_only", "n_pairs_tl_reference_only",
+        "n_pairs_nothing_landed", "n_pairs_no_arm",
+    )
+    norm, at = _largest_translation([
+        (s["max_translation_norm_m"], s["max_translation_pair"])
+        for s in per_scene.values()
+    ])
+    return {
+        "n_scenes": len(per_scene),
+        "n_rotation_pairs": total,
+        **{key: sum(s[key] for s in per_scene.values()) for key in count_keys},
+        "worst": {
+            name: _worst_entry([s["worst"][name] for s in per_scene.values()])
+            for name in ROTATION_COMPARISONS
+        },
+        "max_translation_norm_m": norm,
+        "max_translation_pair": at,
+        "tolerance_px": tol_px,
+        "rotation_position_bound_m": position_bound_m,
+        "reading": ROTATION_READING,
+        "scenes": per_scene,
+    }
+
+
+def rotation_scene_evidence(cfg: Any, analysis: Any, inputs: Any) -> dict[str, Any]:
+    """Step 17 on one scene: every rotation pair, at the primary level.
+
+    Context-Lift is built as evaluate builds it. TL-Reference is recomputed by
+    the call evaluate makes, so the gate checks the estimators that are scored.
+    Nothing is reconciled with Phase 4 here: evaluate does that on every pair,
+    and step 8 does it on one before anything trains.
+    """
+    from .context_lift import context_lift_map
+    from .phase5 import aligned_context_depth, pair_cameras, phase5_scene_pairs
+    from .phase5_reference import recompute_reference_arms
+
+    scene = inputs.scene
+    level = cfg.primary_alignment_level
+    dtype = cfg.torch_dtype
+    pairs = [p for p in phase5_scene_pairs(cfg, analysis, scene) if p.regime == "rotation"]
+    evidence: list[dict[str, Any]] = []
+    no_arm: list[str] = []
+    for pair in pairs:
+        ctx, tgt = pair.context_frame_id, pair.target_frame_id
+        where = f"{scene} {ctx} -> {tgt} level {level}"
+        context_depth = aligned_context_depth(inputs, ctx, level)
+        if context_depth is None:
+            no_arm.append(where)
+            continue
+        cams = pair_cameras(cfg, inputs, pair)
+        depth = torch.from_numpy(context_depth).to(dtype)
+        lift = context_lift_map(
+            depth, cams.K_context, cams.K_target, cams.T_target_from_context,
+            cams.context_hw, cams.target_hw,
+        )
+        substituted = context_lift_map(
+            torch.full_like(depth, ROTATION_SUBSTITUTE_DEPTH_M),
+            cams.K_context, cams.K_target, cams.T_target_from_context,
+            cams.context_hw, cams.target_hw,
+        )
+        arms = recompute_reference_arms(
+            inputs.cache.depth(cams.context.depth_path).to(dtype),
+            inputs.cache.depth(cams.target.depth_path).to(dtype),
+            inputs.est_maps[ctx], inputs.est_maps[tgt], inputs.calibrations[ctx],
+            inputs.cache.features(cfg.feature_encoder, ctx),
+            inputs.cache.features(cfg.feature_encoder, tgt),
+            cams.K_context, cams.K_target, cams.T_target_from_context,
+            scene, ctx, tgt, analysis, level, dtype,
+        )
+        if arms is None:
+            raise GateStop(
+                "17", f"{where}: Context-Lift has an arm at the primary level and "
+                "TL-Reference has none", IMPLEMENTATION_BUG, {"pair": where},
+            )
+        evidence.append(rotation_pair_evidence(
+            lift=lift,
+            substituted=substituted,
+            tl_read_uv_context=arms.tl_read_uv_context,
+            tl_read_depth_context=arms.tl_read_depth_context,
+            tl_landed=arms.tl_landed,
+            uv_target_samples=arms.geometry.samples.uv_target,
+            K_context=cams.K_context,
+            K_target=cams.K_target,
+            T_target_from_context=cams.T_target_from_context,
+            context_hw=cams.context_hw,
+            tol_px=analysis.rotation_gate_coord_tol_px,
+            position_bound_m=analysis.rotation_position_bound_m,
+            where=where,
+        ))
+    return rotation_scene_summary(scene, evidence, no_arm)
 
 
 def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
@@ -753,6 +1212,28 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         state["pin_path"] = str(destination)
         return {**outcome, "keys": sorted(pin)}
 
+    def step17() -> dict[str, Any]:
+        # Specification step 6 across the whole pure-rotation regime, as
+        # reporting_rules.md section 7 records it: every rotation pair of every
+        # scene, at the primary level, before Context-Lift is used
+        # scientifically. Scene inputs are built as step 4 builds them.
+        per_scene: dict[str, Any] = {}
+        for scene in REPLICA_SCENES:
+            first = scene == PROBE_SCENES[0]
+            inputs = (
+                state["probe_inputs"] if first
+                else build_scene_inputs(cfg, analysis, scene, state["convention"])
+            )
+            try:
+                per_scene[scene] = rotation_scene_evidence(cfg, analysis, inputs)
+            finally:
+                if not first:
+                    inputs.close()
+        return rotation_regime_summary(
+            per_scene, analysis.rotation_gate_coord_tol_px,
+            analysis.rotation_position_bound_m,
+        )
+
     def step16() -> dict[str, Any]:
         evidence = assert_no_checkpoint_written(run_dir, checkpoints_before)
         probe_inputs = state.get("probe_inputs")
@@ -775,6 +1256,7 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         ("12", "dry-run one real batch: forward, loss, backward", step12),
         ("13", "resource probe against the frozen batch", step13),
         ("14", "test seal", step14),
+        ("17", "pure-rotation gate across the regime", step17),
         ("15", "complete the deferred pin", step15),
         ("16", "verdict and no-side-effect assertion", step16),
     ])

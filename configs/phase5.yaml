@@ -6,17 +6,19 @@
 # Stream S step 9.
 #
 # Order on the cluster, each mode gated on a clean worktree:
-#   ./scripts/run_phase5.sh check       # the Borah integration gate, 16 steps
+#   ./scripts/run_phase5.sh check       # the Borah integration gate, 17 steps
 #   ./scripts/run_phase5.sh overfit     # Stream U step 14, the overfit gate
 #   ./scripts/run_phase5.sh train       # nine (fold, seed) tasks via SLURM
 #   ./scripts/run_phase5.sh controls    # Stream U step 17, pose and depth shuffle
+#   ./scripts/run_phase5.sh lock        # the checkpoint lock, reporting_rules.md section 7
 #   ./scripts/run_phase5.sh evaluate    # Streams V and W
 #   ./scripts/run_phase5.sh tables      # Stream AC tables
 #   ./scripts/run_phase5.sh figures     # Stream AC figures
 #   ./scripts/run_phase5.sh acceptance  # Stream AD
 #
-# Stream R's pure-rotation validation is not a separate mode: it runs inside
-# check, at step 10, against the real rotation regime.
+# Stream R's pure-rotation validation is not a separate mode. It runs inside
+# check. Gate step 10 checks one probe pair. Gate step 17 checks every
+# rotation-regime pair of every scene, after step 14 and before the pin of step 15.
 
 experiment_name: phase5_rung2
 renders_root: data/replica_renders

@@ -1018,3 +1018,20 @@ def test_every_gpu_job_template_refuses_to_fall_back_to_the_cpu():
         text = (Path("scripts") / name).read_text(encoding="utf-8")
         call = text[text.rindex("python -m lot.phase5"):]
         assert "--device cuda" in call, name
+
+
+def test_the_launcher_keeps_every_submitted_job_off_excluded_nodes():
+    """Written from the GPU diagnosis on Borah. One L40 node, gpu118, restricts
+    its GPU device files to a group this account is not in, so torch sees no
+    GPU there. Every job the launcher submits must be able to avoid such a
+    node. The node list comes from the environment, never from the script,
+    as CLAUDE.md requires of cluster names."""
+    from pathlib import Path
+
+    text = Path("scripts/run_phase5.sh").read_text(encoding="utf-8")
+    submit = text[text.index("submit() {"):]
+    submit = submit[:submit.index("\n}\n")]
+    assert 'sbatch --account "$SLURM_ACCOUNT"' in submit
+    assert '${LOT_EXCLUDE_NODES:+--exclude "$LOT_EXCLUDE_NODES"}' in submit
+    assert "LOT_EXCLUDE_NODES" in text[:text.index("set -euo pipefail")]
+    assert "gpu118" not in text

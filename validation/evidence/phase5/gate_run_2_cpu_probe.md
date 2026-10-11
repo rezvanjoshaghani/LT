@@ -58,3 +58,26 @@ The cause on the node, a driver or a visibility problem, is diagnosed
 separately. The gate is rerun on a node where torch sees the GPU. That
 supersedes this run's receipt, so the overfit gate is rerun after it. Any
 overfit result bound to this run's receipt is superseded with it.
+
+## The cause, diagnosed on 2026-10-11
+
+Short jobs pinned to each node showed a node-level permission, not a code,
+driver, or environment problem.
+
+- On `gpu118`, an L40 node, the GPU device files `/dev/nvidia0` to
+  `/dev/nvidia3` and `/dev/nvidiactl` are owned by `root:vglusers`, mode 0660.
+  The account is not in `vglusers`. SLURM allocates the card, but every
+  process the account runs is refused it: `nvidia-smi` reports "Failed to
+  initialize NVML: Insufficient Permissions", and torch sees zero devices.
+  Those device files were changed on September 22.
+- On `gpu114` and `gpu117`, also L40 nodes of `gpu-l40`, the device files are
+  `root:root`, mode 0666, and torch sees the L40. Five other `gpu-l40` nodes
+  were busy and could not be tested.
+- The A30, V100, RTX 8000, and P100 nodes tested are all open, and torch sees
+  each card.
+- The same environment, torch 2.5.1 for CUDA 12.1, works on every open node.
+
+The run stays on L40s. `LOT_EXCLUDE_NODES` keeps every submitted job off the
+restricted node, and the `srun` that runs `check` excludes it too. A job that
+lands on another restricted node stops at once under `--device cuda`, and the
+node is then added to the list.

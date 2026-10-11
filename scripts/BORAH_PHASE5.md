@@ -22,6 +22,15 @@ never hard-coded anywhere.
     export SLURM_PARTITION=<partition>
     export LOT_ENV=lot-encode            # the Phase 2/3/4 env, unchanged
     export MAMBA_ROOT_PREFIX=/bsuscratch/$USER/micromamba
+    export LOT_EXCLUDE_NODES=<nodes>     # optional; see below
+
+`LOT_EXCLUDE_NODES` is a comma-separated list of nodes no submitted job may
+use. Set it when a node grants a GPU that this account cannot open: SLURM
+allocates the card, but its device files belong to a group the account is not
+in, so torch sees no device. Such a node is found by running a short job on
+each node of the partition and asking torch whether it sees the GPU; see
+`validation/evidence/phase5/gate_run_2_cpu_probe.md`. Pass the same list to
+the `srun` that runs `check`, as section 1 shows.
 
 `sacctmgr show associations where user=$USER format=account%30,partition%30`
 lists your accounts, and `sinfo -o "%P %G %l"` lists each partition's GPUs and
@@ -47,8 +56,9 @@ Phase 5 re-encodes nothing. It consumes the existing caches.
 ## 1. The integration gate
 
     srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+         ${LOT_EXCLUDE_NODES:+--exclude="$LOT_EXCLUDE_NODES"} \
          --ntasks=1 --cpus-per-task=4 --mem=48G --gres=gpu:1 \
-         --time=04:00:00 --pty ./scripts/run_phase5.sh check
+         --time=08:00:00 --pty ./scripts/run_phase5.sh check
 
 Run it inside a GPU allocation as above, never on the login node. Step 12 stops,
 as a missing resource, when torch sees no CUDA device. Without a GPU the dry run

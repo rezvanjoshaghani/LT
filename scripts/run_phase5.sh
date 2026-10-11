@@ -65,6 +65,8 @@
 #   LOT_ENV            micromamba env with torch and pyarrow (default lot-encode)
 #   SLURM_ACCOUNT      required only by the modes that submit jobs
 #   SLURM_PARTITION    same
+#   LOT_EXCLUDE_NODES  optional, comma separated: nodes no submitted job may use,
+#                      for nodes where this account cannot open the GPU
 
 set -euo pipefail
 
@@ -204,7 +206,12 @@ require_slurm() {
 submit() {
     local output="$1"
     shift
+    # LOT_EXCLUDE_NODES keeps every job off nodes where this account cannot use
+    # the GPU. On Borah one L40 node restricts its GPU device files to a group
+    # this account is not in. A job landing there stops at once under
+    # --device cuda, so the exclusion saves a failed task, not a wrong result.
     sbatch --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" \
+        ${LOT_EXCLUDE_NODES:+--exclude "$LOT_EXCLUDE_NODES"} \
         --output "$EVIDENCE_DIR/$output.txt" \
         "$@"
 }

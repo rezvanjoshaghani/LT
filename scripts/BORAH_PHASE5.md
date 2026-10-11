@@ -50,13 +50,24 @@ Phase 5 re-encodes nothing. It consumes the existing caches.
          --ntasks=1 --cpus-per-task=4 --mem=48G --gres=gpu:1 \
          --time=04:00:00 --pty ./scripts/run_phase5.sh check
 
-Run it inside a GPU allocation as above, never on the login node. Without a GPU
-the gate dry-runs the training batch on the CPU, and step 13 cannot measure
-whether the batch fits in GPU memory, so the gate would pass without that test.
+Run it inside a GPU allocation as above, never on the login node. Step 12 stops,
+as a missing resource, when torch sees no CUDA device. Without a GPU the dry run
+would fall back to the CPU and step 13 could not measure whether the batch fits
+in GPU memory. That happened once: the second real run asked SLURM for an L40,
+torch saw no device, and the gate passed with the memory test skipped. If step
+12 stops on a GPU node, check that the node's NVIDIA driver supports the torch
+build. The env's torch 2.5.1 is built for CUDA 12.1, which needs driver 525.60
+or newer:
+
+    srun --account "$SLURM_ACCOUNT" --partition "$SLURM_PARTITION" --ntasks=1 \
+         --gres=gpu:1 --time=00:10:00 --pty bash -c 'nvidia-smi --query-gpu=name,driver_version --format=csv; micromamba run -n lot-encode python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"'
+
+The GPU jobs, overfit, train, controls, and evaluate, pass `--device cuda`, so a
+job whose torch sees no usable GPU stops at once instead of training on the CPU.
+
 `--ntasks=1` is explicit because an allocation that inherits a larger task
 count runs one copy of the gate per task; that once happened to the Phase 4
-smoke run. The time limit is an estimate, since the gate has not yet run on
-real artifacts.
+smoke run. The time limit is an estimate.
 
 A hard gate with no training side effects, and the only thing permitted to run
 first. It verifies the frozen blobs against FREEZE.md, asserts a clean tree,

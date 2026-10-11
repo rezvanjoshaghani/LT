@@ -71,8 +71,11 @@ echo "clean worktree at commit $(git rev-parse HEAD)"
 
 # One task per (fold, seed). The task never sees a test scene: the fold object
 # exposes train and val only, and lot.train asserts the seal inside its loop.
+# --device cuda: a task whose torch sees no usable GPU stops at once. Under the
+# default, auto, it would fall back to the CPU and train for days.
 "$MM" run -n "$LOT_ENV" python -m lot.phase5 \
     --config "$CONFIG" \
     --mode train \
+    --device cuda \
     --task-index "${SLURM_ARRAY_TASK_ID:-0}" \
     "$@"

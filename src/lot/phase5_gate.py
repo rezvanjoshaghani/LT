@@ -54,6 +54,27 @@ PROBE_SCENES = ("apartment_0", "office_0", "room_0")
 REGIMES = ("rotation", "translation", "orbit")
 
 
+def dry_run_device() -> str:
+    """The device step 12's dry run and step 13's resource probe must use: the GPU.
+
+    The gate measures whether the frozen training batch fits in the memory of
+    the GPU type training will use. On the CPU that test cannot run, and step
+    13 skips it. The second real run of the gate asked SLURM for an L40, torch
+    saw no CUDA device, and the gate passed with the memory test skipped. So a
+    run where torch sees no GPU now stops here. It is a missing resource:
+    nothing in the code or the design is at fault.
+    """
+    if not torch.cuda.is_available():
+        raise GateStop(
+            "12", "torch sees no CUDA device, so the dry run and the resource probe "
+            "would run on the CPU and step 13 could not test GPU memory. Run check "
+            "inside a GPU allocation on the GPU type training will use, with a "
+            "torch build the node's NVIDIA driver supports.",
+            MISSING_ARTIFACT, {"cuda_available": False},
+        )
+    return "cuda"
+
+
 def rotation_gate_evidence(
     lift: Any,
     analytic: torch.Tensor,
@@ -1093,7 +1114,7 @@ def run_integration_gate(cfg: Any, analysis: Any) -> GateReport:
         inputs = state["probe_inputs"]
         frame = next(iter(inputs.frames.values()))
         model_cfg = predictor_config_from(cfg, (frame.height, frame.width))
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = dry_run_device()
         model = build_predictor(model_cfg).to(device)
 
         batch_pairs = int(cfg.training.get("batch_pairs", 8))

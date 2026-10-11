@@ -72,4 +72,6 @@ ARGS=(--config "$CONFIG" --mode "$MODE" "$@")
 if [ "$MODE" = evaluate ] && [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
     ARGS+=(--scene-index "$SLURM_ARRAY_TASK_ID")
 fi
-"$MM" run -n "$LOT_ENV" python -m lot.phase5 "${ARGS[@]}"
+# --device cuda: a job whose torch sees no usable GPU stops at once. Under the
+# default, auto, it would fall back to the CPU and run for days.
+"$MM" run -n "$LOT_ENV" python -m lot.phase5 --device cuda "${ARGS[@]}"

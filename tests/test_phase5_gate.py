@@ -969,3 +969,52 @@ def test_step_seventeen_runs_the_tested_functions():
 
     pair = inspect.getsource(phase5_gate.rotation_pair_evidence)
     assert "rotation_homography_landing(" in pair
+
+
+# ---------------------------------------------------------------------------
+# Step 12 needs a GPU
+# ---------------------------------------------------------------------------
+#
+# Written from the second real run of the gate. srun asked for an L40, but torch
+# saw no CUDA device, so step 12 dry-ran the batch on the CPU and step 13 had
+# no GPU memory to test. The gate passed with that test skipped. A run on the
+# wrong device is a missing resource, not a pass.
+
+def test_the_dry_run_device_is_the_gpu_when_one_is_visible(monkeypatch):
+    from lot.phase5_gate import dry_run_device
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert dry_run_device() == "cuda"
+
+
+def test_the_dry_run_stops_when_torch_sees_no_gpu(monkeypatch):
+    from lot.phase5_gate import dry_run_device
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(GateStop) as stop:
+        dry_run_device()
+    assert stop.value.step == "12"
+    assert stop.value.classification == MISSING_ARTIFACT
+    assert "GPU" in stop.value.message
+
+
+def test_step_twelve_takes_its_device_from_the_guard():
+    import inspect
+
+    from lot import phase5_gate
+
+    source = inspect.getsource(phase5_gate.run_integration_gate)
+    step12 = source[source.index("def step12"):source.index("def step13")]
+    assert "dry_run_device()" in step12
+    assert "torch.cuda.is_available()" not in step12
+
+
+def test_every_gpu_job_template_refuses_to_fall_back_to_the_cpu():
+    """A template without --device cuda resolves auto to the CPU when the job
+    gets no usable GPU, and trains for days instead of failing at once."""
+    from pathlib import Path
+
+    for name in ("phase5_train.sbatch", "phase5_job.sbatch"):
+        text = (Path("scripts") / name).read_text(encoding="utf-8")
+        call = text[text.rindex("python -m lot.phase5"):]
+        assert "--device cuda" in call, name

@@ -264,6 +264,22 @@ def test_overfit_records_its_verdict_and_never_raises(world, store, threshold, e
     json.dumps(result)   # a receipt must be serializable
 
 
+def test_overfit_and_training_record_the_device_they_ran_on(world, store, trained):
+    """The second real gate run found torch blind to the GPU it was given. Each
+    gate verdict and training record therefore names its device and the
+    environment, so a run that fell back to the CPU is visible afterwards."""
+    result = run_overfit(
+        world["cfg"], world["analysis"], store, FOLD, MODEL, TRAIN, world["center"],
+        "cpu", LEVEL, 2, ("rotation", "translation"), -1.0, 3, 0,
+        train_scenes=[TRAIN_SCENE],
+    )
+    assert result["device"] == "cpu"
+    assert result["environment"]["cuda_available"] in (True, False)
+    for payload in trained.values():
+        assert payload["device"] == "cpu"
+        assert "cuda_available" in payload["environment"]
+
+
 # ---------------------------------------------------------------------------
 # train
 # ---------------------------------------------------------------------------
@@ -293,6 +309,9 @@ TRAINING_RECORD_BASE_FIELDS = (
 )
 TRAINING_RECORD_PROVENANCE = (
     "licence", "train_scenes_planned", "val_scenes_planned", "written_utc",
+    # Added after the second real gate run, where torch saw no GPU: the device
+    # and environment a run trained on, gate_run_2_cpu_probe.md.
+    "device", "environment",
 )
 
 

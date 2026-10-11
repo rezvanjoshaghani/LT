@@ -328,6 +328,10 @@ def run_overfit(
             }
             for plan in plans
         ],
+        # Where the fit ran. A gate that silently fell back to the CPU is then
+        # visible in its receipt rather than inferred from how long it took.
+        "device": str(device),
+        "environment": environment_identity(),
     }
 
 
@@ -517,6 +521,9 @@ def run_train_task(
         "train_scenes_planned": planned_scenes(train_plans),
         "val_scenes_planned": planned_scenes(val_plans),
         "written_utc": utc_timestamp(),
+        # Where the run trained, so a fall back to the CPU is on the record.
+        "device": str(device),
+        "environment": environment_identity(),
     }
     write_once(record_file, json.dumps(payload, indent=2, sort_keys=True, default=str))
     return payload

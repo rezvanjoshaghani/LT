@@ -538,3 +538,119 @@ def test_controls_refuse_examples_outside_the_validation_split():
         run_input_use_controls(
             model, training, GRID_HW, batch_pairs=2, seed=5, fold=FOLD
         )
+
+
+# ---------------------------------------------------------------------------
+# The gate scores with dropout off: overfit_gate_amendment.md
+# ---------------------------------------------------------------------------
+#
+# Written from the first real overfit run. The gate scored the training batch
+# with dropout active and reached 0.9763; the same network scored with dropout
+# off reached 0.9832. The amended gate scores the fit with dropout off after
+# every optimizer step, and leaves training exactly as it was.
+
+NOISY = dataclasses.replace(TINY, dropout=0.5)
+GATE_CFG = TrainingConfig(learning_rate=3e-3, weight_decay=0.0, warmup_steps=1)
+
+
+def _replay(model_cfg, examples, steps, seed=0):
+    """The gate's training loop, with both scores recorded after every step.
+
+    Returns the per-step training-batch cosine, taken with dropout active from
+    the forward that drives the loss, and the eval-mode cosine scored after the
+    optimizer step.
+    """
+    from lot.train import batch_loss
+
+    torch.manual_seed(seed)
+    model = build_predictor(model_cfg)
+    model.train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=GATE_CFG.learning_rate,
+        weight_decay=GATE_CFG.weight_decay,
+        betas=(GATE_CFG.adam_beta1, GATE_CFG.adam_beta2), eps=GATE_CFG.adam_eps,
+    )
+    train_scores, eval_scores = [], []
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        loss, cosine, _ = batch_loss(model, examples, GRID_HW)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GATE_CFG.grad_clip_norm)
+        optimizer.step()
+        train_scores.append(cosine)
+        model.eval()
+        with torch.no_grad():
+            eval_scores.append(batch_loss(model, examples, GRID_HW)[1])
+        model.train()
+    return train_scores, eval_scores
+
+
+def _gate(model_cfg, examples, threshold, steps):
+    return run_tiny_overfit_gate(
+        examples, model_cfg, GATE_CFG, GRID_HW, threshold=threshold, max_steps=steps,
+        fold=FOLD, expected_pairs=len(examples), required_regimes=REGIMES, seed=0,
+        raise_on_failure=False,
+    )
+
+
+def test_the_gate_reports_the_dropout_off_score_and_the_training_score():
+    examples = tiny_subset()
+    train_scores, eval_scores = _replay(NOISY, examples, 30)
+    result = _gate(NOISY, examples, threshold=1.5, steps=30)
+    assert result.scoring == "eval_mode"
+    assert result.reached_centered_cosine == max(eval_scores)
+    assert result.train_mode_centered_cosine == max(train_scores)
+    # Heavy dropout makes the two measures differ, so the test can tell them apart.
+    assert result.reached_centered_cosine != result.train_mode_centered_cosine
+
+
+def test_scoring_with_dropout_off_leaves_training_unchanged():
+    """The eval forward draws no random numbers and the model returns to train
+    mode, so the training-batch scores are the frozen gate's own. A scoring
+    step that consumed the dropout generator, or left dropout off for the next
+    step, would change them."""
+    from lot.train import batch_loss
+
+    examples = tiny_subset()
+    torch.manual_seed(0)
+    model = build_predictor(NOISY)
+    model.train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=GATE_CFG.learning_rate,
+        weight_decay=GATE_CFG.weight_decay,
+        betas=(GATE_CFG.adam_beta1, GATE_CFG.adam_beta2), eps=GATE_CFG.adam_eps,
+    )
+    frozen_gate_scores = []
+    for _ in range(30):
+        optimizer.zero_grad(set_to_none=True)
+        loss, cosine, _ = batch_loss(model, examples, GRID_HW)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GATE_CFG.grad_clip_norm)
+        optimizer.step()
+        frozen_gate_scores.append(cosine)
+    result = _gate(NOISY, examples, threshold=1.5, steps=30)
+    assert result.train_mode_centered_cosine == max(frozen_gate_scores)
+
+
+def test_the_gate_stops_at_the_first_step_the_dropout_off_score_reaches_the_threshold():
+    examples = tiny_subset()
+    _, eval_scores = _replay(NOISY, examples, 60)
+    threshold = sorted(eval_scores)[len(eval_scores) // 2]
+    first = next(i for i, value in enumerate(eval_scores, start=1) if value >= threshold)
+    result = _gate(NOISY, examples, threshold=threshold, steps=60)
+    assert result.passed
+    assert result.steps == first
+    assert result.reached_centered_cosine >= threshold
+
+
+def test_a_fit_masked_by_dropout_passes_the_amended_gate():
+    """The real failure in miniature: a threshold the training-batch score never
+    reaches and the dropout-off score does."""
+    examples = tiny_subset()
+    steps = 60
+    train_scores, eval_scores = _replay(NOISY, examples, steps)
+    assert max(eval_scores) > max(train_scores)
+    threshold = (max(train_scores) + max(eval_scores)) / 2
+    result = _gate(NOISY, examples, threshold=threshold, steps=steps)
+    assert result.passed
+    assert result.train_mode_centered_cosine < threshold <= result.reached_centered_cosine

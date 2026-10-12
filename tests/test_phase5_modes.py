@@ -259,6 +259,11 @@ def test_overfit_records_its_verdict_and_never_raises(world, store, threshold, e
     )
     assert result["passed"] is expect
     assert result["fold"] == FOLD.index and result["level"] == LEVEL
+    # The verdict is scored with dropout off, and the dropout-on value is
+    # reported beside it. overfit_gate_amendment.md.
+    assert result["scoring"] == "eval_mode"
+    assert math.isfinite(result["reached_centered_cosine"])
+    assert math.isfinite(result["train_mode_centered_cosine"])
     assert len(result["subset"]) == 2
     assert all(item["n_supported"] > 0 for item in result["subset"])
     json.dumps(result)   # a receipt must be serializable
@@ -827,7 +832,7 @@ def test_the_lock_needs_the_licence_it_binds(world, trained, tmp_path):
 OVERFIT_RECEIPT = {
     "passed": True, "reached_centered_cosine": 0.9912, "threshold": 0.98, "steps": 140,
     "n_pairs": 8, "regimes": ["rotation", "translation", "orbit"], "fold": 0,
-    "level": LEVEL, "seed": 0,
+    "level": LEVEL, "seed": 0, "scoring": "eval_mode", "train_mode_centered_cosine": 0.9837,
     "subset": [{"scene": TRAIN_SCENE, "context_frame_id": "000", "target_frame_id": "001",
                 "regime": "rotation", "n_supported": 12}],
     "kind": "overfit", "commit": "c" * 40, "config_digest": "d" * 64,
@@ -1505,7 +1510,8 @@ def test_the_run_record_embeds_what_the_tables_read(world, evaluated):
 
     assert OVERFIT_VERDICT_FIELDS == ("passed", "reached_centered_cosine", "threshold",
                                       "steps", "n_pairs", "regimes", "subset", "fold",
-                                      "level", "seed")
+                                      "level", "seed", "scoring",
+                                      "train_mode_centered_cosine")
     overfit = evidence / "tiny_overfit.json"
     assert meta["overfit_verdict"] == {
         "sha256": sha256_file(overfit),

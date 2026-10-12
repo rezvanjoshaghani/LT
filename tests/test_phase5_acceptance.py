@@ -270,6 +270,7 @@ def overfit_report() -> dict:
     return {
         "passed": True, "reached_centered_cosine": 0.9917, "threshold": 0.98, "steps": 1460,
         "n_pairs": 8, "regimes": list(REGIMES), "fold": 0, "level": LEVEL, "seed": 0,
+        "scoring": "eval_mode", "train_mode_centered_cosine": 0.9843,
         "subset": [{"scene": train[index % len(train)], "context_frame_id": f"{index:03d}",
                     "target_frame_id": f"{index + 4:03d}", "regime": REGIMES[index % 3],
                     "n_supported": 800} for index in range(8)],
@@ -1084,6 +1085,21 @@ def test_9_an_overfit_subset_outside_the_training_scenes(shared, tmp_path):
         payload["subset"][0]["scene"] = FOLDS[0].val[0]
 
     only(accept(rebuild(shared, tmp_path / "world", overfit=leak)), 9, FOLDS[0].val[0])
+
+
+@pytest.mark.parametrize("scoring", ["train_mode", None])
+def test_9_an_overfit_gate_not_scored_with_dropout_off(shared, tmp_path, scoring):
+    """overfit_gate_amendment.md: the gate scores the fit with dropout off. A
+    receipt scored with dropout on, or one that does not say how it scored,
+    does not pass, whatever value it reached."""
+    def score(payload):
+        if scoring is None:
+            del payload["scoring"]
+        else:
+            payload["scoring"] = scoring
+
+    only(accept(rebuild(shared, tmp_path / "world", overfit=score)), 9,
+         "scored the fit by", "dropout off")
 
 
 def test_10_a_training_config_digest_that_drifted(shared, tmp_path):

@@ -578,12 +578,49 @@ class TinyOverfitFailure(RuntimeError):
 
 @dataclasses.dataclass
 class TinyOverfitResult:
+    """The gate's verdict.
+
+    reached_centered_cosine is the gate's measure: the best pooled centered
+    cosine of the subset scored in eval mode, with dropout off.
+    train_mode_centered_cosine is the best training-batch value, taken with
+    dropout active. The gate scored that value until
+    validation/evidence/phase5/overfit_gate_amendment.md and reports it
+    beside the measure. scoring names the rule.
+    """
+
     reached_centered_cosine: float
     threshold: float
     steps: int
     passed: bool
     n_pairs: int
     regimes: tuple[str, ...]
+    train_mode_centered_cosine: float
+    scoring: str
+
+
+# How the overfit gate scores the fit: in eval mode, with dropout off. Defined
+# once; the receipt records it and acceptance requires it.
+TINY_OVERFIT_SCORING = "eval_mode"
+
+
+def _score_without_dropout(
+    model: PredictWithDepth,
+    examples: Sequence[TrainingExample],
+    grid_hw: tuple[int, int],
+) -> tuple[float, int]:
+    """The pooled centered cosine of a batch in eval mode, with no gradient.
+
+    Returns (mean cosine over supported samples, supported sample count) and
+    leaves the model in train mode. The eval forward draws no random numbers,
+    so scoring between optimizer steps leaves the training trajectory unchanged.
+    """
+    model.eval()
+    try:
+        with torch.no_grad():
+            _, cosine, n = batch_loss(model, examples, grid_hw)
+    finally:
+        model.train()
+    return cosine, n
 
 
 def run_tiny_overfit_gate(
@@ -617,6 +654,12 @@ def run_tiny_overfit_gate(
     to. It says the supervised mapping is representable by this trunk under this
     optimizer, which is the precondition for reading anything scientific into a
     later underperformance.
+
+    The fit is scored after every optimizer step in eval mode, with dropout off,
+    as validation and evaluation score the model. Training itself runs with
+    dropout on, exactly as before. The gate stops at the first step whose score
+    reaches the threshold. validation/evidence/phase5/overfit_gate_amendment.md
+    records why the gate scores this way and when that was decided.
     """
     assert_scenes_in_role(
         fold, [e.scene for e in examples], "train", "tiny overfit gate"
@@ -646,14 +689,18 @@ def run_tiny_overfit_gate(
         eps=train_cfg.adam_eps,
     )
     best = -math.inf
+    best_train_mode = -math.inf
     for step in range(max_steps):
         optimizer.zero_grad(set_to_none=True)
         loss, cosine, n = batch_loss(model, examples, grid_hw)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip_norm)
         optimizer.step()
-        if n and cosine > best:
-            best = cosine
+        if n and cosine > best_train_mode:
+            best_train_mode = cosine
+        fitted, n_fitted = _score_without_dropout(model, examples, grid_hw)
+        if n_fitted and fitted > best:
+            best = fitted
         if best >= threshold:
             break
 
@@ -665,12 +712,17 @@ def run_tiny_overfit_gate(
         passed=passed,
         n_pairs=len(examples),
         regimes=tuple(sorted({e.regime for e in examples})),
+        train_mode_centered_cosine=(
+            best_train_mode if math.isfinite(best_train_mode) else float("nan")
+        ),
+        scoring=TINY_OVERFIT_SCORING,
     )
     if not passed and raise_on_failure:
         raise TinyOverfitFailure(
             f"tiny-subset overfit gate failed: reached centered cosine "
-            f"{result.reached_centered_cosine:.4f} against the frozen threshold "
-            f"{threshold} after {result.steps} steps over {len(examples)} pairs. "
+            f"{result.reached_centered_cosine:.4f} with dropout off against the "
+            f"frozen threshold {threshold} after {result.steps} steps over "
+            f"{len(examples)} pairs. "
             "Phase 5 stops here: a predictor that cannot fit this sample cannot "
             "support a scientific reading of its underperformance at scale."
         )

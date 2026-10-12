@@ -1,11 +1,13 @@
 """Diagnose a failed tiny-subset overfit gate. A diagnostic, never a gate.
 
-The overfit gate (lot.train.run_tiny_overfit_gate) trains on the frozen
-eight-pair subset with the model in train mode and reports the best
-training-batch centered cosine. Dropout is active in that forward pass, so
-the reported value mixes how well the trunk fits the subset with dropout
-noise. This script replays the gate's training exactly, with the same subset,
-seed, optimizer, clipping, and steps, and records two values every few steps:
+Written for the gate as it stood at 1e7ce8f. That gate
+(lot.train.run_tiny_overfit_gate) trained on the frozen eight-pair subset with
+the model in train mode and reported the best training-batch centered cosine.
+Dropout was active in that forward pass, so the reported value mixed how well
+the trunk fits the subset with dropout noise. The gate now scores with dropout
+off, as validation/evidence/phase5/overfit_gate_amendment.md records. This
+script replays the gate's training exactly, with the same subset, seed,
+optimizer, clipping, and steps, and records two values every few steps:
 
     train_mode   the gate's own measure, dropout active, from the training forward
     eval_mode    the same batch scored with dropout off, a deterministic forward
@@ -68,9 +70,9 @@ def diagnose(
 ) -> dict[str, Any]:
     """Replay the gate's loop and record train-mode and eval-mode cosines.
 
-    The loop is lot.train.run_tiny_overfit_gate's, statement for statement,
-    except that it never stops early and it scores the batch in eval mode at
-    every `every` steps and at the end.
+    The training loop is lot.train.run_tiny_overfit_gate's, statement for
+    statement, except that it never stops early and it scores the batch in eval
+    mode at every `every` steps and at the end, rather than after every step.
     """
     from lot.predictors import build_predictor
     from lot.train import batch_loss

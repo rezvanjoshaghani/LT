@@ -758,7 +758,7 @@ def test_verify_against_checks_a_lock_like_verify(tmp_path):
 OVERFIT_RESULT = {
     "passed": True, "reached_centered_cosine": 0.9917, "threshold": 0.98, "steps": 1460,
     "n_pairs": 8, "regimes": ["rotation", "translation", "orbit"], "fold": 0,
-    "level": "image", "seed": 0,
+    "level": "image", "seed": 0, "scoring": "eval_mode", "train_mode_centered_cosine": 0.9843,
     "subset": [{"scene": "apartment_1", "context_frame_id": "000",
                 "target_frame_id": "004", "regime": "rotation", "n_supported": 812}],
 }

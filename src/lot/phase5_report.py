@@ -1994,6 +1994,9 @@ def adequacy_table(
             "tiny_overfit_passed": verdict.get("passed") is True,
             "tiny_overfit_reached_centered_cosine": _float(
                 verdict.get("reached_centered_cosine")),
+            "tiny_overfit_scoring": verdict.get("scoring"),
+            "tiny_overfit_train_mode_centered_cosine": _float(
+                verdict.get("train_mode_centered_cosine")),
             "tiny_overfit_threshold": _float(verdict.get("threshold")),
             "tiny_overfit_steps": _int(verdict.get("steps")),
             "tiny_overfit_n_pairs": _int(verdict.get("n_pairs")),

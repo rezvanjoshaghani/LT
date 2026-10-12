@@ -67,7 +67,7 @@ STAMP = "2026-10-10T09:00:00.000000+00:00"
 OVERFIT_VERDICT = {
     "passed": True, "reached_centered_cosine": 0.9917, "threshold": 0.98, "steps": 1460,
     "n_pairs": 8, "regimes": ["rotation", "translation", "orbit"], "fold": 0,
-    "level": LEVEL, "seed": 0,
+    "level": LEVEL, "seed": 0, "scoring": "eval_mode", "train_mode_centered_cosine": 0.9843,
     "subset": [{"scene": FOLDS[0].train[0], "context_frame_id": "000",
                 "target_frame_id": "004", "regime": "rotation", "n_supported": 812}],
 }

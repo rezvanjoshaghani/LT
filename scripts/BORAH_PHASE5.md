@@ -186,7 +186,8 @@ receipt, so an overfit result cannot be carried across to a run the gate never
 examined; rerunning `check` invalidates it and the overfit gate must be rerun.
 
 The job prints `TINY-SUBSET OVERFIT GATE: PASS` or `FAIL`, the centered cosine
-reached, and the eight pairs, and writes the verdict to
+reached with dropout off, the best training-batch value with dropout on, and the
+eight pairs, and writes the verdict to
 `outputs/phase5_rung2/evidence/tiny_overfit.json`. A rerun archives the earlier
 receipt as `*.superseded.N.*` rather than overwriting it. A FAIL receipt blocks
 every later mode, because verification requires a recorded pass. The gate runs
@@ -194,6 +195,15 @@ only at the primary alignment level.
 
 Stream U step 14. Eight pairs from training scenes only, spanning the three
 camera regimes, at the frozen threshold of centered cosine 0.98.
+
+The gate trains with dropout on, as training does. After every optimizer step
+it scores the eight pairs in eval mode, with dropout off, as validation and
+evaluation score the model. It passes at the first step whose score reaches
+0.98 within the 2000 steps. The receipt records the rule as
+`scoring: eval_mode`, and acceptance requires it. The first gate run scored
+with dropout on and failed at 0.9763.
+`validation/evidence/phase5/overfit_gate_amendment.md` records that failure,
+the diagnostic that followed, and the decision to score with dropout off.
 
 A failure is a stop and the phase does not continue. The reason is not that a
 failing model is uninteresting; it is that Phase 5's whole question is whether

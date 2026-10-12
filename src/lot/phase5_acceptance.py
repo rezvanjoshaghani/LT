@@ -229,6 +229,7 @@ from .phase5_report import (
     level_role,
 )
 from .render_replica import REPLICA_SCENES
+from .train import TINY_OVERFIT_SCORING
 
 # ---------------------------------------------------------------------------
 # The conditions and what they read
@@ -2674,7 +2675,8 @@ def _superseded(ctx: AcceptanceContext, check: _Check) -> None:
 
 
 def check_09_tiny_overfit(ctx: AcceptanceContext) -> Outcome:
-    """The licensed overfit receipt passed the frozen gate on fold 0's training scenes."""
+    """The licensed overfit receipt passed the frozen gate on fold 0's training
+    scenes, scored with dropout off as overfit_gate_amendment.md records."""
     check = _Check()
     tiny = dict(ctx.cfg.tiny_overfit)
     with check.part("the overfit receipt"):
@@ -2687,6 +2689,9 @@ def check_09_tiny_overfit(ctx: AcceptanceContext) -> Outcome:
         frozen_threshold = float(tiny.get("threshold_centered_cosine"))
         if payload.get("passed") is not True:
             check.fail("the overfit receipt records a failed gate")
+        if payload.get("scoring") != TINY_OVERFIT_SCORING:
+            check.fail(f"the gate scored the fit by {payload.get('scoring')!r}, not "
+                       f"{TINY_OVERFIT_SCORING!r} with dropout off")
         if threshold != frozen_threshold:
             check.fail(f"the gate ran at threshold {threshold}, not the frozen {frozen_threshold}")
         if not (_finite(reached) and _finite(threshold) and reached >= threshold):
@@ -2715,9 +2720,9 @@ def check_09_tiny_overfit(ctx: AcceptanceContext) -> Outcome:
         check.evidence["overfit"] = {field: payload.get(field) for field in OVERFIT_VERDICT_FIELDS
                                      if field != "subset"}
         check.evidence["overfit"]["sha256"] = receipt.sha256
-        check.note_if_clean(mark, f"the gate reached centered cosine {reached} against "
-                                  f"{threshold} on {len(subset)} training pairs of fold 0 "
-                                  f"spanning {regimes}")
+        check.note_if_clean(mark, f"the gate reached centered cosine {reached} with dropout "
+                                  f"off against {threshold} on {len(subset)} training pairs "
+                                  f"of fold 0 spanning {regimes}")
     with check.part("the verdict each run record embeds"):
         receipt = ctx.receipt(KIND_OVERFIT)
         expected = {"sha256": receipt.sha256,

@@ -341,7 +341,8 @@ def control_result(fold, seed: int) -> dict:
 OVERFIT = {"sha256": "f" * 64, "passed": True, "reached_centered_cosine": 0.9917,
            "threshold": 0.98, "steps": 1460, "n_pairs": 8,
            "regimes": ["rotation", "translation", "orbit"], "subset": [], "fold": 0,
-           "level": LEVEL, "seed": 0}
+           "level": LEVEL, "seed": 0, "scoring": "eval_mode",
+           "train_mode_centered_cosine": 0.9843}
 TRAINING = {"max_steps": 20000, "validation_every_steps": 500, "early_stopping_patience": 10}
 
 
@@ -1358,6 +1359,9 @@ def test_the_adequacy_and_validation_history_tables(built):
         assert row["val_scenes"] == ",".join(fold.val)
         assert row["test_scenes"] == ",".join(fold.test)
         assert row["tiny_overfit_passed"] is True and row["tiny_overfit_threshold"] == 0.98
+        assert row["tiny_overfit_scoring"] == "eval_mode"
+        assert row["tiny_overfit_reached_centered_cosine"] == 0.9917
+        assert row["tiny_overfit_train_mode_centered_cosine"] == 0.9843
         assert row["tiny_overfit_regimes"] == "rotation,translation,orbit"
         assert row["parameter_count"] == 16680960
         assert row["max_steps"] == 20000 and row["validation_every_steps"] == 500

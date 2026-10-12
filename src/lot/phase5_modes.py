@@ -120,10 +120,11 @@ REGIONS = ("all", "boundary", "interior", "low_texture", "high_texture")
 PHASE5_EVAL_VERSION = 1
 
 # The overfit receipt's fields every evaluation run record carries: the
-# verdict, and the gate's own fold, level, and seed.
+# verdict, how the gate scored it, and the gate's own fold, level, and seed.
 OVERFIT_VERDICT_FIELDS = (
     "passed", "reached_centered_cosine", "threshold", "steps", "n_pairs",
-    "regimes", "subset", "fold", "level", "seed",
+    "regimes", "subset", "fold", "level", "seed", "scoring",
+    "train_mode_centered_cosine",
 )
 
 
@@ -310,7 +311,11 @@ def run_overfit(
     )
     return {
         "passed": bool(result.passed),
+        # The gate's measure, scored with dropout off, and the training-batch
+        # value with dropout on beside it. overfit_gate_amendment.md.
         "reached_centered_cosine": result.reached_centered_cosine,
+        "scoring": result.scoring,
+        "train_mode_centered_cosine": result.train_mode_centered_cosine,
         "threshold": result.threshold,
         "steps": result.steps,
         "n_pairs": result.n_pairs,

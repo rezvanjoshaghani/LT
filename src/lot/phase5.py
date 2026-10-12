@@ -1046,7 +1046,10 @@ def run_mode(cfg: Phase5Config, analysis: AnalysisConfig, args: Any) -> None:
             verdict = "PASS" if result["passed"] else "FAIL"
             print(f"TINY-SUBSET OVERFIT GATE: {verdict}")
             print(f"  reached centered cosine {result['reached_centered_cosine']:.4f} "
-                  f"against {result['threshold']} in {result['steps']} steps")
+                  f"with dropout off against {result['threshold']} in "
+                  f"{result['steps']} steps")
+            print(f"  best training-batch value with dropout on "
+                  f"{result['train_mode_centered_cosine']:.4f}, reported only")
             for item in result["subset"]:
                 print(f"  {item['regime']:<12} {item['scene']} "
                       f"{item['context_frame_id']} -> {item['target_frame_id']}")

@@ -1266,6 +1266,31 @@ def test_19_an_unstable_validation_curve(shared, tmp_path):
     only(accept(rebuild(shared, tmp_path / "world", training=unstable)), 19, "fold2_seed2")
 
 
+def test_19_a_curve_stable_only_by_its_level_passes_and_is_reported(shared, tmp_path):
+    """stability_rule_amendment.md: the run reaches its step limit on a level
+    0.0022 below its best level, with its last score 0.004 below its best. The
+    amended rule passes it. The rule as registered does not, and its verdict
+    is reported beside the amended one and decides nothing."""
+    def plateau(record, fold, seed):
+        if (fold.index, seed) == (2, 2):
+            history = training_history(fold.index, seed)
+            best = max(score for _, score in history)
+            settings = training_config_from(shared.world.cfg.training)
+            steps = range(history[-1][0] + 500, settings.max_steps + 1, 500)
+            history += [[step, best - 0.004] for step in steps]
+            record.update(history=history, stopped_early=False, steps_run=settings.max_steps)
+
+    verdict = accept(rebuild(shared, tmp_path / "world", training=plateau))
+    assert failed(verdict) == set(), acceptance.format_report(verdict)
+    text = notes(verdict, 19)
+    assert "9 of 9 training runs have a stable validation curve" in text
+    assert "8 of 9 are stable by decision 5 as registered" in text
+    assert "fold2_seed2 is stable as amended and not as registered" in text
+    run = verdict.conditions[18].evidence["runs"]["fold2_seed2"]
+    assert run["stable"] is True and run["stable_as_registered"] is False
+    assert run["level_gap"] == pytest.approx(0.0022, abs=1e-9)
+
+
 def test_20_headline_figures_drawn_from_an_earlier_headline_table(shared, tmp_path):
     def restamp(directory):
         rewrite_table(directory, report.PRIMARY_TABLE,

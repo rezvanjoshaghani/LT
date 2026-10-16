@@ -50,18 +50,24 @@ Decision 5 defines two more things, kept here so they freeze with the rest:
   labelled "essentially no effect". The label is descriptive. A control is
   never a threshold anything must pass.
 - A training run's validation curve is stable when every validation score is
-  finite, at least two validations ran, and early stopping fired or the last
-  score is within 0.003 of the best. All nine runs must be stable for
-  acceptance.
+  finite, at least two validations ran, and early stopping fired or the
+  curve's level at the end is within 0.003 of its best level. The level is
+  the mean of one early-stopping patience of consecutive validations. All
+  nine runs must be stable for acceptance. This is the rule as amended in
+  validation/evidence/phase5/stability_rule_amendment.md. The rule as
+  registered compared the last score with the best. It is still computed and
+  reported beside the amended one, and it decides nothing.
 
 Decision 5's 0.003 is the frozen path_agreement_tolerance of
-configs/analysis.yaml. Nothing in src/ carries a normative constant as a
-literal, so the caller passes it in as tolerance.
+configs/analysis.yaml, and the patience is the frozen early_stopping_patience
+of configs/phase5.yaml. Nothing in src/ carries a normative constant as a
+literal, so the caller passes them in as tolerance and window.
 """
 
 from __future__ import annotations
 
 import math
+import operator
 from typing import Any, Mapping, Sequence
 
 from .phase5_estimands import CellResult
@@ -431,24 +437,98 @@ def control_label(degradation: float, tolerance: float) -> str | None:
     return ESSENTIALLY_NO_EFFECT if abs(degradation) <= tolerance else None
 
 
-def stable_validation_curve(
-    history: Sequence[Sequence[float]], stopped_early: bool, tolerance: float
-) -> bool:
-    """Decision 5: whether one training run's validation curve is stable.
+def _judged_scores(history: Sequence[Sequence[float]]) -> list[float] | None:
+    """The scores of a curve that can be judged, or None.
 
     history is the run's (step, validation centered cosine) pairs, in the
-    order lot.train records them. The curve is stable when every score is
-    finite, at least two validations ran, and early stopping fired or the
-    last score is within tolerance of the best. tolerance is the frozen 0.003.
+    order lot.train records them. A curve can be judged when at least two
+    validations ran and every score is finite.
     """
     scores = [entry[1] for entry in history]
     if len(scores) < 2:
-        return False
+        return None
     if not all(
         isinstance(score, (int, float)) and not isinstance(score, bool)
         and math.isfinite(score)
         for score in scores
     ):
+        return None
+    return scores
+
+
+def _validations_per_level(window: int) -> int:
+    """window as a whole number of validations, at least one, or a stop."""
+    if isinstance(window, bool):
+        raise ValueError(f"window must be a whole number of validations, not {window!r}")
+    try:
+        count = operator.index(window)
+    except TypeError:
+        raise ValueError(
+            f"window must be a whole number of validations, not {window!r}"
+        ) from None
+    if count < 1:
+        raise ValueError(f"window must be at least one validation, not {count}")
+    return count
+
+
+def validation_level_gap(history: Sequence[Sequence[float]], window: int) -> float:
+    """How far a curve's level at the end sits below its best level.
+
+    The level is the mean of window consecutive validation scores. The gap is
+    the highest such mean less the mean of the last window scores, so it is
+    zero when the curve ends at its best level. It is NaN when the curve
+    cannot be judged or has fewer scores than one window.
+    stability_rule_amendment.md sets window to the frozen early-stopping
+    patience.
+    """
+    count = _validations_per_level(window)
+    scores = _judged_scores(history)
+    if scores is None or len(scores) < count:
+        return math.nan
+    levels = [math.fsum(scores[start:start + count]) / count
+              for start in range(len(scores) - count + 1)]
+    return max(levels) - levels[-1]
+
+
+def stable_validation_curve(
+    history: Sequence[Sequence[float]], stopped_early: bool, tolerance: float, window: int
+) -> bool:
+    """Decision 5 as amended: whether one training run's validation curve is stable.
+
+    The curve is stable when every score is finite, at least two validations
+    ran, and early stopping fired or the curve's level at the end is within
+    tolerance of its best level. validation_level_gap defines the level over
+    window consecutive validations. A curve with fewer validations than one
+    window is judged by the rule as registered. tolerance is the frozen 0.003,
+    and window is the frozen early-stopping patience.
+
+    validation/evidence/phase5/stability_rule_amendment.md records why the
+    rule reads the level rather than single scores, and when that was
+    decided.
+    """
+    count = _validations_per_level(window)
+    scores = _judged_scores(history)
+    if scores is None:
+        return False
+    if stopped_early is True:
+        return True
+    if len(scores) < count:
+        return max(scores) - scores[-1] <= tolerance
+    return validation_level_gap(history, count) <= tolerance
+
+
+def stable_validation_curve_as_registered(
+    history: Sequence[Sequence[float]], stopped_early: bool, tolerance: float
+) -> bool:
+    """Decision 5 as reporting_rules.md registered it. Reported, never decisive.
+
+    The curve is stable when every score is finite, at least two validations
+    ran, and early stopping fired or the last score is within tolerance of
+    the best. stable_validation_curve decides acceptance. This verdict is
+    reported beside it, as stability_rule_amendment.md requires.
+    """
+    scores = _judged_scores(history)
+    if scores is None:
         return False
     if stopped_early is True:
         return True

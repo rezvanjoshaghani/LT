@@ -150,6 +150,8 @@ from .phase5_outcomes import (
     outcome_49,
     shown_near_zero,
     stable_validation_curve,
+    stable_validation_curve_as_registered,
+    validation_level_gap,
 )
 from .phase5_provenance import (
     ProvenanceError,
@@ -1938,10 +1940,20 @@ def adequacy_table(
     The scene roles are checked against the fold, and the scenes each role
     planned from must be inside it. Decision 5's control labels and stable
     validation curve are applied with the frozen 0.003, path_agreement_tolerance.
+    The curve is judged as stability_rule_amendment.md amends decision 5, by its
+    level over one early-stopping patience of validations. The verdict under the
+    rule as registered is reported beside it and decides nothing.
     The validation score is a model-selection statistic and is labelled one.
     """
     tolerance = analysis.path_agreement_tolerance
     training = training or {}
+    window = _int(training.get("early_stopping_patience"))
+    if window is None or window < 1:
+        raise TablesStop(
+            "the training settings name no early_stopping_patience, so decision 5's "
+            "stable curve has no level to read; it is the window of "
+            "stability_rule_amendment.md"
+        )
     rows = []
     for entry in entries:
         fold, seed = entry["fold"], entry["seed"]
@@ -2019,9 +2031,12 @@ def adequacy_table(
             "max_steps": _int(training.get("max_steps")),
             "stopped_early": stopped_early,
             "validation_every_steps": _int(training.get("validation_every_steps")),
-            "early_stopping_patience": _int(training.get("early_stopping_patience")),
+            "early_stopping_patience": window,
+            "validation_level_gap": _float(validation_level_gap(history, window)),
             "stable_validation_curve": stable_validation_curve(history, stopped_early,
-                                                               tolerance),
+                                                               tolerance, window),
+            "stable_validation_curve_as_registered": stable_validation_curve_as_registered(
+                history, stopped_early, tolerance),
             "parameter_count": _int(record.get("parameter_count")),
             "training_config_digest": record.get("training_config_digest"),
             "config_digest": record.get("config_digest"),

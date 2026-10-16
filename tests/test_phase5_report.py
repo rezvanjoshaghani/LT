@@ -302,6 +302,11 @@ def prepare(level: str = LEVEL, primary: str = LEVEL, analysis=FAST):
 def training_record(fold, seed: int, level: str = LEVEL) -> dict:
     history = [[500 * i, 0.50 + 0.01 * i] for i in range(1, 9)]
     stopped_early = True
+    if (fold.index, seed) == (1, 2):
+        # Ran out of steps on a plateau after one high reading: stable by its
+        # level, and not stable as registered. stability_rule_amendment.md.
+        history += [[4500, 0.585], [5000, 0.58], [5500, 0.58], [6000, 0.58]]
+        stopped_early = False
     if (fold.index, seed) == (2, 2):
         # Ran out of steps with the last score well below the best: unstable.
         history = [[500 * i, 0.50 + 0.01 * i] for i in range(1, 6)] + [[3000, 0.53]]
@@ -1371,11 +1376,31 @@ def test_the_adequacy_and_validation_history_tables(built):
         assert row["n_pairs"] == 10 * len(fold.train)
         assert row["n_empty_support"] == len(fold.train)
         assert row["best_validation_note"] == "model-selection statistic, not an estimand"
-        assert row["stable_validation_curve"] is ((row["fold"], row["seed"]) != (2, 2))
+        run = (row["fold"], row["seed"])
+        # Decision 5 as amended decides; the rule as registered is reported.
+        assert row["stable_validation_curve"] is (run != (2, 2))
+        assert row["stable_validation_curve_as_registered"] is (run not in {(1, 2), (2, 2)})
+        assert row["early_stopping_patience"] == 10
+        if run == (1, 2):
+            assert row["validation_level_gap"] == 0.0
+            assert row["validation_last_minus_best"] == pytest.approx(-0.005)
+        else:
+            # Fewer validations than one window: no level to read.
+            assert math.isnan(row["validation_level_gap"])
     history = rows_of(built, "phase5_validation_history.parquet")
-    assert len(history) == 8 * 8 + 6
+    assert len(history) == 7 * 8 + 12 + 6
     best = [r for r in history if r["is_best"]]
     assert len(best) == 9
+
+
+def test_the_adequacy_table_needs_the_patience_to_read_the_curve_level():
+    """stability_rule_amendment.md reads the level over one early-stopping
+    patience, so a table built without it has no rule to apply."""
+    entries = adequacy_entries(evidence_records(), FOLDS, SEEDS)
+    settings = {key: value for key, value in TRAINING.items() if key != "early_stopping_patience"}
+    with pytest.raises(TablesStop, match="early_stopping_patience"):
+        report.adequacy_table(entries, FAST, level=LEVEL, primary_level=LEVEL,
+                              training=settings)
 
 
 def test_scenes_of_one_fold_that_embed_different_evidence_stop():

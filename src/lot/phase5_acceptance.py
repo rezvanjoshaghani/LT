@@ -69,8 +69,9 @@ What each condition reads:
 18. The headline table's columns and strings, its gap against its two
     methods, the formulation table's label, the reference table's rung, and
     where the reporting code at R names the target-lift reference.
-19. Decision 5's stable curve, from the training records each run record
-    embeds.
+19. Decision 5's stable curve, as stability_rule_amendment.md amends it,
+    from the training records each run record embeds. Each run's verdict
+    under the rule as registered is reported beside it.
 20. The published figures against the current tables, and the headline
     figures among them.
 21. The full suite, run in a subprocess at R, with HEAD unmoved and the
@@ -181,6 +182,8 @@ from .phase5_outcomes import (
     call_outcome,
     outcome_49,
     stable_validation_curve,
+    stable_validation_curve_as_registered,
+    validation_level_gap,
 )
 from .phase5_provenance import (
     FROZEN_AT_E,
@@ -3684,9 +3687,15 @@ def check_18_no_target_lift(ctx: AcceptanceContext) -> Outcome:
 
 
 def check_19_stable_curve(ctx: AcceptanceContext) -> Outcome:
-    """Decision 5, from the training records each run record embeds."""
+    """Decision 5 as amended, from the training records each run record embeds.
+
+    stability_rule_amendment.md judges each curve by its level over one
+    early-stopping patience of validations. Each run's verdict under the rule
+    as registered is reported beside it and decides nothing.
+    """
     check = _Check()
     tolerance = ctx.analysis.path_agreement_tolerance
+    window = ctx.settings.early_stopping_patience
     with check.part("the embedded training records"):
         mark = check.mark()
         records = ctx.records()
@@ -3710,16 +3719,21 @@ def check_19_stable_curve(ctx: AcceptanceContext) -> Outcome:
                     continue
                 history = record.get("history") if isinstance(record.get("history"), list) else []
                 stopped = record.get("stopped_early") is True
-                stable = stable_validation_curve(history, stopped, tolerance)
+                stable = stable_validation_curve(history, stopped, tolerance, window)
+                registered = stable_validation_curve_as_registered(history, stopped, tolerance)
+                level_gap = validation_level_gap(history, window)
                 scores = [entry[1] for entry in history]
                 finite = [score for score in scores if _finite(score)]
                 runs[key] = {"n_validations": len(history), "stopped_early": stopped,
                              "best": max(finite) if finite else None,
-                             "last": scores[-1] if scores else None, "stable": stable}
+                             "last": scores[-1] if scores else None,
+                             "level_gap": level_gap if _finite(level_gap) else None,
+                             "stable": stable, "stable_as_registered": registered}
                 if not stable:
                     check.fail(f"{key}: the validation curve is not stable: {len(history)} "
                                f"validations, stopped early {stopped}, last "
-                               f"{runs[key]['last']} against best {runs[key]['best']}")
+                               f"{runs[key]['last']} against best {runs[key]['best']}, "
+                               f"level gap {runs[key]['level_gap']} over {window} validations")
         missing = sorted({fold_seed_key(f, s) for f in by_fold for s in ctx.seeds} - set(runs))
         if missing:
             check.fail(f"no embedded training record for {missing}")
@@ -3728,10 +3742,21 @@ def check_19_stable_curve(ctx: AcceptanceContext) -> Outcome:
             check.fail(f"no evaluated scene embeds the training records of fold(s) "
                        f"{folds_missing}")
         check.evidence["runs"] = runs
+        check.evidence["level_window"] = window
         stable = sum(1 for run in runs.values() if run["stable"])
-        check.note(f"{stable} of {len(runs)} training runs have a stable validation curve: every "
-                   f"score finite, at least two validations, and early stopping or a last score "
-                   f"within {tolerance} of the best")
+        check.note(f"{stable} of {len(runs)} training runs have a stable validation curve, by "
+                   f"decision 5 as stability_rule_amendment.md amends it: every score finite, "
+                   f"at least two validations, and early stopping or the mean of the last "
+                   f"{window} validations within {tolerance} of the highest mean of any "
+                   f"{window} consecutive validations")
+        registered = sum(1 for run in runs.values() if run["stable_as_registered"])
+        check.note(f"reported only: {registered} of {len(runs)} are stable by decision 5 as "
+                   f"registered, early stopping or a last score within {tolerance} of the best")
+        for key, run in runs.items():
+            if run["stable"] and not run["stable_as_registered"]:
+                check.note(f"{key} is stable as amended and not as registered: last "
+                           f"{run['last']} against best {run['best']}, level gap "
+                           f"{run['level_gap']}")
         check.note_if_clean(mark, "every scene of a fold embeds the same training records")
     return check.result()
 

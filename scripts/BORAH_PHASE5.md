@@ -241,6 +241,10 @@ validation centered cosine, and never touches the six test scenes. The seal is
 asserted inside the training loop, so a leaked scene raises rather than
 training.
 
+At `a7f3a64` each task took 53 to 60 minutes on Borah's L40 partition and
+peaked at 16.6 GB of resident memory, well inside the template's eight hours
+and 48 GB.
+
 Nothing about a test scene may influence anything here. If a training run is
 restarted, changed, or retuned in response to a test metric, that run is
 invalid under Stream S step 9 and must be discarded rather than reported.
@@ -522,7 +526,11 @@ evaluation ledger to `evidence/evaluation_ledger.jsonl`. It then re-derives
 each of the eighteen conditions of step 45, and the three that
 `reporting_rules.md` section 8 adds: every training run's validation curve is
 stable, the headline figures are present and built from the current tables,
-and the full suite is green at R. A condition that cannot be re-derived
+and the full suite is green at R. Stability is judged as
+`validation/evidence/phase5/stability_rule_amendment.md` amends decision 5,
+by the curve's level over one early-stopping patience of validations. Each
+run's verdict under the rule as registered is reported beside it and decides
+nothing. A condition that cannot be re-derived
 fails. It never passes. The verdict goes to `evidence/acceptance_{level}.json`,
 and a rerun keeps the earlier verdict as `*.superseded.N.*`, so acceptance
 takes no `--supersede`.

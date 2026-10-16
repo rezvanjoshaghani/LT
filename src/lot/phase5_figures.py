@@ -1483,9 +1483,11 @@ def figureS1_validation_curves(history_rows: Sequence[Mapping[str, Any]],
         "Supplementary figure S1: the validation centered cosine of every training run, one "
         "line per fold and seed. The star marks the selected checkpoint, chosen on validation "
         "scenes only. The validation score is a model-selection statistic, not an estimand. "
-        "Stable is decision 5 of reporting_rules.md: every score finite, at least two "
-        "validations, and early stopping fired or the last score within the frozen tolerance "
-        "of the best."
+        "Stable is decision 5 of reporting_rules.md as stability_rule_amendment.md amends it: "
+        "every score finite, at least two validations, and early stopping fired or the mean "
+        "of the last validations over one early-stopping patience within the frozen tolerance "
+        "of the highest such mean. The adequacy table reports the verdict under the rule as "
+        "registered beside it."
     )
     return _publish(figure, path_out, caption, size)
 

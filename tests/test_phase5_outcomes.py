@@ -563,13 +563,22 @@ def test_section_nine_states_the_stop_the_code_applies():
 # reporting_rules.md decision 5: the control label and the stable curve
 # ---------------------------------------------------------------------------
 
+import yaml  # noqa: E402
+
 from lot.phase5_outcomes import (  # noqa: E402
     ESSENTIALLY_NO_EFFECT,
     control_label,
     stable_validation_curve,
+    stable_validation_curve_as_registered,
+    validation_level_gap,
 )
 
 TOLERANCE = ANALYSIS.path_agreement_tolerance
+# Decision 5's level window as amended: the frozen early-stopping patience.
+WINDOW = yaml.safe_load(
+    (Path(__file__).resolve().parents[1] / "configs" / "phase5.yaml").read_text(encoding="utf-8")
+)["training"]["early_stopping_patience"]
+STABILITY_AMENDMENT = REPORTING_RULES.with_name("stability_rule_amendment.md")
 
 
 def test_decision_five_names_the_label_and_the_tolerance_verbatim():
@@ -602,7 +611,25 @@ def test_a_control_with_a_tiny_degradation_is_labelled_essentially_no_effect(
     assert control_label(degradation, TOLERANCE) == expected
 
 
-@pytest.mark.parametrize("history, stopped_early, expected", [
+def curve(*scores: float) -> list[list]:
+    """A history as lot.train records it: (step, score), one per 500 steps."""
+    return [[500 * (index + 1), score] for index, score in enumerate(scores)]
+
+
+def test_the_amendment_states_the_rule_the_code_applies():
+    """stability_rule_amendment.md amends decision 5. The rule it states is the
+    rule stable_validation_curve applies, over the frozen patience."""
+    text = " ".join(STABILITY_AMENDMENT.read_text(encoding="utf-8").split())
+    assert ("the mean of its last 10 validations is within 0.003 of the highest mean "
+            "of any 10 consecutive validations") in text
+    assert "is judged by the rule as registered" in text
+    assert "> go with 1" in text
+    assert WINDOW == 10 and TOLERANCE == 0.003
+
+
+# Short curves: fewer validations than one window, so both rules read single
+# scores and must agree.
+SHORT_CURVES = [
     # Early stopping fired.
     ([[500, 0.50], [1000, 0.55], [1500, 0.54]], True, True),
     # The last score is the best.
@@ -617,15 +644,106 @@ def test_a_control_with_a_tiny_degradation_is_labelled_essentially_no_effect(
     # A score that is not finite makes the curve unstable.
     ([[500, 0.50], [1000, NAN], [1500, 0.55]], True, False),
     ([[500, 0.50], [1000, math.inf]], True, False),
-])
-def test_the_stable_validation_curve(history, stopped_early, expected):
-    assert stable_validation_curve(history, stopped_early, TOLERANCE) is expected
+]
+
+
+@pytest.mark.parametrize("history, stopped_early, expected", SHORT_CURVES)
+def test_a_short_curve_is_judged_by_the_rule_as_registered(history, stopped_early, expected):
+    assert stable_validation_curve_as_registered(history, stopped_early, TOLERANCE) is expected
+    assert stable_validation_curve(history, stopped_early, TOLERANCE, WINDOW) is expected
 
 
 def test_the_stable_curve_reads_the_score_not_the_step():
     """A history is (step, score) pairs, as lot.train records them."""
-    assert stable_validation_curve(((500, 0.50), (1000, 0.40)), False, TOLERANCE) is False
-    assert stable_validation_curve(((500, 0.40), (1000, 0.50)), False, TOLERANCE) is True
+    for judge in (lambda h, s: stable_validation_curve(h, s, TOLERANCE, WINDOW),
+                  lambda h, s: stable_validation_curve_as_registered(h, s, TOLERANCE)):
+        assert judge(((500, 0.50), (1000, 0.40)), False) is False
+        assert judge(((500, 0.40), (1000, 0.50)), False) is True
+    rising = curve(*(0.40 + 0.01 * index for index in range(2 * WINDOW)))
+    falling = [[step, 1.0 - score] for step, score in rising]
+    assert stable_validation_curve(rising, False, TOLERANCE, WINDOW) is True
+    assert stable_validation_curve(falling, False, TOLERANCE, WINDOW) is False
+
+
+# Long curves: the amended rule reads the level, the mean of WINDOW
+# consecutive scores. Each case gives (scores, amended, registered).
+PLATEAU = [0.600] * (2 * WINDOW)
+
+
+def with_score(scores: list[float], index: int, value: float) -> list[float]:
+    changed = list(scores)
+    changed[index] = value
+    return changed
+
+
+LONG_CURVES = {
+    # One high reading on a flat plateau, the case that prompted the amendment.
+    # The rule as registered compares the last score with it and fails.
+    "a single high reading on a plateau": (with_score(PLATEAU, WINDOW + 3, 0.605), True, False),
+    "a flat plateau": (PLATEAU, True, True),
+    "a rising curve": ([0.50 + 0.01 * index for index in range(2 * WINDOW)], True, True),
+    # The level fell by 0.0029, within the tolerance, or by 0.0031, beyond it.
+    "a level that fell within the tolerance": ([0.600] * WINDOW + [0.5971] * WINDOW, True, True),
+    "a level that fell beyond the tolerance": ([0.600] * WINDOW + [0.5969] * WINDOW, False, False),
+    "a level that collapsed": ([0.600] * WINDOW + [0.550] * WINDOW, False, False),
+    # The level collapsed and the last single reading recovered. The rule as
+    # registered passes it. The amended rule does not, so it is not only a
+    # more lenient rule.
+    "a collapse with one recovered reading": (
+        [0.700] * WINDOW + [0.500] * (WINDOW - 1) + [0.710], False, True),
+}
+
+
+@pytest.mark.parametrize("name", LONG_CURVES)
+def test_a_long_curve_is_judged_by_its_level(name):
+    scores, amended, registered = LONG_CURVES[name]
+    history = curve(*scores)
+    assert stable_validation_curve(history, False, TOLERANCE, WINDOW) is amended
+    assert stable_validation_curve_as_registered(history, False, TOLERANCE) is registered
+    # Early stopping still makes a finite curve stable under both rules.
+    assert stable_validation_curve(history, True, TOLERANCE, WINDOW) is True
+    assert stable_validation_curve_as_registered(history, True, TOLERANCE) is True
+
+
+def test_the_level_gap_is_the_best_level_less_the_last_level():
+    assert validation_level_gap(curve(*PLATEAU), WINDOW) == 0.0
+    assert validation_level_gap(curve(*(0.50 + 0.01 * i for i in range(2 * WINDOW))),
+                                WINDOW) == 0.0
+    fell = [0.600] * WINDOW + [0.590] * WINDOW
+    assert validation_level_gap(curve(*fell), WINDOW) == pytest.approx(0.010, abs=1e-12)
+    # A high reading the last window has passed leaves a gap of its share of a
+    # window. One inside the last window leaves none.
+    early = with_score(PLATEAU, WINDOW - 1, 0.610)
+    assert validation_level_gap(curve(*early), WINDOW) == pytest.approx(0.001, abs=1e-12)
+    late = with_score(PLATEAU, WINDOW + 3, 0.610)
+    assert validation_level_gap(curve(*late), WINDOW) == pytest.approx(0.0, abs=1e-12)
+
+
+@pytest.mark.parametrize("history", [
+    curve(*([0.60] * (WINDOW - 1))),
+    curve(*([0.60] * WINDOW + [NAN])),
+    curve(0.60),
+    [],
+])
+def test_a_curve_without_a_whole_window_has_no_level_gap(history):
+    assert math.isnan(validation_level_gap(history, WINDOW))
+
+
+def test_a_window_of_one_validation_is_the_rule_as_registered():
+    """With one score per level, the level gap is the last score's distance to
+    the best, so the amended rule reduces to the rule as registered."""
+    for scores, _, _ in LONG_CURVES.values():
+        history = curve(*scores)
+        assert (stable_validation_curve(history, False, TOLERANCE, 1)
+                is stable_validation_curve_as_registered(history, False, TOLERANCE))
+
+
+@pytest.mark.parametrize("window", [0, -1, 2.5, True, None, "10"])
+def test_a_window_that_is_not_a_whole_number_of_validations_stops(window):
+    with pytest.raises(ValueError, match="window"):
+        stable_validation_curve(curve(*PLATEAU), False, TOLERANCE, window)
+    with pytest.raises(ValueError, match="window"):
+        validation_level_gap(curve(*PLATEAU), window)
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +767,8 @@ def test_the_outcome_code_has_one_home_in_the_frozen_class():
     }
     assert {"call_outcome", "gap_outcome", "outcome_49", "metric_sensitive",
             "landing_offset_flags", "measured_outcome", "control_label",
-            "stable_validation_curve", "OutcomeAnomaly"} <= frozen
+            "stable_validation_curve", "stable_validation_curve_as_registered",
+            "validation_level_gap", "OutcomeAnomaly"} <= frozen
     defined = {
         node.name for node in ast.parse(Path(report.__file__).read_text(encoding="utf-8")).body
         if isinstance(node, (ast.FunctionDef, ast.ClassDef))

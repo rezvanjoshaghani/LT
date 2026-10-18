@@ -241,9 +241,9 @@ validation centered cosine, and never touches the six test scenes. The seal is
 asserted inside the training loop, so a leaked scene raises rather than
 training.
 
-At `a7f3a64` each task took 53 to 60 minutes on Borah's L40 partition and
-peaked at 16.6 GB of resident memory, well inside the template's eight hours
-and 48 GB.
+At `a7f3a64` and again at `acc86ba`, each task took 53 to 64 minutes on
+Borah's L40 partition and peaked at about 15.9 GiB of resident memory, well
+inside the template's eight hours and 48 GiB. sacct reports that peak in KiB.
 
 Nothing about a test scene may influence anything here. If a training run is
 restarted, changed, or retuned in response to a test metric, that run is

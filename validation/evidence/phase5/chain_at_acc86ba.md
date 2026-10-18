@@ -51,4 +51,50 @@ and 0.9802 at step 1700.
 ## Training
 
 The nine training tasks were submitted after this pass, as array 3387760,
-with the template's limit of eight hours per task.
+with the template's limit of eight hours per task. All nine completed with
+exit code 0, on gpu111 and gpu117, in 58 to 64 minutes each. Every record
+names commit `acc86ba` and device cuda. Retraining moved the checkpoints and
+records trained at `a7f3a64` aside as numbered siblings, as
+`lot.phase5_check.supersede` does.
+
+sacct reports the peak resident memory in KiB. It was 15.5 to 15.8 GiB per
+task, against the 48 GiB requested. Read the same way, the `a7f3a64` runs
+peaked at 15.6 to 15.9 GiB. `stability_rule_amendment.md` gave those as 16.3
+to 16.6 GB, which counts each KiB as 1,000 bytes.
+
+Decision 5 was applied on Borah to the nine training records, with the frozen
+functions of `lot.phase5_outcomes`, a tolerance of 0.003, and a window of 10
+validations. The gap from the last score to the best is computed here from
+the printed values.
+
+| run | steps | best step | best | last | last below best | level gap | early stopping | as amended | as registered |
+|---|---|---|---|---|---|---|---|---|---|
+| fold0_seed0 | 20000 | 16000 | 0.66615 | 0.66385 | 0.00230 | 0.00005 | no | stable | stable |
+| fold0_seed1 | 20000 | 17000 | 0.66887 | 0.66678 | 0.00209 | 0.00000 | no | stable | stable |
+| fold0_seed2 | 20000 | 19000 | 0.66692 | 0.66519 | 0.00173 | 0.00000 | no | stable | stable |
+| fold1_seed0 | 20000 | 19000 | 0.68260 | 0.68061 | 0.00199 | 0.00000 | no | stable | stable |
+| fold1_seed1 | 19500 | 14500 | 0.68122 | 0.67558 | 0.00564 | 0.00185 | yes | stable | stable |
+| fold1_seed2 | 20000 | 16000 | 0.68179 | 0.67846 | 0.00333 | 0.00000 | no | stable | not stable |
+| fold2_seed0 | 20000 | 15500 | 0.68792 | 0.68604 | 0.00188 | 0.00069 | no | stable | stable |
+| fold2_seed1 | 20000 | 16500 | 0.69013 | 0.68797 | 0.00216 | 0.00000 | no | stable | stable |
+| fold2_seed2 | 20000 | 16000 | 0.69124 | 0.69044 | 0.00080 | 0.00000 | no | stable | stable |
+
+All nine runs are stable under decision 5 as amended, so acceptance condition
+19 can pass. Under the rule as registered, fold1_seed2 is again not stable:
+its last score is 0.00333 below its best. That verdict is reported and decides
+nothing.
+
+Against the runs at `a7f3a64`, which used the same seeds:
+
+- every best validation score moved by at most 0.00053;
+- seven of the nine best steps are the same;
+- fold1_seed0 set its best at step 19000 this time, not 12500, so it ran to
+  the step limit instead of stopping at step 17500;
+- fold2_seed0 set its best at step 15500, not 15000, so its patience did not
+  run out at step 20000;
+- fold1_seed2 again set its best at step 16000 and again failed the rule as
+  registered.
+
+The training code, the data order, and the seeds are the same at both
+commits. These differences are consistent with nondeterministic GPU
+arithmetic.

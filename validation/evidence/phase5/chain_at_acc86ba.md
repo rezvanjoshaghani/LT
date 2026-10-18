@@ -98,3 +98,51 @@ Against the runs at `a7f3a64`, which used the same seeds:
 The training code, the data order, and the seeds are the same at both
 commits. These differences are consistent with nondeterministic GPU
 arithmetic.
+
+## The input-use controls
+
+The controls ran as job 3387865, on gpu111, over each fold's validation
+scenes. They wrote `input_use_controls_image.json`, sha256
+`49b5353351a9ecbe95df7f8a5bdbf8f6327c0aeb4f797399ab07510f25bd9995`. Each
+degradation is the shared baseline's validation centered cosine less the
+shuffled one. Each count is the exchanges that changed nothing.
+
+| run | pairs | pose shuffle | pose unchanged | depth shuffle | depth unchanged |
+|---|---|---|---|---|---|
+| fold0_seed0 | 2752 | +0.1957 | 1 | +0.0312 | 5 |
+| fold0_seed1 | 2752 | +0.1983 | 1 | +0.0325 | 5 |
+| fold0_seed2 | 2752 | +0.1992 | 1 | +0.0313 | 5 |
+| fold1_seed0 | 2795 | +0.2141 | 2 | +0.0153 | 4 |
+| fold1_seed1 | 2795 | +0.2079 | 2 | +0.0134 | 4 |
+| fold1_seed2 | 2795 | +0.2092 | 2 | +0.0141 | 4 |
+| fold2_seed0 | 2873 | +0.2039 | 4 | +0.0164 | 8 |
+| fold2_seed1 | 2873 | +0.2064 | 4 | +0.0159 | 8 |
+| fold2_seed2 | 2873 | +0.2048 | 4 | +0.0151 | 8 |
+
+These are diagnostics, reported as observed. Every model loses about 0.20
+when its pose input is shuffled, and 0.013 to 0.033 when its depth input is
+shuffled. No degradation is within 0.003 of zero, so no control is labelled
+"essentially no effect". The three seeds of each fold agree to within 0.007
+on pose and 0.002 on depth.
+
+## The checkpoint lock
+
+`./scripts/run_phase5.sh lock` passed at 2026-10-18T17:52:10Z and wrote
+`checkpoint_lock_image.json`. It binds the integration and overfit receipts,
+the controls file above, and these checkpoints and training records, by
+sha256:
+
+| run | checkpoint | training record |
+|---|---|---|
+| fold0_seed0 | `8b0361f9655ee935cb4de306d398041024e364e6b72f1da2c6cc5fcf5f0f7d80` | `fed12e14d19c60cb38c7f21562f2911a0b06190d99ac2a8e12a322529720558a` |
+| fold0_seed1 | `0fd21c0f9278da936cac0d4d33aefb775f8355da58dd699eeb21d0919abaadbe` | `e201cabbc2bde39d563aba2223caecf220b2c92e508531686c5188bdc3921425` |
+| fold0_seed2 | `4133ad3e1dd5c579596e71565dfa15a49a4ea13300d59e2d2f79cbfcab247cbd` | `2f737115630526a0e0f3ecb1f6bcbd9e62d822ad0d6db0e7c7ef44066ae3266e` |
+| fold1_seed0 | `6bac0916f5b9f7a64518ac38a29192f23a13c3b03647e282990f37cd55363620` | `04134a92c984706b26be045b657d123c5f0258c07d8479929a0e9a01d0169326` |
+| fold1_seed1 | `3dedd728128d77c9e38a710634a62137bfa2534c0ca779100dd974e2a14a2053` | `5769889423a738352225ca8c68c2835d51b7f0b4860f9ac7720cff936481eeba` |
+| fold1_seed2 | `6137361139cf5b21ea7ea0686d78fa512e221db755bea6bdd38b18216e6647fc` | `2bad1ac6642deab9809aee2f331253bd983845c2e70630c6ff7faf8a6bd11793` |
+| fold2_seed0 | `89d717b510b0bb17e90b3607a2e40d120cc7ed4d40b56a26d6e3db546593fa12` | `ce2727907a043c9e613ea0205dc4ef125985e5dbc9b4753b5fc30580759021e3` |
+| fold2_seed1 | `54966c5bd5e20b04c605399c921df3c5db51481a444e64a80aedd5eeea9a24c2` | `fe8f96d8d983fce7e083695f6265c8142f73e3aeacf1f5742af350875d7140d4` |
+| fold2_seed2 | `e0a20d78e9fd77456440ca4264e06903a3149a1c66d39c1db25e217ec9f283ae` | `897c40d404cc1e80e92395bef8024cb2c3a65959a15166a340e9adfce69a3923` |
+
+Its output is kept as `checkpoint_lock_image_20261018T175210Z.txt`. No
+evaluation had run when the lock was written.

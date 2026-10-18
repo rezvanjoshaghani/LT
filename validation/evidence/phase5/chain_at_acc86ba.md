@@ -146,3 +146,16 @@ sha256:
 
 Its output is kept as `checkpoint_lock_image_20261018T175210Z.txt`. No
 evaluation had run when the lock was written.
+
+## Evaluation
+
+`./scripts/run_phase5.sh evaluate` verified the gate receipts and the lock,
+then submitted the 18 test scenes as array 3388663, with a limit of one day
+per task. Borah's quality-of-service limit ran at most eight at once. All 18
+completed with exit code 0, on gpu111, gpu114, and gpu117, in 12 to 17
+minutes each, with a peak resident memory of 2.2 to 2.5 GiB. No task failed
+or was resubmitted, so each scene was evaluated once.
+
+The 18 parquets and their run records were written to
+`outputs/phase5_rung2/eval/image/` on 2026-10-18. No test result was read
+before this section was written.

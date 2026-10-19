@@ -585,10 +585,10 @@ def _replay(model_cfg, examples, steps, seed=0):
     return train_scores, eval_scores
 
 
-def _gate(model_cfg, examples, threshold, steps):
+def _gate(model_cfg, examples, threshold, steps, seed=0):
     return run_tiny_overfit_gate(
         examples, model_cfg, GATE_CFG, GRID_HW, threshold=threshold, max_steps=steps,
-        fold=FOLD, expected_pairs=len(examples), required_regimes=REGIMES, seed=0,
+        fold=FOLD, expected_pairs=len(examples), required_regimes=REGIMES, seed=seed,
         raise_on_failure=False,
     )
 
@@ -645,12 +645,26 @@ def test_the_gate_stops_at_the_first_step_the_dropout_off_score_reaches_the_thre
 
 def test_a_fit_masked_by_dropout_passes_the_amended_gate():
     """The real failure in miniature: a threshold the training-batch score never
-    reaches and the dropout-off score does."""
+    reaches within the step budget and the dropout-off score does.
+
+    Whether dropout masks the fit within 60 steps depends on the trajectory,
+    and the trajectory depends on the seed and on the platform's floating-point
+    arithmetic. Where this test was written, seed 0 showed it by 0.0032 and two
+    of the first eight seeds did not show it at all. So the test takes the first
+    seed whose trajectory shows it by at least 0.001 and checks the amended
+    gate on that seed. post_evaluation_changes.md records why. Finding no such
+    seed would mean the tiny model no longer shows the failure the gate was
+    amended for, and fails the test.
+    """
     examples = tiny_subset()
     steps = 60
-    train_scores, eval_scores = _replay(NOISY, examples, steps)
-    assert max(eval_scores) > max(train_scores)
+    for seed in range(16):
+        train_scores, eval_scores = _replay(NOISY, examples, steps, seed=seed)
+        if max(eval_scores) - max(train_scores) >= 1e-3:
+            break
+    else:
+        pytest.fail("in 16 seeds, dropout never masked the fit by 0.001 within 60 steps")
     threshold = (max(train_scores) + max(eval_scores)) / 2
-    result = _gate(NOISY, examples, threshold=threshold, steps=steps)
+    result = _gate(NOISY, examples, threshold=threshold, steps=steps, seed=seed)
     assert result.passed
     assert result.train_mode_centered_cosine < threshold <= result.reached_centered_cosine

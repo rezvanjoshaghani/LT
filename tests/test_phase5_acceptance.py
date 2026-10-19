@@ -149,8 +149,13 @@ def make_repository(root: Path) -> tuple[Path, str]:
     files: dict[str, str] = {}
     for pattern in REPO_GLOBS:
         for path in sorted(REPO.glob(pattern)):
-            files[path.relative_to(REPO).as_posix()] = path.read_bytes().replace(
-                b"\r\n", b"\n").decode("utf-8")
+            name = path.relative_to(REPO).as_posix()
+            # The record of changes after E is written after E, so a repository
+            # standing for E never holds this checkout's. A test that needs one
+            # writes its own.
+            if name == acceptance.POST_EVALUATION_CHANGES:
+                continue
+            files[name] = path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
     for name in REPO_DOCUMENTS:
         files[name] = (REPO / name).read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
     return repo, commit_files(repo, files, "E")

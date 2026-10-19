@@ -159,3 +159,43 @@ or was resubmitted, so each scene was evaluated once.
 The 18 parquets and their run records were written to
 `outputs/phase5_rung2/eval/image/` on 2026-10-18. No test result was read
 before this section was written.
+
+## Acceptance
+
+The tables, the figures, and acceptance ran at R = E, `acc86ba`, as jobs
+3388726, 3388727, and 3388728 on the bsudfq partition. Each started only
+after the one before it passed. The tables and the figures passed.
+
+The first acceptance run returned NOT SATISFIED. Conditions 8, 11, and 21
+failed, and the measured outcome was withheld. The other 18 conditions
+passed. All three failures were one test,
+`test_a_fit_masked_by_dropout_passes_the_amended_gate` in
+`tests/test_phase5_train.py`, the only failure in the suite at R: 1 failed,
+1429 passed, 4 skipped. Conditions 8 and 11 read that file's results, and
+condition 21 reads the suite's.
+
+The test was written with the overfit amendment at `a7f3a64`. It assumed that
+in a 60-step run of a tiny model with dropout 0.5, at seed 0, the best
+dropout-off score beats the best dropout-on score. Where it was written, that
+held by 0.0032. On the Borah CPU node it did not: the best dropout-off score
+was 0.43629, and the best dropout-on score 0.43768. The premise also fails for
+two of the first eight seeds where the test was written, so it was never a
+property of the gate. The other three overfit-gate tests check what the gate
+reports, that its scoring leaves training unchanged, and where it stops. All
+three passed on Borah.
+
+The test now takes the first of 16 seeds whose run shows the effect by at
+least 0.001, and checks the amended gate on that seed. Its assertions about
+the gate are unchanged, and no measured code changed.
+`post_evaluation_changes.md` names the change with its reason, as acceptance
+requires of a test file whose results it reads. Writing that record exposed a
+fixture in `tests/test_phase5_acceptance.py` that copied it into the
+repository its tests build to stand for E. The fixture now leaves the record
+out, and the record names that change too. The tables and figures stand,
+because only neutral paths changed after they were built. Acceptance reruns
+at the commit that carries the change, and the first verdict is kept as a
+numbered sibling.
+
+The first run's output named the failed conditions and withheld the measured
+outcome. Under condition 16 it also printed how many interpreted-effect cells
+carry each near-zero wording. The change reads nothing from them.
